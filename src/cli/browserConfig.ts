@@ -98,6 +98,7 @@ export interface BrowserFlagOptions {
   browserThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
   browserArchive?: BrowserArchiveMode;
+  browserCaptureProviderNative?: boolean;
   browserModelLabel?: string;
   /** Original model request before browser alias normalization. */
   browserRequestedModel?: ModelName;
@@ -363,6 +364,7 @@ export async function buildBrowserConfig(
         ? options.browserResearch
         : "off",
     archiveConversations: options.browserArchive,
+    captureProviderNative: options.browserCaptureProviderNative,
   };
 }
 
