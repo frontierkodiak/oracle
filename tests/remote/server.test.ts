@@ -665,6 +665,7 @@ describe("client browser-config allowlist", () => {
       thinkingTime: "pro",
       archiveConversations: "never",
       resumeConversationUrl: "https://chatgpt.com/c/abc-123",
+      captureProviderNative: true,
       timeoutMs: 900_000,
     });
     expect(accepted).toEqual({
@@ -674,6 +675,7 @@ describe("client browser-config allowlist", () => {
       thinkingTime: "pro",
       archiveConversations: "never",
       resumeConversationUrl: "https://chatgpt.com/c/abc-123",
+      captureProviderNative: true,
       timeoutMs: 900_000,
     });
   });
@@ -712,5 +714,37 @@ describe("client browser-config allowlist", () => {
   test("treats a missing config as an empty one", () => {
     expect(pickClientBrowserConfig(undefined)).toEqual({});
     expect(pickClientBrowserConfig(null)).toEqual({});
+  });
+});
+
+describe("advertised addresses", () => {
+  test.skipIf(!CAN_LISTEN_LOCALHOST)("a loopback bind advertises only loopback", async () => {
+    // The banner is how an operator decides whether this port needs a tunnel or
+    // a firewall rule. Listing LAN and tailnet addresses for a service bound to
+    // 127.0.0.1 tells them it is exposed when it is not.
+    const lines: string[] = [];
+    const server = await createRemoteServer(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        token: "secret",
+        logger: (message: string) => lines.push(message),
+      },
+      {
+        runBrowser: async () => ({
+          answerText: "",
+          answerMarkdown: "",
+          tookMs: 0,
+          answerTokens: 0,
+          answerChars: 0,
+        }),
+      },
+    );
+    const banner = lines.join("\n");
+    expect(banner).toContain("127.0.0.1");
+    expect(banner).not.toMatch(/\b10\.\d+\.\d+\.\d+\b/);
+    expect(banner).not.toMatch(/\b100\.\d+\.\d+\.\d+\b/);
+    expect(banner).not.toMatch(/\b192\.168\.\d+\.\d+\b/);
+    await server.close();
   });
 });
