@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Browser: optionally save ChatGPT’s verbatim conversation record and independent turn digests, with answer fidelity evidence and best-effort fallback; thanks @frontierkodiak.
+
 ## 0.20.3 - 2026-09-13
 
 **Highlights:** Gemini is selected consistently across CLI, MCP, and detached workers; cookie values are redacted from verbose logs.
@@ -86,6 +88,7 @@
 - Remote: advertise only addresses on which the service is listening.
 - Release: attach the npm tarball and its checksums to the GitHub Release and verify them before the Homebrew tap updates, so the formula no longer points at a missing asset. Fixes #443.
 - Dependencies: refresh provider SDKs, browser and terminal utilities, schema/query tooling, development dependencies, pnpm, and Pages actions; update OpenAI to 7.10, Google GenAI to 2.21, Inquirer to 14.2.1, Puppeteer to 25.10, Fast URI to 4.1.4, Vitest to 5, and Chrome DevTools protocol to 0.0.1692173 while retaining Node >=24 and the two-day release-age policy.
+
 
 ## 0.18.0 — 2026-08-14
 
