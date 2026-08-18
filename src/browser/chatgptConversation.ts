@@ -47,6 +47,12 @@ export type ProviderNativeFailureReason =
   | "evaluate-failed"
   | "digest-unavailable";
 
+export interface ProviderNativeTurnAttachment {
+  name: string | null;
+  bytes: number | null;
+  mimeType: string | null;
+}
+
 export interface ProviderNativeTurnDigest {
   /** Position among non-system turns, in conversation order. */
   index: number;
@@ -56,6 +62,13 @@ export interface ProviderNativeTurnDigest {
   bytes: number;
   /** SHA-256 of the normalized turn body, as decimal bytes. */
   sha256Decimal: number[];
+  /**
+   * Files the provider records against this turn. Deliberately outside the
+   * hashed body: an upload does not appear in the turn's content, so without
+   * this the evidence cannot say what was sent, and with it inside the body the
+   * digest would stop matching the reference normalization.
+   */
+  attachments?: ProviderNativeTurnAttachment[];
 }
 
 export interface ProviderNativeCaptureFailure {
@@ -295,6 +308,22 @@ function buildNormalizerSource(): string {
       }
       return order;
     };
+    // Uploaded files are not in the turn's content. ChatGPT records them beside
+    // it, in message.metadata.attachments, so a turn that carried a 50MB archive
+    // and one that carried nothing normalize to exactly the same body — and
+    // therefore to the same digest. Read alongside, never into the body: the
+    // hashed text has to stay comparable to the reference normalizer.
+    const turnAttachments = (message) => {
+      const metadata = message.metadata;
+      const attachments = metadata && Array.isArray(metadata.attachments) ? metadata.attachments : [];
+      return attachments
+        .filter((entry) => entry && typeof entry === 'object')
+        .map((entry) => ({
+          name: typeof entry.name === 'string' ? entry.name : null,
+          bytes: typeof entry.size === 'number' ? entry.size : null,
+          mimeType: typeof entry.mime_type === 'string' ? entry.mime_type : null,
+        }));
+    };
     const normalizeTurns = (document) => {
       if (!document || typeof document !== 'object' || !document.mapping) {
         throw new Error('backend-api JSON has no mapping');
@@ -307,7 +336,7 @@ function buildNormalizerSource(): string {
         const role = (message.author && typeof message.author.role === 'string') ? message.author.role : 'unknown';
         if (role === 'system') continue;
         const [contentType, body] = contentText(message.content || {});
-        turns.push({ index: turns.length, role, contentType, body });
+        turns.push({ index: turns.length, role, contentType, body, attachments: turnAttachments(message) });
       }
       return turns;
     };
@@ -415,6 +444,7 @@ function buildDigestSource(sourceExpression: string): string {
         contentType: turn.contentType,
         bytes: hashed.bytes,
         sha256Decimal: hashed.digest,
+        attachments: turn.attachments,
       });
     }
     const documentDigest = await digestDecimal(result.text);
@@ -812,6 +842,9 @@ export async function finalizeProviderNativeCapture(params: {
           role: turn.role,
           ct: turn.contentType,
           blen: turn.bytes,
+          ...(turn.attachments && turn.attachments.length > 0
+            ? { attachments: turn.attachments }
+            : {}),
           // Space-separated decimal bytes: the transport-safe encoding verifiers
           // of this format expect, and one that survives copy/paste through
           // channels that mangle hex or JSON arrays.
