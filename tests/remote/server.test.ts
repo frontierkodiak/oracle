@@ -1097,3 +1097,96 @@ describe("transport failure messages", () => {
     );
   });
 });
+
+describe("service token sourcing", () => {
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "takes the token from the environment when the flag is absent",
+    async () => {
+      // A supervised service has nowhere else to put a secret: a plist or unit
+      // carrying `--token <secret>` writes it into a world-readable file and into
+      // every `ps` listing on the host.
+      const previous = process.env.ORACLE_SERVE_TOKEN;
+      process.env.ORACLE_SERVE_TOKEN = "from-the-environment";
+      try {
+        const server = await createRemoteServer(
+          { host: "127.0.0.1", port: 0, logger: () => {} },
+          {
+            runBrowser: async () => ({
+              answerText: "",
+              answerMarkdown: "",
+              tookMs: 0,
+              answerTokens: 0,
+              answerChars: 0,
+            }),
+          },
+        );
+        const denied = await new Promise<number | undefined>((resolve) => {
+          http.get(
+            {
+              host: "127.0.0.1",
+              port: server.port,
+              path: "/health",
+              headers: { Authorization: "Bearer wrong" },
+            },
+            (res) => resolve(res.statusCode),
+          );
+        });
+        const allowed = await new Promise<number | undefined>((resolve) => {
+          http.get(
+            {
+              host: "127.0.0.1",
+              port: server.port,
+              path: "/health",
+              headers: { Authorization: "Bearer from-the-environment" },
+            },
+            (res) => resolve(res.statusCode),
+          );
+        });
+        expect(denied).toBe(401);
+        expect(allowed).toBe(200);
+        await server.close();
+      } finally {
+        if (previous === undefined) delete process.env.ORACLE_SERVE_TOKEN;
+        else process.env.ORACLE_SERVE_TOKEN = previous;
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "an explicit flag still wins over the environment",
+    async () => {
+      const previous = process.env.ORACLE_SERVE_TOKEN;
+      process.env.ORACLE_SERVE_TOKEN = "from-the-environment";
+      try {
+        const server = await createRemoteServer(
+          { host: "127.0.0.1", port: 0, token: "from-the-flag", logger: () => {} },
+          {
+            runBrowser: async () => ({
+              answerText: "",
+              answerMarkdown: "",
+              tookMs: 0,
+              answerTokens: 0,
+              answerChars: 0,
+            }),
+          },
+        );
+        const status = await new Promise<number | undefined>((resolve) => {
+          http.get(
+            {
+              host: "127.0.0.1",
+              port: server.port,
+              path: "/health",
+              headers: { Authorization: "Bearer from-the-flag" },
+            },
+            (res) => resolve(res.statusCode),
+          );
+        });
+        expect(status).toBe(200);
+        await server.close();
+      } finally {
+        if (previous === undefined) delete process.env.ORACLE_SERVE_TOKEN;
+        else process.env.ORACLE_SERVE_TOKEN = previous;
+      }
+    },
+  );
+});

@@ -206,7 +206,13 @@ export async function createRemoteServer(
   const runBrowser = deps.runBrowser ?? runBrowserMode;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
-  const authToken = options.token ?? randomBytes(16).toString("hex");
+  // Env before argv-only, because a service that must be started by a supervisor
+  // has nowhere to put a secret otherwise: a launchd plist or systemd unit
+  // carrying `--token <secret>` writes it into a world-readable file and into
+  // every `ps` listing on the host. The flag still wins when given, so nothing
+  // about the interactive path changes.
+  const authToken =
+    options.token ?? process.env.ORACLE_SERVE_TOKEN?.trim() ?? randomBytes(16).toString("hex");
   const startedAt = Date.now();
   const verbose = process.argv.includes("--verbose") || process.env.ORACLE_SERVE_VERBOSE === "1";
   const color = process.stdout.isTTY

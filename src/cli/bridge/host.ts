@@ -34,7 +34,15 @@ export async function runBridgeHost(options: BridgeHostCliOptions): Promise<void
   const bindRaw = options.bind?.trim() || "127.0.0.1:9473";
   const { hostname: bindHost, port: bindPort } = parseHostPort(bindRaw);
 
-  const tokenRaw = options.token?.trim() || "auto";
+  // See the note in remote/server.ts: a supervised service needs a way to be
+  // given its token that is not the process table. `--token` defaults to "auto",
+  // so that value means "nothing was chosen" and the environment gets its turn
+  // before a random one is generated.
+  const explicitToken = options.token?.trim();
+  const tokenRaw =
+    explicitToken && explicitToken !== "auto"
+      ? explicitToken
+      : process.env.ORACLE_BRIDGE_TOKEN?.trim() || "auto";
   const token = tokenRaw === "auto" ? randomBytes(16).toString("hex") : tokenRaw;
   if (!token.trim()) {
     throw new Error("Token is required (use --token auto to generate one).");
