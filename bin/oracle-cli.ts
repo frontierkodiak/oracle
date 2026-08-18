@@ -160,6 +160,7 @@ interface CliOptions extends OptionValues {
   browserManualLoginProfileDir?: string;
   copyProfile?: string;
   browserThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "pro" | "heavy";
+  browserCaptureProviderNative?: boolean;
   browserResearch?: "off" | "search" | "deep";
   browserFollowUp?: string[];
   browserAllowCookieErrors?: boolean;
@@ -835,6 +836,10 @@ program
       "--browser-research <mode>",
       "Browser research mode: search activates Web Search; deep activates Deep Research.",
     ).choices(["off", "search", "deep"]),
+  )
+  .option(
+    "--browser-capture-provider-native",
+    "Also save ChatGPT's own conversation document plus an independent set of per-turn digests alongside the run's artifacts, for runs whose transcript must be evidence rather than an answer.",
   )
   .addOption(
     new Option(
