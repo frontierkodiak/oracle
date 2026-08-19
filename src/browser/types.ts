@@ -121,6 +121,17 @@ export interface BrowserAutomationConfig {
   resumeConversationUrl?: string | null;
   /** Capture ChatGPT's own conversation document plus independent per-turn digests. */
   captureProviderNative?: boolean;
+  /**
+   * Capture an existing conversation and stop, without submitting a turn.
+   *
+   * The read-only half of {@link captureProviderNative}: open the conversation
+   * named by {@link resumeConversationUrl}, take the provider's own document and
+   * the independent per-turn digests, and exit. No model selection, no prompt,
+   * no mutation of the source conversation — which is the whole point, because a
+   * conversation being captured as evidence must not be altered by the act of
+   * capturing it.
+   */
+  captureOnly?: boolean;
 }
 
 export interface BrowserRunOptions {

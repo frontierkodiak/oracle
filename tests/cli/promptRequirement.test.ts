@@ -26,4 +26,17 @@ describe("shouldRequirePrompt", () => {
     const requires = shouldRequirePrompt(["--session", "abc123"], { session: "abc123" });
     expect(requires).toBe(false);
   });
+
+  test("does not require a prompt for a capture-only browser run", () => {
+    const requires = shouldRequirePrompt(
+      ["--browser-capture-only", "--chatgpt-url", "https://chatgpt.com/c/abc"],
+      { browserCaptureOnly: true },
+    );
+    expect(requires).toBe(false);
+  });
+
+  test("still requires a prompt for an ordinary browser run", () => {
+    const requires = shouldRequirePrompt(["--chatgpt-url", "https://chatgpt.com/c/abc"], {});
+    expect(requires).toBe(true);
+  });
 });

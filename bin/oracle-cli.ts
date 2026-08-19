@@ -153,6 +153,7 @@ interface CliOptions extends OptionValues {
   copyProfile?: string;
   browserThinkingTime?: "light" | "standard" | "extended" | "extra-high" | "pro" | "heavy";
   browserCaptureProviderNative?: boolean;
+  browserCaptureOnly?: boolean;
   browserResearch?: "off" | "deep";
   browserFollowUp?: string[];
   browserAllowCookieErrors?: boolean;
@@ -823,6 +824,10 @@ program
   .option(
     "--browser-capture-provider-native",
     "Also save ChatGPT's own conversation document plus an independent set of per-turn digests alongside the run's artifacts, for runs whose transcript must be evidence rather than an answer.",
+  )
+  .option(
+    "--browser-capture-only",
+    "Capture the existing conversation named by --chatgpt-url and stop. Reads the provider's own document and per-turn digests without selecting a model, typing, or submitting anything, so a conversation being kept as evidence is not altered by the act of capturing it. Requires a conversation URL (https://chatgpt.com/c/<id>); no prompt is needed.",
   )
   .addOption(
     new Option(
@@ -2142,6 +2147,32 @@ async function runRootCommand(options: CliOptions): Promise<void> {
       resolvedOptions.followupModel = options.followupModel;
     }
   }
+  if (options.browserCaptureOnly) {
+    if (options.followup) {
+      throw new Error("--browser-capture-only cannot be combined with --followup.");
+    }
+    if (normalizedMultiModels.length > 0) {
+      throw new Error("--browser-capture-only cannot be combined with --models.");
+    }
+    const { isRecoverableChatGptConversationUrl } =
+      await import("../src/browser/reattachability.js");
+    const requestedUrl = (options.chatgptUrl ?? options.browserUrl ?? "").trim();
+    if (!requestedUrl) {
+      throw new Error(
+        "--browser-capture-only requires the conversation to capture: --chatgpt-url https://chatgpt.com/c/<conversation-id>",
+      );
+    }
+    // Same gate the follow-up path uses before it navigates a signed-in
+    // profile: a capture must land on a real conversation, not a project
+    // shell, the home page, or somewhere off-site.
+    if (!isRecoverableChatGptConversationUrl(requestedUrl)) {
+      throw new Error(
+        `--browser-capture-only needs a conversation URL (https://chatgpt.com/c/<conversation-id>); received ${requestedUrl}`,
+      );
+    }
+    engine = "browser";
+    resolvedOptions.browserResumeConversationUrl = requestedUrl;
+  }
   const activeModel = resolvedOptions.model;
   if (options.reasoningMode && engine !== "api") {
     throw new Error("--reasoning-mode requires --engine api.");
@@ -2233,11 +2264,19 @@ async function runRootCommand(options: CliOptions): Promise<void> {
     return;
   }
 
-  if (!options.prompt) {
+  if (!options.prompt && !options.browserCaptureOnly) {
     throw new Error("Prompt is required when starting a new session.");
   }
+  if (options.browserCaptureOnly) {
+    // The session still needs a prompt field to exist; it must never be typed.
+    // Recording what the run actually did keeps the session log honest instead
+    // of leaving a blank where a question would normally be.
+    options.prompt = options.prompt?.trim()
+      ? options.prompt
+      : `(capture-only: read ${resolvedOptions.browserResumeConversationUrl ?? "conversation"} without submitting a turn)`;
+  }
 
-  if (userConfig.promptSuffix) {
+  if (userConfig.promptSuffix && options.prompt) {
     options.prompt = `${options.prompt.trim()}\n${userConfig.promptSuffix}`;
   }
   resolvedOptions.prompt = options.prompt;

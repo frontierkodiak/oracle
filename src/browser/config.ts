@@ -68,6 +68,7 @@ export const DEFAULT_BROWSER_CONFIG: ResolvedBrowserConfig = {
   archiveConversations: "auto",
   resumeConversationUrl: null,
   captureProviderNative: false,
+  captureOnly: false,
 };
 
 export function resolveBrowserConfig(
@@ -156,7 +157,12 @@ export function resolveBrowserConfig(
     resumeConversationUrl:
       config?.resumeConversationUrl ?? DEFAULT_BROWSER_CONFIG.resumeConversationUrl,
     captureProviderNative:
-      config?.captureProviderNative ?? DEFAULT_BROWSER_CONFIG.captureProviderNative,
+      // Capture-only exists to produce the capture; asking for it and getting
+      // nothing back would be a silent no-op.
+      config?.captureOnly === true
+        ? true
+        : (config?.captureProviderNative ?? DEFAULT_BROWSER_CONFIG.captureProviderNative),
+    captureOnly: config?.captureOnly ?? DEFAULT_BROWSER_CONFIG.captureOnly,
     manualLogin,
     manualLoginProfileDir: manualLogin ? resolvedProfileDir : null,
     manualLoginCookieSync:

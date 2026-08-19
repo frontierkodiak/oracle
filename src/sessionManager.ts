@@ -87,6 +87,8 @@ export interface BrowserSessionConfig {
   resumeConversationUrl?: string | null;
   /** Capture ChatGPT's own conversation document plus independent per-turn digests. */
   captureProviderNative?: boolean;
+  /** Capture the resumed conversation and stop, without submitting a turn. */
+  captureOnly?: boolean;
 }
 
 export interface BrowserRuntimeMetadata {

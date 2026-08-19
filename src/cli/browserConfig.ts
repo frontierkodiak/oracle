@@ -93,6 +93,7 @@ export interface BrowserFlagOptions {
   browserResearch?: BrowserResearchMode;
   browserArchive?: BrowserArchiveMode;
   browserCaptureProviderNative?: boolean;
+  browserCaptureOnly?: boolean;
   browserModelLabel?: string;
   /** Original model request before browser alias normalization. */
   browserRequestedModel?: ModelName;
@@ -330,6 +331,7 @@ export async function buildBrowserConfig(
     researchMode: options.browserResearch === "deep" ? "deep" : "off",
     archiveConversations: options.browserArchive,
     captureProviderNative: options.browserCaptureProviderNative,
+    captureOnly: options.browserCaptureOnly,
   };
 }
 
