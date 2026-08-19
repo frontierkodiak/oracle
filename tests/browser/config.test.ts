@@ -132,4 +132,21 @@ describe("resolveBrowserConfig", () => {
     );
     expect(resolveBrowserConfig({ researchMode: "deep", timeoutMs: 123 }).timeoutMs).toBe(123);
   });
+
+  test("capture-only turns provider-native capture on, since the capture is the point", () => {
+    const config = resolveBrowserConfig({ captureOnly: true });
+    expect(config.captureOnly).toBe(true);
+    expect(config.captureProviderNative).toBe(true);
+  });
+
+  test("capture-only is off by default and leaves capture opt-in alone", () => {
+    const config = resolveBrowserConfig({});
+    expect(config.captureOnly).toBe(false);
+    expect(config.captureProviderNative).toBe(false);
+  });
+
+  test("an explicit capture opt-out cannot silently disable a capture-only run", () => {
+    const config = resolveBrowserConfig({ captureOnly: true, captureProviderNative: false });
+    expect(config.captureProviderNative).toBe(true);
+  });
 });

@@ -968,8 +968,12 @@ function buildSkippedModelSelectionEvidence(
 }
 
 export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunResult> {
-  const promptText = options.prompt?.trim();
-  if (!promptText) {
+  const captureOnly = options.config?.captureOnly === true;
+  const promptText = options.prompt?.trim() ?? "";
+  // A capture-only run reads a conversation that already exists. Demanding a
+  // prompt would mean writing a message whose only correct fate is never to be
+  // sent, so the requirement is lifted rather than satisfied with a placeholder.
+  if (!promptText && !captureOnly) {
     throw new Error("Prompt text is required when using browser mode.");
   }
 
@@ -1481,6 +1485,66 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           }),
         );
       }
+    }
+    if (captureOnly) {
+      // Everything below this point types, selects, or submits. A capture-only
+      // run stops here: the conversation is open, authenticated, and hydrated,
+      // which is all the provider-native fetch needs. Its evidence is worthless
+      // if the act of taking it changed the thing it describes.
+      const conversationUrl = config.resumeConversationUrl ?? lastUrl ?? null;
+      try {
+        const { result } = await Runtime.evaluate({
+          expression: "location.href",
+          returnByValue: true,
+        });
+        if (typeof result?.value === "string") {
+          lastUrl = result.value;
+        }
+      } catch {
+        // The captured document, not the tab URL, is the evidence; a failed
+        // location read is not worth failing the capture over.
+      }
+      const capture = await runProviderNativeCapture({
+        Runtime,
+        config,
+        conversationUrl,
+        sessionId: options.sessionId,
+        logger,
+      });
+      if (capture.summary?.status !== "captured") {
+        const failure = capture.summary?.failure;
+        throw new BrowserAutomationError(
+          `Capture-only run could not read the conversation document${
+            failure ? ` (${failure.reason}${failure.detail ? `: ${failure.detail}` : ""})` : ""
+          }.`,
+          { stage: "capture-only", details: { conversationUrl, failure } },
+        );
+      }
+      runStatus = "complete";
+      logger(
+        `[capture] Captured ${capture.summary.turnCount ?? 0} turns (${
+          capture.summary.rawBytes ?? 0
+        } bytes) without submitting a turn.`,
+      );
+      return {
+        answerText: "",
+        answerMarkdown: "",
+        artifacts: capture.artifacts,
+        tookMs: Date.now() - startedAt,
+        answerTokens: 0,
+        answerChars: 0,
+        chromePid: chrome.pid,
+        chromePort: chrome.port,
+        chromeHost,
+        userDataDir,
+        chromeTargetId: lastTargetId,
+        tabUrl: lastUrl,
+        conversationId:
+          capture.summary.conversationId ??
+          (conversationUrl ? extractConversationIdFromUrl(conversationUrl) : undefined),
+        promptSubmitted: false,
+        controllerPid: process.pid,
+      };
     }
     const chatMode = await raceWithDisconnect(
       ensureChatMode(Runtime, Input, config.inputTimeoutMs, logger, {
