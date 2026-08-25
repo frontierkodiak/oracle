@@ -15,6 +15,7 @@ import { normalizeMaxConcurrentTabs } from "../browser/tabLeaseRegistry.js";
 import { loadUserConfig } from "../config.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import type { RemoteArtifactDescriptor, RemoteRunPayload, RemoteRunEvent } from "./types.js";
+import { DurableQueueStore, DURABLE_QUEUE_CAPABILITY_ID, DURABLE_QUEUE_CAPABILITY_VERSION } from "./durableQueue.js";
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
   CAPTURE_ONLY_FEATURE_ID,
@@ -84,6 +85,7 @@ const ARTIFACT_CAPABILITIES = {
       limits: { maxBytes: MAX_REMOTE_ARTIFACT_BYTES },
     },
     { id: CAPTURE_ONLY_FEATURE_ID, version: 1 },
+    { id: DURABLE_QUEUE_CAPABILITY_ID, version: DURABLE_QUEUE_CAPABILITY_VERSION, limits: { maxQueued: 8 } },
   ],
 };
 
@@ -250,6 +252,25 @@ export async function createRemoteServer(
   }
   const slots = new RunSlots(effectiveConcurrency, Math.max(0, options.maxQueuedRuns ?? 8));
   const artifactRegistry = new Map<string, RegisteredRemoteArtifact>();
+  const durableQueue = await DurableQueueStore.open({ capacity: effectiveConcurrency, backlog: options.maxQueuedRuns ?? 8 });
+  let durableWorkers = 0;
+  const pumpDurableQueue = async (): Promise<void> => {
+    while (durableWorkers < effectiveConcurrency) {
+      const next = durableQueue.claimNext(); if (!next) return;
+      durableWorkers += 1;
+      void (async () => {
+        const started = Date.now(); const id = next.id;
+        try {
+          const payload = await durableQueue.request(id); if (!payload) throw new Error("durable request missing");
+          const result = await runBrowser({ prompt: payload.prompt, attachments: [], config: payload.browserConfig as any, sessionId: String(payload.options?.sessionId ?? id), followUpPrompts: payload.options?.followUpPrompts as string[] | undefined });
+          durableQueue.transition(id, "completed", "terminal", { result, elapsedMs: Date.now() - started });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          durableQueue.transition(id, "failed", "terminal", { error: message, elapsedMs: Date.now() - started });
+        } finally { durableWorkers -= 1; void pumpDurableQueue(); }
+      })();
+    }
+  };
 
   if (!process.listenerCount("unhandledRejection")) {
     process.on("unhandledRejection", (reason) => {
@@ -291,9 +312,28 @@ export async function createRemoteServer(
           queuedRuns: slots.queuedCount,
           maxConcurrentRuns: slots.capacity,
           runtime,
+          queue: durableQueue.status(),
         }),
       );
       return;
+    }
+    const v1Match = req.url ? /^\/v1\/runs\/([^/]+)(?:\/(events|cancel))?$/.exec(req.url.split("?")[0] ?? "") : null;
+    if (req.url === "/v1/runs" || v1Match) {
+      if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return; }
+      if (req.method === "POST" && req.url === "/v1/runs") {
+        const key = req.headers["idempotency-key"]; if (typeof key !== "string" || !key.trim()) { res.writeHead(400); res.end(JSON.stringify({ error: "idempotency_key_required" })); return; }
+        try { const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload; const snapshot = durableQueue.submit(key, payload as any); res.writeHead(202, { "Content-Type": "application/json" }); res.end(JSON.stringify(snapshot)); void pumpDurableQueue(); } catch (error) { const message = error instanceof Error ? error.message : String(error); res.writeHead(message === "queue_full" ? 503 : message.includes("idempotency key conflicts") ? 409 : 400); res.end(JSON.stringify({ error: message })); } return;
+      }
+      if (!v1Match) { res.writeHead(404); res.end(); return; }
+      const id = decodeURIComponent(v1Match[1] ?? ""); const action = v1Match[2];
+      if (req.method === "GET" && action === "events") { const url = new URL(req.url ?? "", "http://oracle.local"); const after = Number(url.searchParams.get("after") ?? -1); res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ events: durableQueue.events(id, Number.isFinite(after) ? after : -1) })); return; }
+      if (req.method === "POST" && action === "cancel") { const snap = durableQueue.cancel(id); if (!snap) { res.writeHead(404); res.end(); return; } res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(snap)); return; }
+      if (req.method === "GET" && !action) { const snap = durableQueue.get(id); if (!snap) { res.writeHead(404); res.end(); return; } res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(snap)); return; }
+      res.writeHead(404); res.end(); return;
+    }
+    if (req.method === "GET" && req.url === "/v1/queue/status") {
+      if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) { res.writeHead(401); res.end(JSON.stringify({ error: "unauthorized" })); return; }
+      res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(durableQueue.status())); return;
     }
     const artifactMatch = matchArtifactRequest(req);
     if (artifactMatch) {
@@ -605,6 +645,7 @@ export async function createRemoteServer(
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });
+      durableQueue.close();
     },
   };
 }

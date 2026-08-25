@@ -26,6 +26,7 @@ import {
   type RemoteAttachmentPayload,
   type RemoteCapabilityRequirement,
 } from "./types.js";
+import type { DurableRunSnapshot } from "./types.js";
 import { parseHostPort } from "../bridge/connection.js";
 import { checkRemoteHealth } from "./health.js";
 
@@ -33,6 +34,42 @@ export interface RemoteExecutorOptions {
   host: string;
   token?: string;
   requiredCapabilities?: RemoteCapabilityRequirement[];
+}
+
+export async function submitDurableRemoteRun(params: {
+  host: string;
+  token?: string;
+  idempotencyKey: string;
+  payload: RemoteRunPayload;
+}): Promise<DurableRunSnapshot> {
+  return await requestDurableJson({ ...params, method: "POST", path: "/v1/runs" });
+}
+
+export async function getDurableRemoteRun(host: string, id: string, token?: string): Promise<DurableRunSnapshot> {
+  return await requestDurableJson({ host, token, method: "GET", path: `/v1/runs/${encodeURIComponent(id)}` });
+}
+
+export async function getDurableRemoteQueueStatus(host: string, token?: string): Promise<Record<string, unknown>> {
+  return await requestDurableJson({ host, token, method: "GET", path: "/v1/queue/status" }) as Record<string, unknown>;
+}
+
+export async function cancelDurableRemoteRun(host: string, id: string, token?: string): Promise<DurableRunSnapshot> {
+  return await requestDurableJson({ host, token, method: "POST", path: `/v1/runs/${encodeURIComponent(id)}/cancel` });
+}
+
+async function requestDurableJson(params: { host: string; token?: string; method: string; path: string; idempotencyKey?: string; payload?: unknown }): Promise<any> {
+  const { hostname, port } = parseHost(params.host);
+  const body = params.payload === undefined ? undefined : Buffer.from(JSON.stringify(params.payload));
+  return await new Promise((resolve, reject) => {
+    const req = http.request({ hostname, port, path: params.path, method: params.method, headers: { "content-type": "application/json", ...(body ? { "content-length": body.length } : {}), ...(params.idempotencyKey ? { "idempotency-key": params.idempotencyKey } : {}), ...(params.token ? { authorization: `Bearer ${params.token}` } : {}) } }, (res) => {
+      collectErrorOrJson(res).then((value) => res.statusCode && res.statusCode >= 200 && res.statusCode < 300 ? resolve(value) : reject(new Error(String((value as any)?.error ?? `HTTP ${res.statusCode}`)))).catch(reject);
+    });
+    req.on("error", reject); if (body) req.write(body); req.end();
+  });
+}
+
+function collectErrorOrJson(res: http.IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => { const chunks: Buffer[] = []; res.on("data", (chunk) => chunks.push(Buffer.from(chunk))); res.on("end", () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { resolve({ error: Buffer.concat(chunks).toString("utf8") }); } }); res.on("error", reject); });
 }
 
 export function createRemoteBrowserExecutor({
