@@ -320,7 +320,8 @@ export function createRemoteBrowserExecutor({
     };
     options.signal?.addEventListener("abort", cancel, { once: true });
     try {
-      const w = await watchDurableRemoteRun(host, accepted.id, {
+      let w: DurableWatchOutcome;
+      try { w = await watchDurableRemoteRun(host, accepted.id, {
         token,
         timeoutMs: Math.max(600_000, options.config?.timeoutMs ?? 0),
         signal: options.signal,
@@ -330,7 +331,7 @@ export function createRemoteBrowserExecutor({
           if (hint && options.runtimeHintCb)
             void options.runtimeHintCb(hint, (hint as any).modelSelection);
         },
-      });
+      }); } catch (error) { if (options.signal?.aborted) throw new Error("Remote browser run cancelled: the caller aborted."); throw error; }
       if (w.snapshot.state === "completed" && w.snapshot.result) {
         const raw = [
           ...(((w.snapshot as any).artifacts ?? []) as unknown[]),
