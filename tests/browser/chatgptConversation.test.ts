@@ -87,6 +87,8 @@ describe("provider conversation normalization", () => {
 });
 
 describe("provider capture failure handling", () => {
+  const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
+
   it("retains the independently fetched document as a separately drained artifact", async () => {
     const rawText = JSON.stringify({ conversation_id: "abc-123", mapping: {} });
     const digest = createHash("sha256").update(rawText).digest("hex");
@@ -125,6 +127,69 @@ describe("provider capture failure handling", () => {
         independentBytes: Buffer.byteLength(rawText),
       },
     });
+  });
+
+  it("rejects a non-ASCII authoritative document when UTF-8 bytes exceed the ledger ceiling", async () => {
+    const rawText = "é".repeat(MAX_DOCUMENT_BYTES / 2 + 1);
+    let cursor = 0;
+    const values: unknown[] = [
+      { result: { value: { ok: true, length: rawText.length } } },
+      { result: { value: rawText } },
+      { result: { value: true } },
+    ];
+    const outcome = await captureProviderNativeConversation({
+      Runtime: { evaluate: async () => values[cursor++] } as never,
+      conversationId: "abc-123",
+    });
+    expect(outcome).toEqual({
+      status: "unavailable",
+      failure: {
+        reason: "http-error",
+        detail: `document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
+      },
+    });
+  });
+
+  it("rejects a non-ASCII independent document when UTF-8 bytes exceed the ledger ceiling", async () => {
+    const rawText = "small authoritative document";
+    const independentText = "é".repeat(MAX_DOCUMENT_BYTES / 2 + 1);
+    const independentDigest = createHash("sha256").update(independentText).digest("hex");
+    let cursor = 0;
+    const values: unknown[] = [
+      { result: { value: { ok: true, length: rawText.length } } },
+      { result: { value: rawText } },
+      { result: { value: true } },
+      {
+        result: {
+          value: {
+            ok: true,
+            documentSha256Decimal: [...Buffer.from(independentDigest, "hex")],
+            documentBytes: Buffer.byteLength(independentText),
+            documentChars: independentText.length,
+            perTurn: [],
+            fetchedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      },
+      { result: { value: independentText } },
+      { result: { value: true } },
+    ];
+    const outcome = await captureProviderNativeConversation({
+      Runtime: { evaluate: async () => values[cursor++] } as never,
+      conversationId: "abc-123",
+    });
+    expect(outcome).toMatchObject({
+      status: "captured",
+      capture: {
+        evidenceFailure: {
+          reason: "http-error",
+          detail: `independent document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
+        },
+      },
+    });
+    expect(
+      (outcome as { capture?: { independentRawText?: string } }).capture?.independentRawText,
+    ).toBeUndefined();
   });
 
   it("treats a conversation with no id as a normal unavailable result, not an error", async () => {

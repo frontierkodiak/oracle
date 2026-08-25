@@ -114,6 +114,8 @@ const DRAIN_CHUNK_CHARS = 500_000;
  * and draining it would spend minutes proving that.
  */
 const MAX_DOCUMENT_CHARS = 64 * 1024 * 1024;
+/** Must match the ledger's MAX_RAW_BYTES artifact ceiling exactly. */
+const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
 const CAPTURE_TIMEOUT_MS = 120_000;
 
 async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -624,6 +626,8 @@ export async function captureProviderNativeConversation(params: {
   }
 
   let rawText = "";
+  let rawByteCount = 0;
+  let rawOverflow = false;
   try {
     while (rawText.length < head.length) {
       const chunk = await evaluateInPage<string>(
@@ -634,12 +638,27 @@ export async function captureProviderNativeConversation(params: {
       if (chunk === null || chunk === "") {
         break;
       }
+      const chunkBytes = Buffer.byteLength(chunk, "utf8");
+      if (rawByteCount > MAX_DOCUMENT_BYTES - chunkBytes) {
+        rawOverflow = true;
+        break;
+      }
       rawText += chunk;
+      rawByteCount += chunkBytes;
     }
   } finally {
     await evaluateInPage(Runtime, buildReleaseExpression(), false).catch(() => null);
   }
 
+  if (rawOverflow) {
+    return {
+      status: "unavailable",
+      failure: {
+        reason: "http-error",
+        detail: `document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
+      },
+    };
+  }
   if (rawText.length !== head.length) {
     return {
       status: "unavailable",
@@ -691,6 +710,8 @@ export async function captureProviderNativeConversation(params: {
       fetchedAt: evidence.fetchedAt,
     };
     let independentText = "";
+    let independentByteCount = 0;
+    let independentOverflow = false;
     try {
       while (independentText.length < evidence.documentChars) {
         const chunk = await evaluateInPage<string>(
@@ -699,7 +720,13 @@ export async function captureProviderNativeConversation(params: {
           false,
         );
         if (chunk === null || chunk === "") break;
+        const chunkBytes = Buffer.byteLength(chunk, "utf8");
+        if (independentByteCount > MAX_DOCUMENT_BYTES - chunkBytes) {
+          independentOverflow = true;
+          break;
+        }
         independentText += chunk;
+        independentByteCount += chunkBytes;
       }
     } catch (error) {
       capture.evidenceFailure = {
@@ -711,11 +738,18 @@ export async function captureProviderNativeConversation(params: {
         () => null,
       );
     }
+    if (!capture.evidenceFailure && independentOverflow) {
+      capture.evidenceFailure = {
+        reason: "http-error",
+        detail: `independent document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
+      };
+    }
     if (!capture.evidenceFailure) {
       const independentBytes = Buffer.from(independentText, "utf8");
       const independentSha256 = createHash("sha256").update(independentBytes).digest("hex");
       if (
         independentText.length !== evidence.documentChars ||
+        independentByteCount !== evidence.documentBytes ||
         independentBytes.byteLength !== evidence.documentBytes ||
         independentSha256 !== Buffer.from(evidence.documentSha256Decimal).toString("hex")
       ) {

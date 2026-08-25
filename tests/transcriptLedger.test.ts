@@ -448,6 +448,23 @@ describe("TranscriptLedger", () => {
     forestLedger.close();
   });
 
+  it("enforces the same byte ceiling for a non-ASCII independent artifact", async () => {
+    const dir = await tempRoot();
+    const files = await fixture(dir, "byte-ceiling");
+    await writeFile(files.independentPath, "é".repeat((64 * 1024 * 1024) / 2 + 1));
+    const ledger = await TranscriptLedger.open({ root: path.join(dir, "ledger") });
+    await expect(
+      ledger.ingestPair({
+        provider: "chatgpt",
+        profileId: "p",
+        rawPath: files.rawPath,
+        evidencePath: files.evidencePath,
+        independentPath: files.independentPath,
+      }),
+    ).rejects.toThrow(/exceeds/);
+    ledger.close();
+  });
+
   it("ingests the canonical all-content-types fixture and fails closed on evidence tampering", async () => {
     const dir = await tempRoot();
     const fixturePath = path.join(
