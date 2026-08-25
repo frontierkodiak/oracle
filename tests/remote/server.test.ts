@@ -5,7 +5,12 @@ import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/promises";
-import { createRemoteServer, pickClientBrowserConfig, RunSlots } from "../../src/remote/server.js";
+import {
+  createRemoteServer,
+  pickClientBrowserConfig,
+  RunSlots,
+  serveRemote,
+} from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
 import type { BrowserRunResult } from "../../src/browserMode.js";
 import type { RemoteArtifactDescriptor } from "../../src/remote/types.js";
@@ -27,6 +32,36 @@ const CAN_LISTEN_LOCALHOST =
   ).status === 0;
 
 describe("remote browser service", () => {
+  test("serveRemote refuses unsupported Node before touching browser startup state", async () => {
+    const nodeVersions = ["22.23.2", "23.0.0"];
+    for (const runtimeVersion of nodeVersions) {
+      const root = await mkdtemp(path.join(os.tmpdir(), "oracle-serve-runtime-gate-"));
+      const profile = path.join(root, "profile");
+      const nodeDescriptor = Object.getOwnPropertyDescriptor(process.versions, "node");
+      if (!nodeDescriptor) throw new Error("process.versions.node descriptor is unavailable");
+      try {
+        Object.defineProperty(process.versions, "node", {
+          ...nodeDescriptor,
+          value: runtimeVersion,
+        });
+        await expect(
+          serveRemote({
+            host: "127.0.0.1",
+            port: 0,
+            manualLoginDefault: true,
+            manualLoginProfileDir: profile,
+          }),
+        ).rejects.toThrow("Oracle remote service requires Node.js >= 24");
+        // The gate is before cookie/profile/DevTools/Chrome work and before the
+        // server is created, so no startup state or listener can be left behind.
+        await expect(readdir(root)).resolves.toEqual([]);
+      } finally {
+        Object.defineProperty(process.versions, "node", nodeDescriptor);
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  });
+
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "streams logs and returns results via client executor",
     async () => {
@@ -118,9 +153,15 @@ describe("remote browser service", () => {
       expect(healthOk.statusCode).toBe(200);
       expect(healthOk.json?.ok).toBe(true);
       expect(typeof healthOk.json?.version).toBe("string");
+      expect(healthOk.json?.runtime).toEqual({
+        name: "node",
+        version: process.versions.node,
+        major: Number(process.versions.node.split(".")[0]),
+        minimumMajor: 24,
+      });
       expect(healthOk.json?.capabilities).toMatchObject({
-        artifactTransfer: true,
-        artifactProtocolVersion: 1,
+        schemaVersion: 1,
+        features: [{ id: "oracle.remote.artifact-transfer", version: 1 }],
       });
 
       const artifactUnauthorized = await httpGetJson({
@@ -484,6 +525,27 @@ async function createFakeArtifactBridge({
 }> {
   let artifactRequestCount = 0;
   const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          version: "test",
+          runtime: { name: "node", version: "24.0.0", major: 24, minimumMajor: 24 },
+          capabilities: {
+            schemaVersion: 1,
+            features: [
+              {
+                id: "oracle.remote.artifact-transfer",
+                version: 1,
+                limits: { maxBytes: 512 * 1024 * 1024 },
+              },
+            ],
+          },
+        }),
+      );
+      return;
+    }
     if (req.method === "POST" && req.url === "/runs") {
       req.resume();
       res.writeHead(200, { "Content-Type": "application/x-ndjson" });
@@ -1126,6 +1188,9 @@ describe("cancellation reaches the run", () => {
         },
         () => {},
       );
+      request.on("error", () => {
+        // destroy() below intentionally resets the socket to model a dropped caller.
+      });
       request.write(JSON.stringify({ prompt: "x", options: {}, browserConfig: {} }));
       request.end();
 
@@ -1154,6 +1219,23 @@ describe("transport failure messages", () => {
       // test is entirely the client's, and a real server cannot drop a socket
       // mid-run without also waiting for the run it is pretending to perform.
       const stub = http.createServer((req, res) => {
+        if (req.method === "GET" && req.url === "/health") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              version: "0.18.0",
+              runtime: { name: "node", version: "25.1.0", major: 25, minimumMajor: 24 },
+              capabilities: {
+                schemaVersion: 1,
+                features: [
+                  { id: "oracle.remote.artifact-transfer", version: 1, limits: { maxBytes: 1024 } },
+                ],
+              },
+            }),
+          );
+          return;
+        }
         res.writeHead(200, { "Content-Type": "application/x-ndjson" });
         res.write(`${JSON.stringify({ type: "log", message: "started" })}\n`);
         setTimeout(() => req.socket.destroy(), 50);

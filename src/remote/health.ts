@@ -1,7 +1,19 @@
 import http from "node:http";
 import net from "node:net";
 import { parseHostPort } from "../bridge/connection.js";
-import { MAX_REMOTE_ARTIFACT_BYTES, type RemoteArtifactCapabilities } from "./types.js";
+import {
+  assertSupportedNodeVersion,
+  ORACLE_MIN_NODE_MAJOR,
+  type OracleRuntimeIdentity,
+} from "./runtime.js";
+import {
+  ARTIFACT_TRANSFER_FEATURE_ID,
+  MAX_REMOTE_ARTIFACT_BYTES,
+  REMOTE_HEALTH_SCHEMA_VERSION,
+  type RemoteArtifactCapabilities,
+  type RemoteCapabilityFeature,
+  type RemoteCapabilityManifest,
+} from "./types.js";
 
 export interface RemoteHealthResult {
   ok: boolean;
@@ -9,6 +21,8 @@ export interface RemoteHealthResult {
   error?: string;
   version?: string;
   uptimeSeconds?: number;
+  runtime?: OracleRuntimeIdentity;
+  manifest?: RemoteCapabilityManifest;
   capabilities?: RemoteArtifactCapabilities;
 }
 
@@ -70,15 +84,21 @@ export async function checkRemoteHealth({
       const ok = (response.json as { ok?: unknown }).ok === true;
       const version = (response.json as { version?: unknown }).version;
       const uptimeSeconds = (response.json as { uptimeSeconds?: unknown }).uptimeSeconds;
-      const capabilities = parseCapabilities(
-        (response.json as { capabilities?: unknown }).capabilities,
-      );
+      const parsed = parseHealthEnvelope(response.json);
+      if (!parsed)
+        return {
+          ok: false,
+          statusCode: response.statusCode,
+          error: "malformed /health handshake (upgrade oracle on the host and retry)",
+        };
       return {
-        ok,
+        ok: ok && parsed.ok,
         statusCode: response.statusCode,
         version: typeof version === "string" ? version : undefined,
         uptimeSeconds: typeof uptimeSeconds === "number" ? uptimeSeconds : undefined,
-        capabilities,
+        runtime: parsed.runtime,
+        manifest: parsed.manifest,
+        capabilities: parsed.artifact,
       };
     }
     if (response.statusCode === 404) {
@@ -96,34 +116,90 @@ export async function checkRemoteHealth({
   }
 }
 
-function parseCapabilities(value: unknown): RemoteArtifactCapabilities | undefined {
-  if (!value || typeof value !== "object") {
-    return undefined;
-  }
-  const raw = value as {
-    artifactTransfer?: unknown;
-    artifactProtocolVersion?: unknown;
-    maxArtifactBytes?: unknown;
-  };
-  if (raw.artifactTransfer !== true) {
-    return undefined;
-  }
-  const artifactProtocolVersion = raw.artifactProtocolVersion;
-  const maxArtifactBytes = raw.maxArtifactBytes;
+export function parseHealthEnvelope(value: unknown):
+  | {
+      ok: boolean;
+      runtime: OracleRuntimeIdentity;
+      manifest: RemoteCapabilityManifest;
+      artifact?: RemoteArtifactCapabilities;
+    }
+  | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  const runtime = raw.runtime;
+  if (!runtime || typeof runtime !== "object") return undefined;
+  const rt = runtime as Record<string, unknown>;
   if (
-    typeof artifactProtocolVersion !== "number" ||
-    !Number.isSafeInteger(artifactProtocolVersion) ||
-    artifactProtocolVersion <= 0 ||
-    typeof maxArtifactBytes !== "number" ||
-    !Number.isSafeInteger(maxArtifactBytes) ||
-    maxArtifactBytes <= 0
-  ) {
+    raw.ok !== true ||
+    typeof raw.version !== "string" ||
+    raw.version.trim().length === 0 ||
+    rt.name !== "node" ||
+    typeof rt.version !== "string" ||
+    typeof rt.major !== "number" ||
+    !Number.isSafeInteger(rt.major) ||
+    rt.minimumMajor !== ORACLE_MIN_NODE_MAJOR
+  )
+    return undefined;
+  try {
+    assertSupportedNodeVersion(rt.version);
+  } catch {
     return undefined;
   }
+  if (rt.major !== Number(rt.version.split(".")[0])) return undefined;
+  const caps = raw.capabilities;
+  if (!caps || typeof caps !== "object") return undefined;
+  const c = caps as Record<string, unknown>;
+  if (c.schemaVersion !== REMOTE_HEALTH_SCHEMA_VERSION || !Array.isArray(c.features))
+    return undefined;
+  const features: RemoteCapabilityFeature[] = [];
+  const ids = new Set<string>();
+  for (const item of c.features) {
+    if (!item || typeof item !== "object") return undefined;
+    const f = item as Record<string, unknown>;
+    if (
+      typeof f.id !== "string" ||
+      f.id.trim().length === 0 ||
+      f.id !== f.id.trim() ||
+      !f.id.includes(".") ||
+      typeof f.version !== "number" ||
+      !Number.isSafeInteger(f.version) ||
+      f.version <= 0 ||
+      ids.has(f.id)
+    )
+      return undefined;
+    ids.add(f.id);
+    if (
+      f.limits !== undefined &&
+      (!f.limits || typeof f.limits !== "object" || Array.isArray(f.limits))
+    )
+      return undefined;
+    const limits = f.limits as Record<string, unknown> | undefined;
+    if (
+      limits?.maxBytes !== undefined &&
+      (typeof limits.maxBytes !== "number" ||
+        !Number.isSafeInteger(limits.maxBytes) ||
+        limits.maxBytes <= 0)
+    )
+      return undefined;
+    features.push({ id: f.id, version: f.version, ...(limits ? { limits: { ...limits } } : {}) });
+  }
+  const artifactFeature = features.find(
+    (f) => f.id === ARTIFACT_TRANSFER_FEATURE_ID && f.version === 1,
+  );
+  const artifactMaxBytes = artifactFeature?.limits?.maxBytes;
+  const artifact =
+    typeof artifactMaxBytes === "number" && artifactMaxBytes > 0
+      ? {
+          artifactTransfer: true,
+          artifactProtocolVersion: 1,
+          maxArtifactBytes: Math.min(artifactMaxBytes, MAX_REMOTE_ARTIFACT_BYTES),
+        }
+      : undefined;
   return {
-    artifactTransfer: true,
-    artifactProtocolVersion,
-    maxArtifactBytes: Math.min(maxArtifactBytes, MAX_REMOTE_ARTIFACT_BYTES),
+    ok: raw.ok === true,
+    runtime: rt as unknown as OracleRuntimeIdentity,
+    manifest: { schemaVersion: REMOTE_HEALTH_SCHEMA_VERSION, features },
+    artifact,
   };
 }
 
