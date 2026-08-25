@@ -1077,7 +1077,10 @@ const remoteSubmit = addRemoteConnectionOptions(
     .option("--verbose", "Enable remote browser logging."),
 );
 remoteSubmit.action(async function (this: Command) {
-  const options = this.opts<Record<string, unknown>>();
+  // Commander may attach flags declared on both the root command and this
+  // subcommand to different command nodes. Always consume the merged view so
+  // explicit remote-submit flags cannot be shadowed by root defaults.
+  const options = this.optsWithGlobals<Record<string, unknown>>();
   const { host, token } = remoteHostAndToken(this);
   const prompt = await resolveRemotePrompt(options.prompt as string | undefined);
   const sessionId =
