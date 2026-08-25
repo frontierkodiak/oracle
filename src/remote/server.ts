@@ -273,7 +273,11 @@ export async function createRemoteServer(
           const attachments = await materialize(payload.attachments as any[] | undefined, "attachments");
           const fallback = payload.fallbackSubmission as any;
           const fallbackSubmission = fallback ? { prompt: fallback.prompt, attachments: await materialize(fallback.attachments as any[] | undefined, "fallback-attachments") } : undefined;
-          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: payload.browserConfig as any, signal: controller.signal, sessionId: String(payload.options?.sessionId ?? id), followUpPrompts: payload.options?.followUpPrompts as string[] | undefined });
+          const automationLogger: BrowserLogger = ((message?: string) => {
+            if (typeof message === "string") logger(`[run ${id}] ${message}`);
+          }) as BrowserLogger;
+          automationLogger.verbose = Boolean(payload.options?.verbose);
+          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: payload.browserConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId: String(payload.options?.sessionId ?? id), followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && payload.browserConfig.keepBrowser !== true) });
           durableQueue.transition(id, "completed", "terminal", { result, elapsedMs: Date.now() - started });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -319,9 +323,9 @@ export async function createRemoteServer(
           capabilities: ARTIFACT_CAPABILITIES,
           // So a caller can decide whether to send work now or later, instead of
           // discovering the answer by being queued.
-          activeRuns: slots.activeCount,
-          queuedRuns: slots.queuedCount,
-          maxConcurrentRuns: slots.capacity,
+          activeRuns: durableQueue.status().active,
+          queuedRuns: durableQueue.status().queued,
+          maxConcurrentRuns: durableQueue.status().capacity,
           runtime,
           queue: durableQueue.status(),
         }),
@@ -333,7 +337,12 @@ export async function createRemoteServer(
       if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return; }
       if (req.method === "POST" && req.url === "/v1/runs") {
         const key = req.headers["idempotency-key"]; if (typeof key !== "string" || !key.trim()) { res.writeHead(400); res.end(JSON.stringify({ error: "idempotency_key_required" })); return; }
-        try { const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload; const snapshot = await durableQueue.submit(key, payload as any); res.writeHead(202, { "Content-Type": "application/json" }); res.end(JSON.stringify(snapshot)); void pumpDurableQueue(); } catch (error) { const message = error instanceof Error ? error.message : String(error); res.writeHead(message === "queue_full" ? 503 : message.includes("idempotency key conflicts") ? 409 : 400); res.end(JSON.stringify({ error: message })); } return;
+        try {
+          const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload;
+          normalizeRemotePayload(payload);
+          const snapshot = await durableQueue.submit(key, payload as any);
+          res.writeHead(202, { "Content-Type": "application/json" }); res.end(JSON.stringify(snapshot)); void pumpDurableQueue();
+        } catch (error) { const message = error instanceof Error ? error.message : String(error); res.writeHead(message === "queue_full" ? 503 : message.includes("idempotency key conflicts") ? 409 : 400); res.end(JSON.stringify({ error: message })); } return;
       }
       if (!v1Match) { res.writeHead(404); res.end(); return; }
       const id = decodeURIComponent(v1Match[1] ?? ""); const action = v1Match[2];
@@ -997,12 +1006,30 @@ function classifySourceUrlKind(sourceUrl?: string): RemoteArtifactDescriptor["so
   return "chatgpt-file-endpoint";
 }
 
-async function readRequestBody(req: http.IncomingMessage): Promise<string> {
+async function readRequestBody(req: http.IncomingMessage, maxBytes = 64 * 1024 * 1024): Promise<string> {
+  const declared = Number(req.headers["content-length"] ?? 0);
+  if (declared > maxBytes) throw new Error("request body too large");
   const chunks: Buffer[] = [];
+  let total = 0;
   for await (const chunk of req) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    const buffer = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    total += buffer.byteLength;
+    if (total > maxBytes) throw new Error("request body too large");
+    chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString("utf8");
+}
+
+function normalizeRemotePayload(payload: RemoteRunPayload): void {
+  if (!payload || typeof payload !== "object" || !payload.browserConfig) throw new Error("invalid_request");
+  payload.browserConfig.url = normalizeChatgptUrl(payload.browserConfig.url, CHATGPT_URL);
+  payload.browserConfig = pickClientBrowserConfig(payload.browserConfig);
+  if (payload.browserConfig.captureOnly === true) {
+    payload.prompt = ""; payload.attachments = []; payload.fallbackSubmission = undefined;
+    payload.options = { ...payload.options, followUpPrompts: undefined };
+    payload.browserConfig.desiredModel = undefined; payload.browserConfig.modelStrategy = undefined;
+    payload.browserConfig.thinkingTime = undefined; payload.browserConfig.researchMode = undefined;
+  }
 }
 
 /**
