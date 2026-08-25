@@ -813,8 +813,32 @@ function isValidResult(result: BrowserRunResult): boolean {
     typeof result.answerMarkdown === "string" &&
     [result.tookMs, result.answerTokens, result.answerChars].every(
       (n) => Number.isSafeInteger(n) && n >= 0,
-    )
+    ) &&
+    isSanitizedRemoteValue(result)
   );
+}
+/** A durable remote result may contain answer metadata and artifact descriptors,
+ * but never a host-local file, Chrome, or runtime handle. */
+function isSanitizedRemoteValue(value: unknown): boolean {
+  if (Array.isArray(value)) return value.every(isSanitizedRemoteValue);
+  if (!value || typeof value !== "object") return true;
+  return Object.entries(value).every(([key, child]) => {
+    if (
+      [
+        "path",
+        "chromePid",
+        "chromePort",
+        "chromeHost",
+        "chromeBrowserWSEndpoint",
+        "chromeProfileRoot",
+        "userDataDir",
+        "chromeTargetId",
+        "controllerPid",
+      ].includes(key)
+    )
+      return false;
+    return isSanitizedRemoteValue(child);
+  });
 }
 function isFailureMetadata(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
