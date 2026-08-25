@@ -116,6 +116,7 @@ describe("remote executor health preflight", () => {
       if (req.method === "POST" && (req.url === "/runs" || req.url === "/v1/runs")) {
         runRequests += 1;
         req.resume();
+        const now = new Date().toISOString();
         res.writeHead(req.url === "/v1/runs" ? 202 : 200, { "Content-Type": "application/json" });
         res.end(
           req.url === "/v1/runs"
@@ -126,6 +127,8 @@ describe("remote executor health preflight", () => {
                 queuePosition: 0,
                 roughEtaMs: 0,
                 requestHash: "a".repeat(64),
+                createdAt: now,
+                updatedAt: now,
                 result: {
                   answerText: "ok",
                   answerMarkdown: "ok",
@@ -141,7 +144,8 @@ describe("remote executor health preflight", () => {
       if (req.method === "GET" && req.url?.startsWith("/v1/runs/")) {
         res.writeHead(200, { "Content-Type": "application/json" });
         if (req.url.includes("/events")) res.end(JSON.stringify({ events: [] }));
-        else
+        else {
+          const now = new Date().toISOString();
           res.end(
             JSON.stringify({
               id: "11111111-1111-4111-8111-111111111111",
@@ -150,6 +154,8 @@ describe("remote executor health preflight", () => {
               queuePosition: 0,
               roughEtaMs: 0,
               requestHash: "a".repeat(64),
+              createdAt: now,
+              updatedAt: now,
               result: {
                 answerText: "ok",
                 answerMarkdown: "ok",
@@ -159,6 +165,7 @@ describe("remote executor health preflight", () => {
               },
             }),
           );
+        }
         return;
       }
       res.writeHead(404);
