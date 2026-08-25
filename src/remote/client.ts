@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat, chmod, lstat } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { BrowserRunOptions, BrowserRunResult } from "../browserMode.js";
@@ -77,10 +78,13 @@ async function privateReceiptParent(target: string): Promise<void> {
 export async function readDurableReceipt(sessionId: string): Promise<DurableReceipt | undefined> {
   try {
     const target = receiptPath(sessionId);
-    const info = await lstat(target);
-    if (!info.isFile() || info.isSymbolicLink()) throw new Error("unsafe durable receipt file");
-    await chmod(target, 0o600);
-    return validateReceipt(JSON.parse(await readFile(target, "utf8")), sessionId);
+    const handle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error("unsafe durable receipt file");
+      await chmod(target, 0o600);
+      return validateReceipt(JSON.parse(await handle.readFile("utf8")), sessionId);
+    } finally { await handle.close(); }
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new Error("invalid durable queue receipt");
@@ -226,6 +230,7 @@ export async function watchDurableRemoteRun(
       o.onSnapshot?.(s);
       if (TERMINAL.has(s.state)) return { snapshot: s, detached };
     } catch (e) {
+      if (!isRetryableTransport(e)) throw e;
       detached = true;
       if (Date.now() >= deadline)
         throw new Error(`durable run observer timed out while detached: ${safeMessage(e)}`);
@@ -334,11 +339,9 @@ export function createRemoteBrowserExecutor({
         const descriptors = raw.filter((x): x is RemoteArtifactDescriptor =>
           Boolean(x && typeof x === "object" && "artifactId" in x && "runId" in x),
         );
-        const transferred = await Promise.all(
-          descriptors.map((descriptor) =>
-            transferRemoteArtifact({ host, token, descriptor, sessionId, log: options.log }),
-          ),
-        );
+        const transferResults = await Promise.allSettled(descriptors.map((descriptor) => transferRemoteArtifact({ host, token, descriptor, sessionId, log: options.log })));
+        const transferred = transferResults.flatMap((item) => item.status === "fulfilled" ? [item.value] : []);
+        for (const failure of transferResults) if (failure.status === "rejected") options.log?.(`[remote] artifact transfer failed: ${safeMessage(failure.reason)}`);
         return {
           ...w.snapshot.result,
           savedFiles: [...(w.snapshot.result.savedFiles ?? []), ...transferred],

@@ -16,6 +16,7 @@ import { loadUserConfig } from "../config.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import type { RemoteArtifactDescriptor, RemoteRunPayload, RemoteRunEvent } from "./types.js";
 import { DurableQueueStore, DURABLE_QUEUE_CAPABILITY_ID, DURABLE_QUEUE_CAPABILITY_VERSION } from "./durableQueue.js";
+import { persistBrowserRunArtifacts, reopenDurableArtifactRun, resolveDurableArtifact } from "./durableArtifacts.js";
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
   CAPTURE_ONLY_FEATURE_ID,
@@ -56,6 +57,8 @@ export interface RemoteServerOptions {
   maxConcurrentRuns?: number;
   /** Callers that may wait for a slot before the service starts refusing. */
   maxQueuedRuns?: number;
+  /** Test/embedding seam; production defaults to ORACLE_HOME_DIR. */
+  queueHomeDir?: string;
 }
 
 interface RemoteServerDeps {
@@ -253,7 +256,7 @@ export async function createRemoteServer(
   }
   const slots = new RunSlots(effectiveConcurrency, Math.max(0, options.maxQueuedRuns ?? 8));
   const artifactRegistry = new Map<string, RegisteredRemoteArtifact>();
-  const durableQueue = await DurableQueueStore.open({ capacity: effectiveConcurrency, backlog: options.maxQueuedRuns ?? 8 });
+  const durableQueue = await DurableQueueStore.open({ homeDir: options.queueHomeDir, capacity: effectiveConcurrency, backlog: options.maxQueuedRuns ?? 8 });
   let durableWorkers = 0;
   const durableControllers = new Map<string, AbortController>();
   const pumpDurableQueue = async (): Promise<void> => {
@@ -281,15 +284,24 @@ export async function createRemoteServer(
             if (typeof message === "string") logger(`[run ${id}] ${message}`);
           }) as BrowserLogger;
           automationLogger.verbose = Boolean(payload.options?.verbose);
-          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: hostConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId, followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser) });
-          durableQueue.transition(id, "completed", "terminal", { result, elapsedMs: Date.now() - started });
+          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: hostConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId, followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser), runtimeHintCb: async (hint) => {
+            const raw = hint as unknown as Record<string, unknown>;
+            durableQueue.transition(id, "running", raw.promptSubmitted === true ? "prompt_submitted" : "browser_attached", { runtimeHint: raw });
+          } });
+          const durable = await persistBrowserRunArtifacts({ queueRoot: durableQueue.root, runId: id, result });
+          const model = typeof (result.modelSelection as any)?.model === "string" ? String((result.modelSelection as any).model) : "";
+          const qualifying = payload.browserConfig.captureOnly !== true && /pro/i.test(model) && result.promptSubmitted === true;
+          durableQueue.transition(id, "completed", "terminal", { result: { ...durable.result, artifacts: durable.descriptors }, elapsedMs: Date.now() - started, model, etaQualifying: qualifying });
         } catch (error) {
-          const message = formatDurableFailure(error);
-          durableQueue.transition(id, controller.signal.aborted ? "canceled" : "failed", "terminal", { error: message, elapsedMs: Date.now() - started });
+          const failure = formatDurableFailure(error);
+          const phase = durableQueue.get(id)?.phase;
+          const terminalState = controller.signal.aborted ? "canceled" : (phase === "prompt_submitted" || phase === "awaiting_response" || phase === "capturing") ? "unknown" : "failed";
+          durableQueue.transition(id, terminalState, "terminal", { error: failure.message, errorMetadata: failure.metadata, elapsedMs: Date.now() - started, etaQualifying: false });
         } finally { durableControllers.delete(id); durableWorkers -= 1; void pumpDurableQueue(); }
       })();
     }
   };
+  void pumpDurableQueue();
 
   if (!process.listenerCount("unhandledRejection")) {
     process.on("unhandledRejection", (reason) => {
@@ -370,6 +382,7 @@ export async function createRemoteServer(
         verbose,
         runId: artifactMatch.runId,
         artifactId: artifactMatch.artifactId,
+        queueRoot: durableQueue.root,
       });
       return;
     }
@@ -820,6 +833,7 @@ async function serveRemoteArtifact(params: {
   verbose: boolean;
   runId: string;
   artifactId: string;
+  queueRoot?: string;
 }): Promise<void> {
   const authHeader = params.req.headers.authorization ?? "";
   if (authHeader !== `Bearer ${params.authToken}`) {
@@ -833,6 +847,17 @@ async function serveRemoteArtifact(params: {
     return;
   }
 
+  if (params.queueRoot) {
+    try {
+      const durable = await resolveDurableArtifact({ queueRoot: params.queueRoot, runId: params.runId, artifactId: params.artifactId });
+      const fileStat = await stat(durable.filePath);
+      if (!fileStat.isFile() || fileStat.size <= 0) throw new Error("artifact_unavailable");
+      params.res.writeHead(200, { "Content-Type": sanitizeArtifactMimeType(durable.descriptor.mimeType) ?? "application/octet-stream", "Content-Length": fileStat.size, "Content-Disposition": `attachment; filename="${sanitizeArtifactFilename(durable.descriptor.filename, "artifact.bin").replace(/"/g, "")}"`, "X-Oracle-Artifact-Sha256": durable.descriptor.sha256 });
+      await pipeline(createReadStream(durable.filePath), params.res); return;
+    } catch {
+      // Fall through to the legacy in-memory registry for old, already-running clients.
+    }
+  }
   pruneExpiredArtifacts(params.artifactRegistry);
   const key = remoteArtifactKey(params.runId, params.artifactId);
   const artifact = params.artifactRegistry.get(key);
@@ -1015,7 +1040,7 @@ function classifySourceUrlKind(sourceUrl?: string): RemoteArtifactDescriptor["so
   return "chatgpt-file-endpoint";
 }
 
-async function readRequestBody(req: http.IncomingMessage, maxBytes = 64 * 1024 * 1024): Promise<string> {
+async function readRequestBody(req: http.IncomingMessage, maxBytes = MAX_REMOTE_ARTIFACT_BYTES + 32 * 1024 * 1024): Promise<string> {
   const declared = Number(req.headers["content-length"] ?? 0);
   if (declared > maxBytes) throw new Error("request body too large");
   const chunks: Buffer[] = [];
@@ -1041,12 +1066,12 @@ function normalizeRemotePayload(payload: RemoteRunPayload): void {
   }
 }
 
-function formatDurableFailure(error: unknown): string {
+function formatDurableFailure(error: unknown): { message: string; metadata: { code?: string; type?: string; message?: string } } {
   const oracleError = asOracleUserError(error);
-  if (!oracleError) return error instanceof Error ? error.message : String(error);
+  if (!oracleError) { const message = error instanceof Error ? error.message : String(error); return { message, metadata: { message } }; }
   const details = oracleError.details ?? {};
   const uiWarning = details.uiWarning;
-  return JSON.stringify({ message: oracleError.message, category: oracleError.category, stage: details.stage, code: details.code, uiWarning });
+  return { message: oracleError.message, metadata: { type: String(details.stage ?? details.code ?? oracleError.category), code: typeof details.code === "string" ? details.code : undefined, message: uiWarning && typeof uiWarning === "object" && typeof (uiWarning as any).type === "string" ? String((uiWarning as any).type) : oracleError.message } };
 }
 
 /**

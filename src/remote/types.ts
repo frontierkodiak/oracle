@@ -56,8 +56,15 @@ export interface DurableRunSnapshot {
   roughEtaMs: number;
   createdAt: string;
   updatedAt: string;
+  requestHash: string;
+  runtimeHint?: Record<string, unknown>;
+  modelSelection?: unknown;
+  artifacts?: RemoteArtifactDescriptor[];
+  failure?: { code?: string; type?: string; throttleMs?: number; message?: string };
+  cancellation?: { requestedAt?: string; outcome?: string };
   result?: BrowserRunResult;
   error?: string;
+  errorMetadata?: { code?: string; type?: string; throttleMs?: number; message?: string };
 }
 
 export interface RemoteArtifactCapabilities {

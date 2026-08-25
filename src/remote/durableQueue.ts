@@ -361,19 +361,13 @@ export class DurableQueueStore {
         id,
       );
       this.append(id, t, { type: "state", state, phase });
+      if (terminal.has(state) && p.elapsedMs !== undefined && state !== "canceled" && state !== "unknown" && p.etaQualifying === true)
+        this.db.prepare("INSERT INTO eta_samples VALUES(?,?,?,1)").run(p.elapsedMs, t, "pro");
       this.db.exec("COMMIT");
     } catch (e) {
       this.db.exec("ROLLBACK");
       throw e;
     }
-    if (
-      terminal.has(state) &&
-      p.elapsedMs !== undefined &&
-      state !== "canceled" &&
-      state !== "unknown" &&
-      p.etaQualifying === true
-    )
-      this.db.prepare("INSERT INTO eta_samples VALUES(?,?,?,1)").run(p.elapsedMs, t, "pro");
   }
   claimNext(): DurableRunSnapshot | undefined {
     this.db.exec("BEGIN IMMEDIATE");
