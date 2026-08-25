@@ -15,8 +15,15 @@ import { normalizeMaxConcurrentTabs } from "../browser/tabLeaseRegistry.js";
 import { loadUserConfig } from "../config.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import type { RemoteArtifactDescriptor, RemoteRunPayload, RemoteRunEvent } from "./types.js";
-import { DurableQueueStore, DURABLE_QUEUE_CAPABILITY_ID, DURABLE_QUEUE_CAPABILITY_VERSION } from "./durableQueue.js";
-import { persistBrowserRunArtifacts, reopenDurableArtifactRun, resolveDurableArtifact } from "./durableArtifacts.js";
+import {
+  DurableQueueStore,
+  DURABLE_QUEUE_CAPABILITY_ID,
+  DURABLE_QUEUE_CAPABILITY_VERSION,
+} from "./durableQueue.js";
+import {
+  persistBrowserRunArtifacts,
+  resolveDurableArtifact,
+} from "./durableArtifacts.js";
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
   CAPTURE_ONLY_FEATURE_ID,
@@ -89,7 +96,11 @@ const ARTIFACT_CAPABILITIES = {
       limits: { maxBytes: MAX_REMOTE_ARTIFACT_BYTES },
     },
     { id: CAPTURE_ONLY_FEATURE_ID, version: 1 },
-    { id: DURABLE_QUEUE_CAPABILITY_ID, version: DURABLE_QUEUE_CAPABILITY_VERSION, limits: { maxQueued: 8 } },
+    {
+      id: DURABLE_QUEUE_CAPABILITY_ID,
+      version: DURABLE_QUEUE_CAPABILITY_VERSION,
+      limits: { maxQueued: 8 },
+    },
   ],
 };
 
@@ -256,56 +267,173 @@ export async function createRemoteServer(
   }
   const slots = new RunSlots(effectiveConcurrency, Math.max(0, options.maxQueuedRuns ?? 8));
   const artifactRegistry = new Map<string, RegisteredRemoteArtifact>();
-  const durableQueue = await DurableQueueStore.open({ homeDir: options.queueHomeDir, capacity: effectiveConcurrency, backlog: options.maxQueuedRuns ?? 8 });
+  const durableQueue = await DurableQueueStore.open({
+    homeDir: options.queueHomeDir,
+    capacity: effectiveConcurrency,
+    backlog: options.maxQueuedRuns ?? 8,
+  });
   let durableWorkers = 0;
   const durableControllers = new Map<string, AbortController>();
   const pumpDurableQueue = async (): Promise<void> => {
     while (durableWorkers < effectiveConcurrency) {
-      const next = durableQueue.claimNext(); if (!next) return;
+      const next = durableQueue.claimNext();
+      if (!next) return;
       durableWorkers += 1;
       const controller = new AbortController();
       durableControllers.set(next.id, controller);
       void (async () => {
-        const started = Date.now(); const id = next.id;
+        const started = Date.now();
+        const id = next.id;
         try {
-          const payload = await durableQueue.request(id); if (!payload) throw new Error("durable request missing");
+          const payload = await durableQueue.request(id);
+          if (!payload) throw new Error("durable request missing");
           const runDir = durableQueue.runDirectory(id);
           const materialize = async (items: any[] | undefined, folder: string) => {
-            const destination = path.join(runDir, folder); await mkdir(destination, { recursive: true, mode: 0o700 });
-            return await Promise.all((items ?? []).map(async (item, index) => { const base = sanitizeName(item.fileName ?? `attachment-${index + 1}`); const ext = path.extname(base); const stem = ext ? base.slice(0, -ext.length) : base; const bytes = Buffer.from(String(item.contentBase64 ?? ""), "base64"); for (let n = 0; n < 1000; n++) { const name = n === 0 ? base : `${stem}-${n}${ext}`; const target = path.join(destination, name); try { await writeFile(target, bytes, { flag: "wx", mode: 0o600 }); return { path: target, displayPath: item.displayPath, sizeBytes: item.sizeBytes }; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; } } throw new Error("too many attachment name collisions"); }));
+            const destination = path.join(runDir, folder);
+            await mkdir(destination, { recursive: true, mode: 0o700 });
+            return await Promise.all(
+              (items ?? []).map(async (item, index) => {
+                const base = sanitizeName(item.fileName ?? `attachment-${index + 1}`);
+                const ext = path.extname(base);
+                const stem = ext ? base.slice(0, -ext.length) : base;
+                const bytes = Buffer.from(String(item.contentBase64 ?? ""), "base64");
+                for (let n = 0; n < 1000; n++) {
+                  const name = n === 0 ? base : `${stem}-${n}${ext}`;
+                  const target = path.join(destination, name);
+                  try {
+                    await writeFile(target, bytes, { flag: "wx", mode: 0o600 });
+                    return {
+                      path: target,
+                      displayPath: item.displayPath,
+                      sizeBytes: item.sizeBytes,
+                    };
+                  } catch (error) {
+                    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+                  }
+                }
+                throw new Error("too many attachment name collisions");
+              }),
+            );
           };
-          const attachments = await materialize(payload.attachments as any[] | undefined, "attachments");
+          const attachments = await materialize(
+            payload.attachments as any[] | undefined,
+            "attachments",
+          );
           const fallback = payload.fallbackSubmission as any;
-          const fallbackSubmission = fallback ? { prompt: fallback.prompt, attachments: await materialize(fallback.attachments as any[] | undefined, "fallback-attachments") } : undefined;
+          const fallbackSubmission = fallback
+            ? {
+                prompt: fallback.prompt,
+                attachments: await materialize(
+                  fallback.attachments as any[] | undefined,
+                  "fallback-attachments",
+                ),
+              }
+            : undefined;
           const clientRequestedKeepBrowser = payload.browserConfig.keepBrowser === true;
-          const hostConfig = { ...payload.browserConfig, inlineCookies: null, inlineCookiesSource: null, cookieSync: options.cookieSyncDefault === true, ...(options.manualLoginDefault ? { manualLogin: true, manualLoginProfileDir: options.manualLoginProfileDir, keepBrowser: true } : {}) };
-          const sessionId = payload.options?.sessionId ? `${String(payload.options.sessionId)}-${id.slice(0, 8)}` : id;
+          const hostConfig = {
+            ...payload.browserConfig,
+            inlineCookies: null,
+            inlineCookiesSource: null,
+            cookieSync: options.cookieSyncDefault === true,
+            ...(options.manualLoginDefault
+              ? {
+                  manualLogin: true,
+                  manualLoginProfileDir: options.manualLoginProfileDir,
+                  keepBrowser: true,
+                }
+              : {}),
+          };
+          const sessionId = payload.options?.sessionId
+            ? `${String(payload.options.sessionId)}-${id.slice(0, 8)}`
+            : id;
           const automationLogger: BrowserLogger = ((message?: string) => {
-            if (typeof message === "string") { logger(`[run ${id}] ${message}`); durableQueue.appendEvent(id, { type: "log", message }); }
+            if (typeof message === "string") {
+              logger(`[run ${id}] ${message}`);
+              durableQueue.appendEvent(id, { type: "log", message });
+            }
           }) as BrowserLogger;
           automationLogger.verbose = Boolean(payload.options?.verbose);
-          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: hostConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId, followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser), runtimeHintCb: async (hint, modelSelection) => {
-            const raw = hint as unknown as Record<string, unknown>;
-            durableQueue.transition(id, "running", raw.promptSubmitted === true ? "prompt_submitted" : "browser_attached", { runtimeHint: { ...raw, ...(modelSelection ? { modelSelection } : {}) } });
-          } });
+          const result = await runBrowser({
+            prompt: payload.prompt,
+            attachments,
+            fallbackSubmission,
+            config: hostConfig as any,
+            signal: controller.signal,
+            log: automationLogger,
+            verbose: Boolean(payload.options?.verbose),
+            heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined,
+            sessionId,
+            followUpPrompts: payload.options?.followUpPrompts as string[] | undefined,
+            closeOwnedTabOnComplete: Boolean(
+              options.manualLoginDefault && !clientRequestedKeepBrowser,
+            ),
+            runtimeHintCb: async (hint, modelSelection) => {
+              const raw = hint as unknown as Record<string, unknown>;
+              durableQueue.transition(
+                id,
+                "running",
+                raw.promptSubmitted === true ? "prompt_submitted" : "browser_attached",
+                { runtimeHint: { ...raw, ...(modelSelection ? { modelSelection } : {}) } },
+              );
+            },
+          });
           let durable: Awaited<ReturnType<typeof persistBrowserRunArtifacts>> | undefined;
-          try { durable = await persistBrowserRunArtifacts({ queueRoot: durableQueue.root, runId: id, result }); }
-          catch (artifactError) {
-            const warning = { code: "remote-artifact-persistence-failed", severity: "warning" as const, message: artifactError instanceof Error ? artifactError.message : String(artifactError) };
-            durableQueue.transition(id, "completed", "terminal", { result: { ...result, warnings: [...(result.warnings ?? []), warning] }, elapsedMs: Date.now() - started, etaQualifying: false });
+          try {
+            durable = await persistBrowserRunArtifacts({
+              queueRoot: durableQueue.root,
+              runId: id,
+              result,
+            });
+          } catch (artifactError) {
+            const warning = {
+              code: "remote-artifact-persistence-failed",
+              severity: "warning" as const,
+              message:
+                artifactError instanceof Error ? artifactError.message : String(artifactError),
+            };
+            durableQueue.transition(id, "completed", "terminal", {
+              result: { ...result, warnings: [...(result.warnings ?? []), warning] },
+              elapsedMs: Date.now() - started,
+              etaQualifying: false,
+            });
             return;
           }
           const modelEvidence = result.modelSelection as any;
           const thinkingEvidence = result.thinkingSelection as any;
           const model = String(modelEvidence?.resolvedLabel ?? modelEvidence?.requestedModel ?? "");
-          const qualifying = payload.browserConfig.captureOnly !== true && /pro/i.test(model) && modelEvidence?.verified === true && thinkingEvidence?.verified === true && /pro/i.test(String(thinkingEvidence?.requestedLevel ?? "")) && result.promptSubmitted === true;
-          durableQueue.transition(id, "completed", "terminal", { result: { ...durable.result, artifacts: durable.descriptors }, elapsedMs: Date.now() - started, model, etaQualifying: qualifying });
+          const qualifying =
+            payload.browserConfig.captureOnly !== true &&
+            /pro/i.test(model) &&
+            modelEvidence?.verified === true &&
+            thinkingEvidence?.verified === true &&
+            /pro/i.test(String(thinkingEvidence?.requestedLevel ?? "")) &&
+            result.promptSubmitted === true;
+          durableQueue.transition(id, "completed", "terminal", {
+            result: { ...durable.result, artifacts: durable.descriptors },
+            elapsedMs: Date.now() - started,
+            model,
+            etaQualifying: qualifying,
+          });
         } catch (error) {
           const failure = formatDurableFailure(error);
           const phase = durableQueue.get(id)?.phase;
-          const terminalState = (phase === "prompt_submitted" || phase === "awaiting_response" || phase === "capturing") ? "unknown" : controller.signal.aborted ? "canceled" : "failed";
-          durableQueue.transition(id, terminalState, "terminal", { error: failure.message, errorMetadata: failure.metadata, elapsedMs: Date.now() - started, etaQualifying: false });
-        } finally { durableControllers.delete(id); durableWorkers -= 1; void pumpDurableQueue(); }
+          const terminalState =
+            phase === "prompt_submitted" || phase === "awaiting_response" || phase === "capturing"
+              ? "unknown"
+              : controller.signal.aborted
+                ? "canceled"
+                : "failed";
+          durableQueue.transition(id, terminalState, "terminal", {
+            error: failure.message,
+            errorMetadata: failure.metadata,
+            elapsedMs: Date.now() - started,
+            etaQualifying: false,
+          });
+        } finally {
+          durableControllers.delete(id);
+          durableWorkers -= 1;
+          void pumpDurableQueue();
+        }
       })();
     }
   };
@@ -356,29 +484,95 @@ export async function createRemoteServer(
       );
       return;
     }
-    const v1Match = req.url ? /^\/v1\/runs\/([^/]+)(?:\/(events|cancel))?$/.exec(req.url.split("?")[0] ?? "") : null;
+    const v1Match = req.url
+      ? /^\/v1\/runs\/([^/]+)(?:\/(events|cancel))?$/.exec(req.url.split("?")[0] ?? "")
+      : null;
     if (req.url === "/v1/runs" || v1Match) {
-      if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return; }
+      if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
       if (req.method === "POST" && req.url === "/v1/runs") {
-        const key = req.headers["idempotency-key"]; if (typeof key !== "string" || !key.trim()) { res.writeHead(400); res.end(JSON.stringify({ error: "idempotency_key_required" })); return; }
+        const key = req.headers["idempotency-key"];
+        if (typeof key !== "string" || !key.trim()) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: "idempotency_key_required" }));
+          return;
+        }
         try {
           const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload;
           validateRemotePayload(payload);
           normalizeRemotePayload(payload);
           const snapshot = await durableQueue.submit(key, payload as any);
-          res.writeHead(202, { "Content-Type": "application/json" }); res.end(JSON.stringify(snapshot)); void pumpDurableQueue();
-        } catch (error) { const message = error instanceof Error ? error.message : String(error); res.writeHead(message === "queue_full" ? 503 : message.includes("idempotency key conflicts") ? 409 : 400); res.end(JSON.stringify({ error: message })); } return;
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(snapshot));
+          void pumpDurableQueue();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          res.writeHead(
+            message === "queue_full"
+              ? 503
+              : message.includes("idempotency key conflicts")
+                ? 409
+                : 400,
+          );
+          res.end(JSON.stringify({ error: message }));
+        }
+        return;
       }
-      if (!v1Match) { res.writeHead(404); res.end(); return; }
-      const id = decodeURIComponent(v1Match[1] ?? ""); const action = v1Match[2];
-      if (req.method === "GET" && action === "events") { const url = new URL(req.url ?? "", "http://oracle.local"); const after = Number(url.searchParams.get("after") ?? -1); res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ events: durableQueue.events(id, Number.isFinite(after) ? after : -1) })); return; }
-      if (req.method === "POST" && action === "cancel") { const snap = durableQueue.cancel(id); if (!snap) { res.writeHead(404); res.end(); return; } durableControllers.get(id)?.abort(); res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(durableQueue.get(id))); return; }
-      if (req.method === "GET" && !action) { const snap = durableQueue.get(id); if (!snap) { res.writeHead(404); res.end(); return; } res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(snap)); return; }
-      res.writeHead(404); res.end(); return;
+      if (!v1Match) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      const id = decodeURIComponent(v1Match[1] ?? "");
+      const action = v1Match[2];
+      if (req.method === "GET" && action === "events") {
+        const url = new URL(req.url ?? "", "http://oracle.local");
+        const after = Number(url.searchParams.get("after") ?? -1);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({ events: durableQueue.events(id, Number.isFinite(after) ? after : -1) }),
+        );
+        return;
+      }
+      if (req.method === "POST" && action === "cancel") {
+        const snap = durableQueue.cancel(id);
+        if (!snap) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        durableControllers.get(id)?.abort();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(durableQueue.get(id)));
+        return;
+      }
+      if (req.method === "GET" && !action) {
+        const snap = durableQueue.get(id);
+        if (!snap) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(snap));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+      return;
     }
     if (req.method === "GET" && req.url === "/v1/queue/status") {
-      if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) { res.writeHead(401); res.end(JSON.stringify({ error: "unauthorized" })); return; }
-      res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(durableQueue.status())); return;
+      if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) {
+        res.writeHead(401);
+        res.end(JSON.stringify({ error: "unauthorized" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(durableQueue.status()));
+      return;
     }
     const artifactMatch = matchArtifactRequest(req);
     if (artifactMatch) {
@@ -858,11 +1052,22 @@ async function serveRemoteArtifact(params: {
 
   if (params.queueRoot) {
     try {
-      const durable = await resolveDurableArtifact({ queueRoot: params.queueRoot, runId: params.runId, artifactId: params.artifactId });
+      const durable = await resolveDurableArtifact({
+        queueRoot: params.queueRoot,
+        runId: params.runId,
+        artifactId: params.artifactId,
+      });
       const fileStat = await stat(durable.filePath);
       if (!fileStat.isFile() || fileStat.size <= 0) throw new Error("artifact_unavailable");
-      params.res.writeHead(200, { "Content-Type": sanitizeArtifactMimeType(durable.descriptor.mimeType) ?? "application/octet-stream", "Content-Length": fileStat.size, "Content-Disposition": `attachment; filename="${sanitizeArtifactFilename(durable.descriptor.filename, "artifact.bin").replace(/"/g, "")}"`, "X-Oracle-Artifact-Sha256": durable.descriptor.sha256 });
-      await pipeline(createReadStream(durable.filePath), params.res); return;
+      params.res.writeHead(200, {
+        "Content-Type":
+          sanitizeArtifactMimeType(durable.descriptor.mimeType) ?? "application/octet-stream",
+        "Content-Length": fileStat.size,
+        "Content-Disposition": `attachment; filename="${sanitizeArtifactFilename(durable.descriptor.filename, "artifact.bin").replace(/"/g, "")}"`,
+        "X-Oracle-Artifact-Sha256": durable.descriptor.sha256,
+      });
+      await pipeline(createReadStream(durable.filePath), params.res);
+      return;
     } catch {
       // Fall through to the legacy in-memory registry for old, already-running clients.
     }
@@ -1049,7 +1254,10 @@ function classifySourceUrlKind(sourceUrl?: string): RemoteArtifactDescriptor["so
   return "chatgpt-file-endpoint";
 }
 
-async function readRequestBody(req: http.IncomingMessage, maxBytes = MAX_REMOTE_ARTIFACT_BYTES + 32 * 1024 * 1024): Promise<string> {
+async function readRequestBody(
+  req: http.IncomingMessage,
+  maxBytes = MAX_REMOTE_ARTIFACT_BYTES + 32 * 1024 * 1024,
+): Promise<string> {
   const declared = Number(req.headers["content-length"] ?? 0);
   if (declared > maxBytes) throw new Error("request body too large");
   const chunks: Buffer[] = [];
@@ -1064,31 +1272,80 @@ async function readRequestBody(req: http.IncomingMessage, maxBytes = MAX_REMOTE_
 }
 
 function normalizeRemotePayload(payload: RemoteRunPayload): void {
-  if (!payload || typeof payload !== "object" || !payload.browserConfig) throw new Error("invalid_request");
+  if (!payload || typeof payload !== "object" || !payload.browserConfig)
+    throw new Error("invalid_request");
   payload.browserConfig.url = normalizeChatgptUrl(payload.browserConfig.url, CHATGPT_URL);
   payload.browserConfig = pickClientBrowserConfig(payload.browserConfig);
   if (payload.browserConfig.captureOnly === true) {
-    payload.prompt = ""; payload.attachments = []; payload.fallbackSubmission = undefined;
+    payload.prompt = "";
+    payload.attachments = [];
+    payload.fallbackSubmission = undefined;
     payload.options = { ...payload.options, followUpPrompts: undefined };
-    payload.browserConfig.desiredModel = undefined; payload.browserConfig.modelStrategy = undefined;
-    payload.browserConfig.thinkingTime = undefined; payload.browserConfig.researchMode = undefined;
+    payload.browserConfig.desiredModel = undefined;
+    payload.browserConfig.modelStrategy = undefined;
+    payload.browserConfig.thinkingTime = undefined;
+    payload.browserConfig.researchMode = undefined;
   }
 }
 
 function validateRemotePayload(payload: unknown): asserts payload is RemoteRunPayload {
   if (!payload || typeof payload !== "object") throw new Error("invalid_request");
   const p = payload as any;
-  if (typeof p.prompt !== "string" || p.prompt.length > 20_000_000 || !Array.isArray(p.attachments) || !p.browserConfig || typeof p.browserConfig !== "object" || !p.options || typeof p.options !== "object") throw new Error("invalid_request");
-  for (const a of p.attachments) if (!a || typeof a.fileName !== "string" || typeof a.contentBase64 !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(a.contentBase64)) throw new Error("invalid_request");
-  if (p.fallbackSubmission !== undefined) { const f = p.fallbackSubmission; if (!f || typeof f.prompt !== "string" || !Array.isArray(f.attachments)) throw new Error("invalid_request"); for (const a of f.attachments) if (!a || typeof a.fileName !== "string" || typeof a.contentBase64 !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(a.contentBase64)) throw new Error("invalid_request"); }
+  if (
+    typeof p.prompt !== "string" ||
+    p.prompt.length > 20_000_000 ||
+    !Array.isArray(p.attachments) ||
+    !p.browserConfig ||
+    typeof p.browserConfig !== "object" ||
+    !p.options ||
+    typeof p.options !== "object"
+  )
+    throw new Error("invalid_request");
+  for (const a of p.attachments)
+    if (
+      !a ||
+      typeof a.fileName !== "string" ||
+      typeof a.contentBase64 !== "string" ||
+      !/^[A-Za-z0-9+/]*={0,2}$/.test(a.contentBase64)
+    )
+      throw new Error("invalid_request");
+  if (p.fallbackSubmission !== undefined) {
+    const f = p.fallbackSubmission;
+    if (!f || typeof f.prompt !== "string" || !Array.isArray(f.attachments))
+      throw new Error("invalid_request");
+    for (const a of f.attachments)
+      if (
+        !a ||
+        typeof a.fileName !== "string" ||
+        typeof a.contentBase64 !== "string" ||
+        !/^[A-Za-z0-9+/]*={0,2}$/.test(a.contentBase64)
+      )
+        throw new Error("invalid_request");
+  }
 }
 
-function formatDurableFailure(error: unknown): { message: string; metadata: { code?: string; type?: string; message?: string } } {
+function formatDurableFailure(error: unknown): {
+  message: string;
+  metadata: { code?: string; type?: string; message?: string };
+} {
   const oracleError = asOracleUserError(error);
-  if (!oracleError) { const message = error instanceof Error ? error.message : String(error); return { message, metadata: { message } }; }
+  if (!oracleError) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { message, metadata: { message } };
+  }
   const details = oracleError.details ?? {};
   const uiWarning = details.uiWarning;
-  return { message: oracleError.message, metadata: { type: String(details.stage ?? details.code ?? oracleError.category), code: typeof details.code === "string" ? details.code : undefined, message: uiWarning && typeof uiWarning === "object" && typeof (uiWarning as any).type === "string" ? String((uiWarning as any).type) : oracleError.message } };
+  return {
+    message: oracleError.message,
+    metadata: {
+      type: String(details.stage ?? details.code ?? oracleError.category),
+      code: typeof details.code === "string" ? details.code : undefined,
+      message:
+        uiWarning && typeof uiWarning === "object" && typeof (uiWarning as any).type === "string"
+          ? String((uiWarning as any).type)
+          : oracleError.message,
+    },
+  };
 }
 
 /**

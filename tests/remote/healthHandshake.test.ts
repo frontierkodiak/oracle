@@ -117,13 +117,48 @@ describe("remote executor health preflight", () => {
         runRequests += 1;
         req.resume();
         res.writeHead(req.url === "/v1/runs" ? 202 : 200, { "Content-Type": "application/json" });
-        res.end(req.url === "/v1/runs" ? JSON.stringify({ id: "11111111-1111-4111-8111-111111111111", state: "completed", phase: "terminal", queuePosition: 0, roughEtaMs: 0, requestHash: "a".repeat(64), result: { answerText: "ok", answerMarkdown: "ok", tookMs: 1, answerTokens: 1, answerChars: 2 } }) : "");
+        res.end(
+          req.url === "/v1/runs"
+            ? JSON.stringify({
+                id: "11111111-1111-4111-8111-111111111111",
+                state: "completed",
+                phase: "terminal",
+                queuePosition: 0,
+                roughEtaMs: 0,
+                requestHash: "a".repeat(64),
+                result: {
+                  answerText: "ok",
+                  answerMarkdown: "ok",
+                  tookMs: 1,
+                  answerTokens: 1,
+                  answerChars: 2,
+                },
+              })
+            : "",
+        );
         return;
       }
       if (req.method === "GET" && req.url?.startsWith("/v1/runs/")) {
         res.writeHead(200, { "Content-Type": "application/json" });
         if (req.url.includes("/events")) res.end(JSON.stringify({ events: [] }));
-        else res.end(JSON.stringify({ id: "11111111-1111-4111-8111-111111111111", state: "completed", phase: "terminal", queuePosition: 0, roughEtaMs: 0, requestHash: "a".repeat(64), result: { answerText: "ok", answerMarkdown: "ok", tookMs: 1, answerTokens: 1, answerChars: 2 } }));
+        else
+          res.end(
+            JSON.stringify({
+              id: "11111111-1111-4111-8111-111111111111",
+              state: "completed",
+              phase: "terminal",
+              queuePosition: 0,
+              roughEtaMs: 0,
+              requestHash: "a".repeat(64),
+              result: {
+                answerText: "ok",
+                answerMarkdown: "ok",
+                tookMs: 1,
+                answerTokens: 1,
+                answerChars: 2,
+              },
+            }),
+          );
         return;
       }
       res.writeHead(404);

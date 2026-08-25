@@ -425,19 +425,15 @@ describe("remote browser service", () => {
       });
 
       expect(result.answerText).toBe("done");
-      expect(result.warnings).toEqual(expect.arrayContaining([expect.objectContaining({ code: "chatgpt-ui-warning" })]));
+      expect(result.warnings).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: "chatgpt-ui-warning" })]),
+      );
       expect(JSON.stringify(result)).not.toContain(hostPrivatePath);
       expect(JSON.stringify(result)).not.toContain("host-only warning /Users/private/profile");
       expect(result.artifacts).toHaveLength(3);
       const artifact = result.artifacts?.[0];
       expect(artifact?.path).toBe(
-        path.join(
-          clientHome,
-          "sessions",
-          "remote-artifact-session",
-          "artifacts",
-          "result.zip",
-        ),
+        path.join(clientHome, "sessions", "remote-artifact-session", "artifacts", "result.zip"),
       );
       expect(artifact?.path).not.toBe(hostArtifactPath);
       expect(artifact).toMatchObject({
@@ -471,7 +467,11 @@ describe("remote browser service", () => {
         size: emptyZip.length,
       });
       await expect(stat(hostPrivatePath)).resolves.toMatchObject({ size: emptyZip.length });
-      expect(result.artifacts?.some((item) => (item as any).filename === "private.zip" || item.label === "Private download")).toBe(true);
+      expect(
+        result.artifacts?.some(
+          (item) => (item as any).filename === "private.zip" || item.label === "Private download",
+        ),
+      ).toBe(true);
 
       await server.close();
       await rm(tmpDir, { recursive: true, force: true });
@@ -712,7 +712,24 @@ async function createFakeArtifactBridge({
       req.resume();
       if (req.url === "/v1/runs") {
         res.writeHead(202, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ id: descriptor.runId, state: "completed", phase: "terminal", queuePosition: 0, roughEtaMs: 0, requestHash: "a".repeat(64), result: { answerText: "done", answerMarkdown: "done", tookMs: 1, answerTokens: 1, answerChars: 4, artifacts: [descriptor] } }));
+        res.end(
+          JSON.stringify({
+            id: descriptor.runId,
+            state: "completed",
+            phase: "terminal",
+            queuePosition: 0,
+            roughEtaMs: 0,
+            requestHash: "a".repeat(64),
+            result: {
+              answerText: "done",
+              answerMarkdown: "done",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 4,
+              artifacts: [descriptor],
+            },
+          }),
+        );
         return;
       }
       res.writeHead(200, { "Content-Type": "application/x-ndjson" });
@@ -733,10 +750,31 @@ async function createFakeArtifactBridge({
       );
       return;
     }
-    if (req.method === "GET" && req.url?.startsWith(`/v1/runs/${encodeURIComponent(descriptor.runId)}`)) {
+    if (
+      req.method === "GET" &&
+      req.url?.startsWith(`/v1/runs/${encodeURIComponent(descriptor.runId)}`)
+    ) {
       res.writeHead(200, { "Content-Type": "application/json" });
       if (req.url.includes("/events")) res.end(JSON.stringify({ events: [] }));
-      else res.end(JSON.stringify({ id: descriptor.runId, state: "completed", phase: "terminal", queuePosition: 0, roughEtaMs: 0, requestHash: "a".repeat(64), result: { answerText: "done", answerMarkdown: "done", tookMs: 1, answerTokens: 1, answerChars: 4, artifacts: [descriptor] } }));
+      else
+        res.end(
+          JSON.stringify({
+            id: descriptor.runId,
+            state: "completed",
+            phase: "terminal",
+            queuePosition: 0,
+            roughEtaMs: 0,
+            requestHash: "a".repeat(64),
+            result: {
+              answerText: "done",
+              answerMarkdown: "done",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 4,
+              artifacts: [descriptor],
+            },
+          }),
+        );
       return;
     }
     if (
@@ -1398,14 +1436,20 @@ describe("cancellation reaches the run", () => {
           port: server.port,
           path: "/v1/runs",
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer secret", "Idempotency-Key": "disconnect-test" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer secret",
+            "Idempotency-Key": "disconnect-test",
+          },
         },
         () => {},
       );
       request.on("error", () => {
         // destroy() below intentionally resets the socket to model a dropped caller.
       });
-      request.write(JSON.stringify({ prompt: "x", attachments: [], options: {}, browserConfig: {} }));
+      request.write(
+        JSON.stringify({ prompt: "x", attachments: [], options: {}, browserConfig: {} }),
+      );
       request.end();
 
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1451,16 +1495,52 @@ describe("transport failure messages", () => {
           );
           return;
         }
-        if (req.method === "POST" && req.url === "/v1/runs") { req.resume(); res.writeHead(202, { "Content-Type": "application/json" }); res.end(JSON.stringify({ id: "run-loss", state: "queued", phase: "accepted", queuePosition: 1, roughEtaMs: 300000, requestHash: "a".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })); return; }
-        if (req.method === "GET" && req.url?.includes("/events")) { setTimeout(() => req.socket.destroy(), 20); return; }
-        if (req.method === "GET" && req.url?.includes("/v1/runs/")) { res.end(JSON.stringify({ id: "run-loss", state: "queued", phase: "accepted", queuePosition: 1, roughEtaMs: 300000, requestHash: "a".repeat(64), createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })); return; }
-        res.writeHead(404); res.end();
+        if (req.method === "POST" && req.url === "/v1/runs") {
+          req.resume();
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: "run-loss",
+              state: "queued",
+              phase: "accepted",
+              queuePosition: 1,
+              roughEtaMs: 300000,
+              requestHash: "a".repeat(64),
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            }),
+          );
+          return;
+        }
+        if (req.method === "GET" && req.url?.includes("/events")) {
+          setTimeout(() => req.socket.destroy(), 20);
+          return;
+        }
+        if (req.method === "GET" && req.url?.includes("/v1/runs/")) {
+          res.end(
+            JSON.stringify({
+              id: "run-loss",
+              state: "queued",
+              phase: "accepted",
+              queuePosition: 1,
+              roughEtaMs: 300000,
+              requestHash: "a".repeat(64),
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            }),
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
       });
       await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
       const { port } = stub.address() as { port: number };
 
       const executor = createRemoteBrowserExecutor({ host: `127.0.0.1:${port}`, token: "secret" });
-      await expect(executor({ prompt: "x", config: { timeoutMs: 100 } })).rejects.toThrow(/timed out/);
+      await expect(executor({ prompt: "x", config: { timeoutMs: 100 } })).rejects.toThrow(
+        /timed out/,
+      );
       await new Promise<void>((resolve) => stub.close(() => resolve()));
     },
   );

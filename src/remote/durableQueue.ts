@@ -295,7 +295,13 @@ export class DurableQueueStore {
   appendEvent(id: string, event: unknown): void {
     const t = this.now();
     this.db.exec("BEGIN IMMEDIATE");
-    try { this.append(id, t, event); this.db.exec("COMMIT"); } catch (e) { this.db.exec("ROLLBACK"); throw e; }
+    try {
+      this.append(id, t, event);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
   }
   cancel(id: string): DurableRunSnapshot | undefined {
     const r = this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Row | undefined;
@@ -368,7 +374,13 @@ export class DurableQueueStore {
         id,
       );
       this.append(id, t, { type: "state", state, phase });
-      if (terminal.has(state) && p.elapsedMs !== undefined && state !== "canceled" && state !== "unknown" && p.etaQualifying === true)
+      if (
+        terminal.has(state) &&
+        p.elapsedMs !== undefined &&
+        state !== "canceled" &&
+        state !== "unknown" &&
+        p.etaQualifying === true
+      )
         this.db.prepare("INSERT INTO eta_samples VALUES(?,?,?,1)").run(p.elapsedMs, t, "pro");
       this.db.exec("COMMIT");
     } catch (e) {

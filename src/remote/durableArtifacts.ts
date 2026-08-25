@@ -169,7 +169,10 @@ async function copyArtifact(params: {
   if (sourceStat.size <= 0) throw new Error("artifact is empty");
   if (sourceStat.size > MAX_REMOTE_ARTIFACT_BYTES || source.endsWith(".crdownload"))
     throw new Error("artifact exceeds transfer policy or is incomplete");
-  const filename = sanitizeFilename(path.basename((params.artifact as any).filename ?? params.artifact.label ?? source), "artifact.bin");
+  const filename = sanitizeFilename(
+    path.basename((params.artifact as any).filename ?? params.artifact.label ?? source),
+    "artifact.bin",
+  );
   const artifactId = randomUUID();
   const destination = path.join(params.artifactsRoot, `${artifactId}-${filename}`);
   const input = await open(source, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -429,6 +432,10 @@ function sanitizeResult(result: BrowserRunResult): BrowserRunResult {
     tabUrl: result.tabUrl,
     conversationId: result.conversationId,
     promptSubmitted: result.promptSubmitted,
-    warnings: result.warnings?.map(({ code, severity, message }) => ({ code, severity, message: message.replace(/(?:\/Users\/|[A-Za-z]:\\|\/home\/)[^\s)]+/g, "[redacted-path]") })),
+    warnings: result.warnings?.map(({ code, severity, message }) => ({
+      code,
+      severity,
+      message: message.replace(/(?:\/Users\/|[A-Za-z]:\\|\/home\/)[^\s)]+/g, "[redacted-path]"),
+    })),
   };
 }

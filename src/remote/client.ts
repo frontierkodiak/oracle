@@ -85,7 +85,9 @@ export async function readDurableReceipt(sessionId: string): Promise<DurableRece
       if (!info.isFile()) throw new Error("unsafe durable receipt file");
       await chmod(target, 0o600);
       return validateReceipt(JSON.parse(await handle.readFile("utf8")), sessionId);
-    } finally { await handle.close(); }
+    } finally {
+      await handle.close();
+    }
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new Error("invalid durable queue receipt");
@@ -226,7 +228,10 @@ export async function watchDurableRemoteRun(
     if (o.signal?.aborted) throw new Error("observer aborted");
     try {
       const events = await getDurableRemoteRunEvents(host, id, after, o.token);
-      for (const e of events) { after = Math.max(after, e.seq); o.onEvent?.(e.event); }
+      for (const e of events) {
+        after = Math.max(after, e.seq);
+        o.onEvent?.(e.event);
+      }
       const s = await getDurableRemoteRun(host, id, o.token);
       o.onSnapshot?.(s);
       if (TERMINAL.has(s.state)) return { snapshot: s, detached };
@@ -254,7 +259,9 @@ export function createRemoteBrowserExecutor({
     if (!h.ok || !h.runtime || !h.manifest) {
       const detail = h.error ?? "remote health handshake failed";
       if (!h.statusCode && /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT/.test(detail))
-        throw new Error(`Could not reach the research bridge at ${host} (${detail}).`, { cause: new Error(detail) });
+        throw new Error(`Could not reach the research bridge at ${host} (${detail}).`, {
+          cause: new Error(detail),
+        });
       throw new Error(`${detail}; upgrade oracle on the host and retry`);
     }
     const features = new Set(h.manifest.features.map((f) => `${f.id}@${f.version}`));
@@ -324,18 +331,27 @@ export function createRemoteBrowserExecutor({
     options.signal?.addEventListener("abort", cancel, { once: true });
     try {
       let w: DurableWatchOutcome;
-      try { w = await watchDurableRemoteRun(host, accepted.id, {
-        token,
-        timeoutMs: options.config?.timeoutMs ?? 600_000,
-        signal: options.signal,
-        onSnapshot: (s) => {
-          options.log?.(`[remote] ${s.state} (${s.phase})`);
-          const hint = (s as any).runtimeHint;
-          if (hint && options.runtimeHintCb)
-            void options.runtimeHintCb(hint, (hint as any).modelSelection);
-        },
-        onEvent: (event) => { if (event && typeof event === "object" && (event as any).type === "log") options.log?.(String((event as any).message ?? "")); },
-      }); } catch (error) { if (options.signal?.aborted) throw new Error("Remote browser run cancelled: the caller aborted."); throw error; }
+      try {
+        w = await watchDurableRemoteRun(host, accepted.id, {
+          token,
+          timeoutMs: options.config?.timeoutMs ?? 600_000,
+          signal: options.signal,
+          onSnapshot: (s) => {
+            options.log?.(`[remote] ${s.state} (${s.phase})`);
+            const hint = (s as any).runtimeHint;
+            if (hint && options.runtimeHintCb)
+              void options.runtimeHintCb(hint, (hint as any).modelSelection);
+          },
+          onEvent: (event) => {
+            if (event && typeof event === "object" && (event as any).type === "log")
+              options.log?.(String((event as any).message ?? ""));
+          },
+        });
+      } catch (error) {
+        if (options.signal?.aborted)
+          throw new Error("Remote browser run cancelled: the caller aborted.");
+        throw error;
+      }
       if (w.snapshot.state === "completed" && w.snapshot.result) {
         const raw = [
           ...(((w.snapshot as any).artifacts ?? []) as unknown[]),
@@ -346,15 +362,42 @@ export function createRemoteBrowserExecutor({
         );
         const transferResults: PromiseSettledResult<SavedBrowserFile>[] = [];
         for (const descriptor of descriptors) {
-          try { transferResults.push({ status: "fulfilled", value: await transferRemoteArtifact({ host, token, descriptor, sessionId, log: options.log }) }); }
-          catch (reason) { transferResults.push({ status: "rejected", reason }); }
+          try {
+            transferResults.push({
+              status: "fulfilled",
+              value: await transferRemoteArtifact({
+                host,
+                token,
+                descriptor,
+                sessionId,
+                log: options.log,
+              }),
+            });
+          } catch (reason) {
+            transferResults.push({ status: "rejected", reason });
+          }
         }
-        const transferred = transferResults.flatMap((item) => item.status === "fulfilled" ? [item.value] : []);
-        const transferWarnings = transferResults.flatMap((item, index) => item.status === "rejected" ? [{ code: "remote-artifact-transfer-failed", severity: "warning" as const, message: `Artifact ${descriptors[index]?.artifactId ?? "unknown"} transfer failed: ${safeMessage(item.reason)}` }] : []);
+        const transferred = transferResults.flatMap((item) =>
+          item.status === "fulfilled" ? [item.value] : [],
+        );
+        const transferWarnings = transferResults.flatMap((item, index) =>
+          item.status === "rejected"
+            ? [
+                {
+                  code: "remote-artifact-transfer-failed",
+                  severity: "warning" as const,
+                  message: `Artifact ${descriptors[index]?.artifactId ?? "unknown"} transfer failed: ${safeMessage(item.reason)}`,
+                },
+              ]
+            : [],
+        );
         for (const warning of transferWarnings) options.log?.(`[remote] ${warning.message}`);
         return {
           ...w.snapshot.result,
-          savedFiles: transferred.length || w.snapshot.result.savedFiles?.length ? [...(w.snapshot.result.savedFiles ?? []), ...transferred] : undefined,
+          savedFiles:
+            transferred.length || w.snapshot.result.savedFiles?.length
+              ? [...(w.snapshot.result.savedFiles ?? []), ...transferred]
+              : undefined,
           artifacts: transferred.length ? transferred : undefined,
           warnings: [...(w.snapshot.result.warnings ?? []), ...transferWarnings],
         };
