@@ -5,12 +5,15 @@ import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { getOracleHomeDir } from "./oracleHome.js";
 import { extractStableConversationIdFromUrl } from "./browser/conversationUrl.js";
-import { canonicalNormalizeProviderConversation } from "./browser/chatgptConversation.js";
+import {
+  canonicalNormalizeProviderConversation,
+  PROVIDER_NATIVE_MAX_DOCUMENT_BYTES,
+} from "./browser/chatgptConversation.js";
 
 export const TRANSCRIPT_LEDGER_SCHEMA = "oracle.transcript-ledger/v1";
 export const TRANSCRIPT_LEDGER_NORMALIZATION = "oracle.transcript-ledger-normalized-turns/v1";
 export const DEFAULT_LEDGER_DIR_NAME = "transcript-ledger";
-const MAX_RAW_BYTES = 64 * 1024 * 1024;
+const MAX_RAW_BYTES = PROVIDER_NATIVE_MAX_DOCUMENT_BYTES;
 const MAX_EVIDENCE_BYTES = 16 * 1024 * 1024;
 const MAX_JSON_DEPTH = 128;
 const MAX_JSON_NODES = 250_000;

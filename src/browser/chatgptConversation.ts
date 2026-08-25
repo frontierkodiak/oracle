@@ -113,9 +113,9 @@ const DRAIN_CHUNK_CHARS = 500_000;
  * returned something other than a conversation (a challenge page, an error body),
  * and draining it would spend minutes proving that.
  */
-const MAX_DOCUMENT_CHARS = 64 * 1024 * 1024;
-/** Must match the ledger's MAX_RAW_BYTES artifact ceiling exactly. */
-const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
+export const PROVIDER_NATIVE_MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
+const MAX_DOCUMENT_CHARS = PROVIDER_NATIVE_MAX_DOCUMENT_BYTES;
+const MAX_DOCUMENT_BYTES = PROVIDER_NATIVE_MAX_DOCUMENT_BYTES;
 const CAPTURE_TIMEOUT_MS = 120_000;
 
 async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
