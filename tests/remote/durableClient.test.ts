@@ -79,8 +79,8 @@ describe("durable remote client receipts", () => {
             queuePosition: 0,
             roughEtaMs: 100,
             requestHash: "a".repeat(64),
-            createdAt: "x",
-            updatedAt: "x",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
             result: {
               answerText: "ok",
               answerMarkdown: "ok",

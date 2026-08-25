@@ -8,6 +8,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { BrowserRunOptions, BrowserRunResult } from "../browserMode.js";
 import type { BrowserAttachment, SavedBrowserFile } from "../browser/types.js";
+import type { BrowserRunWarning } from "../sessionManager.js";
 import {
   computeFileSha256,
   resolveSessionArtifactsDir,
@@ -43,6 +44,36 @@ export interface DurableReceipt {
   idempotencyKey: string;
   runId?: string;
   payloadHash?: string;
+  submission?: "unknown";
+}
+export class DurableSubmissionUnknownError extends Error {
+  readonly reconnectable = true;
+  constructor(message = "durable run submission outcome is unknown; retry with the saved key") {
+    super(message);
+    this.name = "DurableSubmissionUnknownError";
+  }
+}
+class RemoteTransportError extends Error {
+  constructor(
+    message: string,
+    readonly phase: "pre-submit" | "post-submit",
+  ) {
+    super(message);
+    this.name = "RemoteTransportError";
+  }
+}
+export class RemoteArtifactWarning extends Error {
+  readonly warning: BrowserRunWarning;
+  constructor(artifactId: string, message: string) {
+    super(message);
+    this.name = "RemoteArtifactWarning";
+    this.warning = {
+      code: "remote-artifact-transfer-failed",
+      severity: "warning",
+      message,
+      details: { artifactId },
+    };
+  }
 }
 export interface DurableWatchOptions {
   token?: string;
@@ -67,14 +98,7 @@ export function receiptPath(sessionId: string): string {
 }
 async function privateReceiptParent(target: string): Promise<void> {
   const root = getOracleHomeDir();
-  const dirs = [root, path.join(root, "sessions"), path.dirname(target)];
-  for (const dir of dirs) {
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    const info = await lstat(dir);
-    if (!info.isDirectory() || info.isSymbolicLink())
-      throw new Error("unsafe durable receipt directory");
-    await chmod(dir, 0o700);
-  }
+  await ensurePrivateTree(path.dirname(target), root, "unsafe durable receipt directory");
 }
 export async function readDurableReceipt(sessionId: string): Promise<DurableReceipt | undefined> {
   try {
@@ -119,13 +143,17 @@ function validateReceipt(value: unknown, sessionId: string): DurableReceipt {
   const r = value as Record<string, unknown>;
   if (
     !r ||
+    Object.keys(r).some(
+      (key) => !["sessionId", "idempotencyKey", "runId", "payloadHash", "submission"].includes(key),
+    ) ||
     r.sessionId !== sessionId ||
     typeof r.idempotencyKey !== "string" ||
     !/^[a-f0-9]{64}$/.test(r.idempotencyKey) ||
     (r.runId !== undefined &&
       (typeof r.runId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(r.runId))) ||
     (r.payloadHash !== undefined &&
-      (typeof r.payloadHash !== "string" || !/^[a-f0-9]{64}$/.test(r.payloadHash)))
+      (typeof r.payloadHash !== "string" || !/^[a-f0-9]{64}$/.test(r.payloadHash))) ||
+    (r.submission !== undefined && r.submission !== "unknown")
   )
     throw new Error("invalid durable queue receipt");
   return r as unknown as DurableReceipt;
@@ -179,10 +207,64 @@ export async function getDurableRemoteRunEvents(
     throw new Error("malformed durable events response");
   let prior = after;
   for (const e of v.events) {
-    if ((e as any).seq <= prior) throw new Error("nonmonotonic durable events response");
+    if (
+      (e as any).seq <= prior ||
+      !Number.isSafeInteger((e as any).seq) ||
+      !isKnownRemoteEvent((e as any).event)
+    )
+      throw new Error("malformed or nonmonotonic durable events response");
     prior = (e as any).seq;
   }
   return v.events;
+}
+function isKnownRemoteEvent(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const e = value as Record<string, unknown>;
+  const keys = (allowed: string[]) => Object.keys(e).every((key) => allowed.includes(key));
+  if (e.type === "accepted") return keys(["type"]);
+  if (e.type === "log" || e.type === "error")
+    return keys(["type", "message"]) && typeof e.message === "string";
+  if (e.type === "state")
+    return (
+      keys(["type", "state", "phase"]) &&
+      ["queued", "running", "completed", "failed", "canceled", "unknown"].includes(
+        String(e.state),
+      ) &&
+      [
+        "accepted",
+        "dispatching",
+        "browser_attached",
+        "prompt_submitted",
+        "awaiting_response",
+        "capturing",
+        "terminal",
+      ].includes(String(e.phase))
+    );
+  if (e.type === "cancellation") return keys(["type", "outcome"]) && typeof e.outcome === "string";
+  if (e.type === "result")
+    return keys(["type", "result"]) && Boolean(e.result && typeof e.result === "object");
+  if (e.type === "artifact-ready")
+    return (
+      typeof e.runId === "string" &&
+      (() => {
+        try {
+          validateArtifactDescriptor(e.artifact as RemoteArtifactDescriptor);
+          return true;
+        } catch {
+          return false;
+        }
+      })()
+    );
+  if (e.type === "artifact-progress")
+    return (
+      keys(["type", "artifactId", "receivedBytes", "totalBytes", "phase"]) &&
+      typeof e.artifactId === "string" &&
+      ["download", "transfer", "validate"].includes(String(e.phase)) &&
+      [e.receivedBytes, e.totalBytes].every(
+        (n) => n === undefined || (Number.isSafeInteger(n) && Number(n) >= 0),
+      )
+    );
+  return false;
 }
 export async function getDurableRemoteQueueStatus(
   host: string,
@@ -311,15 +393,23 @@ export function createRemoteBrowserExecutor({
       } catch (error) {
         if (options.signal?.aborted)
           throw new Error("Remote browser run aborted before submission.");
-        if (!isRetryableTransport(error)) throw error;
-        accepted = await submitDurableRemoteRun({
-          host,
-          token,
-          idempotencyKey: receipt.idempotencyKey,
-          payload,
-        });
+        if (!isRetryableTransport(error) || isDefinitePreSubmit(error)) throw error;
+        try {
+          accepted = await submitDurableRemoteRun({
+            host,
+            token,
+            idempotencyKey: receipt.idempotencyKey,
+            payload,
+          });
+        } catch (retryError) {
+          if (isRetryableTransport(retryError) && !isDefinitePreSubmit(retryError)) {
+            await writeDurableReceipt({ ...receipt, submission: "unknown" });
+            throw new DurableSubmissionUnknownError();
+          }
+          throw retryError;
+        }
       }
-      await writeDurableReceipt({ ...receipt, runId: accepted.id });
+      await writeDurableReceipt({ ...receipt, runId: accepted.id, submission: undefined });
     }
     let cancelSent = false;
     const cancel = () => {
@@ -383,11 +473,10 @@ export function createRemoteBrowserExecutor({
         const transferWarnings = transferResults.flatMap((item, index) =>
           item.status === "rejected"
             ? [
-                {
-                  code: "remote-artifact-transfer-failed",
-                  severity: "warning" as const,
-                  message: `Artifact ${descriptors[index]?.artifactId ?? "unknown"} transfer failed: ${safeMessage(item.reason)}`,
-                },
+                new RemoteArtifactWarning(
+                  descriptors[index]?.artifactId ?? "unknown",
+                  `Artifact ${descriptors[index]?.artifactId ?? "unknown"} transfer failed: ${safeMessage(item.reason)}`,
+                ).warning,
               ]
             : [],
         );
@@ -459,7 +548,11 @@ export async function transferRemoteArtifact(p: {
   const d = p.descriptor;
   validateArtifactDescriptor(d);
   const dir = resolveSessionArtifactsDir(p.sessionId ?? d.runId);
-  await mkdir(dir, { recursive: true });
+  await ensurePrivateTree(
+    dir,
+    path.resolve(getOracleHomeDir()),
+    "unsafe durable artifact directory",
+  );
   const filename = sanitizeArtifactFilename(d.filename, `artifact-${d.artifactId}.bin`);
   const finalPath = await resolveUniqueArtifactPath(path.join(dir, filename));
   const part = `${finalPath}.part-${d.artifactId}`;
@@ -506,7 +599,12 @@ function validateArtifactDescriptor(d: RemoteArtifactDescriptor): void {
     !Number.isSafeInteger(d.byteSize) ||
     d.byteSize <= 0 ||
     d.byteSize > MAX_REMOTE_ARTIFACT_BYTES ||
-    !/^[a-f0-9]{64}$/.test(d.sha256)
+    !/^[a-f0-9]{64}$/.test(d.sha256) ||
+    typeof d.filename !== "string" ||
+    d.filename.length === 0 ||
+    d.filename.length > 255 ||
+    !["sandbox", "chatgpt-file-endpoint", "browser-download"].includes(d.sourceUrlKind) ||
+    !["ready", "streaming", "completed", "failed", "skipped"].includes(d.transferStatus)
   )
     throw new Error("invalid bridge artifact descriptor");
 }
@@ -532,7 +630,13 @@ async function downloadArtifact(
           reject(new Error(`artifact download HTTP ${res.statusCode}`));
           return;
         }
-        const out = createWriteStream(target, { flags: "wx" });
+        const out = createWriteStream(target, {
+          flags: (fsConstants.O_WRONLY |
+            fsConstants.O_CREAT |
+            fsConstants.O_EXCL |
+            fsConstants.O_NOFOLLOW) as unknown as string,
+          mode: 0o600,
+        });
         let n = 0;
         const limit = new Transform({
           transform(chunk: Buffer, _e, cb) {
@@ -555,19 +659,150 @@ async function downloadArtifact(
 }
 function validateSnapshot(s: DurableRunSnapshot): void {
   if (
+    s &&
+    typeof s === "object" &&
+    Object.keys(s).some(
+      (key) =>
+        ![
+          "id",
+          "state",
+          "phase",
+          "queuePosition",
+          "roughEtaMs",
+          "createdAt",
+          "updatedAt",
+          "requestHash",
+          "runtimeHint",
+          "modelSelection",
+          "artifacts",
+          "failure",
+          "cancellation",
+          "result",
+          "error",
+          "errorMetadata",
+        ].includes(key),
+    )
+  )
+    throw new Error("malformed durable run response");
+  if (
     !s ||
     typeof s !== "object" ||
     !/^[a-zA-Z0-9_-]{1,128}$/.test(s.id) ||
     !(["queued", "running", "completed", "failed", "canceled", "unknown"] as string[]).includes(
       s.state,
     ) ||
-    typeof s.phase !== "string" ||
+    ![
+      "accepted",
+      "dispatching",
+      "browser_attached",
+      "prompt_submitted",
+      "awaiting_response",
+      "capturing",
+      "terminal",
+    ].includes(s.phase) ||
     typeof s.requestHash !== "string" ||
     !/^[a-f0-9]{64}$/.test(s.requestHash) ||
     !Number.isSafeInteger(s.queuePosition) ||
-    !Number.isSafeInteger(s.roughEtaMs)
+    !Number.isSafeInteger(s.roughEtaMs) ||
+    s.queuePosition < 0 ||
+    s.roughEtaMs < 0 ||
+    !isIsoTimestamp(s.createdAt) ||
+    !isIsoTimestamp(s.updatedAt) ||
+    new Date(s.updatedAt).getTime() < new Date(s.createdAt).getTime()
   )
     throw new Error("malformed durable run response");
+  if (s.state === "completed" && (!s.result || !isValidResult(s.result)))
+    throw new Error("malformed completed durable run response");
+  if (s.state === "failed" && typeof s.error !== "string" && !s.failure)
+    throw new Error("malformed failed durable run response");
+  if (s.state === "canceled" && !s.cancellation)
+    throw new Error("malformed canceled durable run response");
+  if (s.state === "unknown" && typeof s.error !== "string" && !s.failure)
+    throw new Error("malformed unknown durable run response");
+  if (
+    s.runtimeHint !== undefined &&
+    (!s.runtimeHint || typeof s.runtimeHint !== "object" || Array.isArray(s.runtimeHint))
+  )
+    throw new Error("malformed durable runtime hint");
+  for (const field of ["failure", "errorMetadata"] as const) {
+    if (s[field] !== undefined && !isFailureMetadata(s[field]))
+      throw new Error(`malformed durable ${field}`);
+  }
+  if (
+    s.cancellation !== undefined &&
+    (!s.cancellation ||
+      typeof s.cancellation !== "object" ||
+      (s.cancellation.requestedAt !== undefined && !isIsoTimestamp(s.cancellation.requestedAt)) ||
+      (s.cancellation.outcome !== undefined && typeof s.cancellation.outcome !== "string"))
+  )
+    throw new Error("malformed durable cancellation");
+  if (
+    s.artifacts !== undefined &&
+    (!Array.isArray(s.artifacts) ||
+      s.artifacts.some((a) => {
+        try {
+          validateArtifactDescriptor(a);
+          return false;
+        } catch {
+          return true;
+        }
+      }))
+  )
+    throw new Error("malformed durable artifact descriptors");
+}
+function isValidResult(result: BrowserRunResult): boolean {
+  return (
+    typeof result.answerText === "string" &&
+    typeof result.answerMarkdown === "string" &&
+    [result.tookMs, result.answerTokens, result.answerChars].every(
+      (n) => Number.isSafeInteger(n) && n >= 0,
+    )
+  );
+}
+function isFailureMetadata(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const r = value as Record<string, unknown>;
+  if (Object.keys(r).some((key) => !["code", "type", "throttleMs", "message"].includes(key)))
+    return false;
+  return (
+    [r.code, r.type, r.message].every((v) => v === undefined || typeof v === "string") &&
+    (r.throttleMs === undefined ||
+      (Number.isSafeInteger(r.throttleMs) && Number(r.throttleMs) >= 0))
+  );
+}
+function isIsoTimestamp(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$/.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+async function ensurePrivateTree(dir: string, root: string, message: string): Promise<void> {
+  const resolvedRoot = path.resolve(root);
+  const resolvedDir = path.resolve(dir);
+  if (resolvedDir !== resolvedRoot && !resolvedDir.startsWith(resolvedRoot + path.sep))
+    throw new Error(message);
+  const relative = path.relative(resolvedRoot, resolvedDir);
+  try {
+    await mkdir(resolvedRoot, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  let current = resolvedRoot;
+  for (const segment of relative ? relative.split(path.sep) : []) {
+    current = path.join(current, segment);
+    try {
+      await mkdir(current, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const info = await lstat(current);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(message);
+    await chmod(current, 0o700);
+  }
+  const rootInfo = await lstat(resolvedRoot);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) throw new Error(message);
+  await chmod(resolvedRoot, 0o700);
 }
 function safeMessage(e: unknown): string {
   return (e instanceof Error ? e.message : String(e))
@@ -579,8 +814,12 @@ function isRetryableTransport(e: unknown): boolean {
     e instanceof Error ? e.message : String(e),
   );
 }
+function isDefinitePreSubmit(e: unknown): boolean {
+  return e instanceof RemoteTransportError && e.phase === "pre-submit";
+}
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
+    let connected = false;
     let settled = false;
     const t = setTimeout(() => {
       settled = true;
@@ -611,6 +850,7 @@ async function requestDurableJson(p: {
   const { hostname, port } = parseHostPort(p.host);
   const body = p.payload === undefined ? undefined : Buffer.from(JSON.stringify(p.payload));
   return new Promise((resolve, reject) => {
+    let connected = false;
     const req = http.request(
       {
         hostname,
@@ -654,8 +894,19 @@ async function requestDurableJson(p: {
         });
       },
     );
-    req.on("timeout", () => req.destroy(new Error("request timeout")));
-    req.on("error", (e) => reject(new Error(safeMessage(e))));
+    req.on("socket", (socket) =>
+      socket.once("connect", () => {
+        connected = true;
+      }),
+    );
+    req.on("timeout", () =>
+      req.destroy(
+        new RemoteTransportError("request timeout", connected ? "post-submit" : "pre-submit"),
+      ),
+    );
+    req.on("error", (e) =>
+      reject(new RemoteTransportError(safeMessage(e), connected ? "post-submit" : "pre-submit")),
+    );
     if (body) req.write(body);
     req.end();
   });
