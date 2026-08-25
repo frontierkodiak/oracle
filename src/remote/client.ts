@@ -19,7 +19,7 @@ import {
 } from "../browser/artifacts.js";
 import { getOracleHomeDir } from "../oracleHome.js";
 import { parseHostPort } from "../bridge/connection.js";
-import { checkRemoteHealth } from "./health.js";
+import { checkRemoteHealth, type RemoteHealthResult } from "./health.js";
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
   CAPTURE_ONLY_FEATURE_ID,
@@ -90,6 +90,33 @@ export interface QueueStatus {
   queued: number;
   capacity: number;
   [key: string]: unknown;
+}
+
+function assertRemoteCapabilities(
+  health: RemoteHealthResult,
+  host: string,
+  required: RemoteCapabilityRequirement[],
+): void {
+  if (!health.ok || !health.runtime || !health.manifest) {
+    const detail = health.error ?? "remote health handshake failed";
+    if (!health.statusCode && /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT/.test(detail))
+      throw new Error(`Could not reach the research bridge at ${host} (${detail}).`, {
+        cause: new Error(detail),
+      });
+    throw new Error(`${detail}; upgrade oracle on the host and retry`);
+  }
+  const features = new Set(
+    health.manifest.features.map((feature) => `${feature.id}@${feature.version}`),
+  );
+  for (const capability of required) {
+    if (
+      !features.has(`${capability.id}@${capability.version}`) ||
+      (capability.id === ARTIFACT_TRANSFER_FEATURE_ID && !health.capabilities?.artifactTransfer)
+    )
+      throw new Error(
+        `Remote host does not support required capability ${capability.id} v${capability.version}`,
+      );
+  }
 }
 
 export function receiptPath(sessionId: string): string {
@@ -179,6 +206,9 @@ export async function submitDurableRemoteRunWithReceipt(p: {
   sessionId: string;
   payload: RemoteRunPayload;
 }): Promise<{ receipt: DurableReceipt; snapshot: DurableRunSnapshot }> {
+  assertRemoteCapabilities(await checkRemoteHealth({ host: p.host, token: p.token }), p.host, [
+    { id: DURABLE_QUEUE_FEATURE_ID, version: 1 },
+  ]);
   let receipt = await readDurableReceipt(p.sessionId);
   if (!receipt) {
     receipt = { sessionId: p.sessionId, idempotencyKey: randomBytes(32).toString("hex") };
@@ -191,14 +221,36 @@ export async function submitDurableRemoteRunWithReceipt(p: {
     receipt = { ...receipt, payloadHash };
     await writeDurableReceipt(receipt);
   }
-  const snapshot = receipt.runId
-    ? await getDurableRemoteRun(p.host, receipt.runId, p.token)
-    : await submitDurableRemoteRun({
+  let snapshot: DurableRunSnapshot;
+  if (receipt.runId) {
+    snapshot = await getDurableRemoteRun(p.host, receipt.runId, p.token);
+  } else {
+    try {
+      snapshot = await submitDurableRemoteRun({
         host: p.host,
         token: p.token,
         idempotencyKey: receipt.idempotencyKey,
         payload: p.payload,
       });
+    } catch (error) {
+      if (!isRetryableTransport(error) || isDefinitePreSubmit(error)) throw error;
+      try {
+        snapshot = await submitDurableRemoteRun({
+          host: p.host,
+          token: p.token,
+          idempotencyKey: receipt.idempotencyKey,
+          payload: p.payload,
+        });
+      } catch (retryError) {
+        if (isRetryableTransport(retryError) && !isDefinitePreSubmit(retryError)) {
+          receipt = { ...receipt, submission: "unknown" };
+          await writeDurableReceipt(receipt);
+          throw new DurableSubmissionUnknownError();
+        }
+        throw retryError;
+      }
+    }
+  }
   if (!receipt.runId) {
     receipt = { ...receipt, runId: snapshot.id, submission: undefined };
     await writeDurableReceipt(receipt);
@@ -373,21 +425,7 @@ export function createRemoteBrowserExecutor({
   let healthPromise: ReturnType<typeof checkRemoteHealth> | undefined;
   const ensureHealth = async (required: RemoteCapabilityRequirement[]) => {
     const h = await (healthPromise ??= checkRemoteHealth({ host, token }));
-    if (!h.ok || !h.runtime || !h.manifest) {
-      const detail = h.error ?? "remote health handshake failed";
-      if (!h.statusCode && /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT/.test(detail))
-        throw new Error(`Could not reach the research bridge at ${host} (${detail}).`, {
-          cause: new Error(detail),
-        });
-      throw new Error(`${detail}; upgrade oracle on the host and retry`);
-    }
-    const features = new Set(h.manifest.features.map((f) => `${f.id}@${f.version}`));
-    for (const c of required)
-      if (
-        !features.has(`${c.id}@${c.version}`) ||
-        (c.id === ARTIFACT_TRANSFER_FEATURE_ID && !h.capabilities?.artifactTransfer)
-      )
-        throw new Error(`Remote host does not support required capability ${c.id} v${c.version}`);
+    assertRemoteCapabilities(h, host, required);
   };
   return async (options: BrowserRunOptions): Promise<BrowserRunResult> => {
     if (options.signal?.aborted)

@@ -162,9 +162,14 @@ describe("remote browser service", () => {
         schemaVersion: 1,
         features: expect.arrayContaining([
           expect.objectContaining({ id: "oracle.remote.artifact-transfer", version: 1 }),
-          expect.objectContaining({ id: "oracle.browser.capture-only", version: 1 }),
+          expect.objectContaining({ id: "oracle.remote.durable-queue", version: 1 }),
         ]),
       });
+      expect(healthOk.json?.capabilities.features).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "oracle.browser.capture-only", version: 1 }),
+        ]),
+      );
 
       const artifactUnauthorized = await httpGetJson({
         hostname: "127.0.0.1",
@@ -199,7 +204,13 @@ describe("remote browser service", () => {
     async () => {
       let runBrowserCalls = 0;
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          host: "127.0.0.1",
+          port: 0,
+          token: "secret",
+          logger: () => {},
+          allowCaptureOnly: true,
+        },
         {
           runBrowser: async (options) => {
             runBrowserCalls += 1;
@@ -581,7 +592,13 @@ describe("remote browser service", () => {
     async () => {
       let received: BrowserRunOptions | undefined;
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          host: "127.0.0.1",
+          port: 0,
+          token: "secret",
+          logger: () => {},
+          allowCaptureOnly: true,
+        },
         {
           runBrowser: async (options) => {
             received = options;

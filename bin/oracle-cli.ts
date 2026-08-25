@@ -1006,21 +1006,15 @@ program
   )
   .action(async (commandOptions) => {
     const { serveRemote } = await import("../src/remote/server.js");
-    const serverOptions = {
+    await serveRemote({
       host: commandOptions.host,
       port: commandOptions.port,
       token: commandOptions.token,
       manualLoginDefault: commandOptions.manualLogin,
       manualLoginProfileDir: commandOptions.manualLoginProfileDir,
       cookieSyncDefault: commandOptions.browserCookieSync,
-    };
-    // The exact-commit server type predates this forward-compatible flag;
-    // newer servers consume it while older ones safely ignore its absence.
-    if (commandOptions.allowCaptureOnly) {
-      (serverOptions as typeof serverOptions & { allowCaptureOnly: boolean }).allowCaptureOnly =
-        true;
-    }
-    await serveRemote(serverOptions);
+      allowCaptureOnly: commandOptions.allowCaptureOnly === true,
+    });
   });
 
 const remoteCommand = program
@@ -1136,13 +1130,16 @@ const remoteWatch = addRemoteConnectionOptions(
   remoteCommand
     .command("watch <run-id>")
     .description("Reconnect to and watch a durable run without canceling it.")
-    .option("--timeout <duration>", "Maximum watch duration (default 10m)."),
+    .option("--timeout <duration>", "Maximum watch duration (default 10m).", (value) =>
+      parseDurationOption(value, "Watch timeout"),
+    ),
 );
 remoteWatch.action(async function (this: Command, runId: string) {
   const options = this.opts<Record<string, unknown>>();
   const { host, token } = remoteHostAndToken(this);
   const outcome = await watchDurableRemoteRun(host, runId, {
     token,
+    timeoutMs: options.timeout as number | undefined,
     onSnapshot: (snapshot) => {
       if (!options.json) console.error(`${snapshot.id}: ${snapshot.state} (${snapshot.phase})`);
     },

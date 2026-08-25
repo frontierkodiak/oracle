@@ -74,6 +74,7 @@ describe("durable remote client receipts", () => {
     setOracleHomeDirOverrideForTest(home);
     const seen: { key?: string; auth?: string } = {};
     const server = http.createServer((req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(health()));
       seen.key = String(req.headers["idempotency-key"]);
       seen.auth = String(req.headers.authorization);
       res.end(JSON.stringify(runSnapshot("run-explicit", "queued")));
@@ -100,6 +101,51 @@ describe("durable remote client receipts", () => {
       });
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
+  it("marks an explicit submission unknown after two ambiguous responses and reuses its key", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-explicit-unknown-"));
+    setOracleHomeDirOverrideForTest(home);
+    let posts = 0;
+    const keys: string[] = [];
+    const { server, host } = await listen(async (req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      if (req.method === "POST" && req.url === "/v1/runs") {
+        posts += 1;
+        keys.push(String(req.headers["idempotency-key"]));
+        await body(req);
+        if (posts <= 2) return void res.destroy();
+        return void res.end(JSON.stringify(runSnapshot("explicit-recovered", "queued")));
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    const request = {
+      host,
+      sessionId: "explicit-unknown",
+      payload: {
+        prompt: "hello",
+        attachments: [],
+        browserConfig: {} as any,
+        options: { sessionId: "explicit-unknown" },
+      },
+    };
+    try {
+      await expect(submitDurableRemoteRunWithReceipt(request)).rejects.toBeInstanceOf(
+        DurableSubmissionUnknownError,
+      );
+      expect(await readDurableReceipt(request.sessionId)).toMatchObject({ submission: "unknown" });
+      const recovered = await submitDurableRemoteRunWithReceipt(request);
+      expect(recovered.snapshot.id).toBe("explicit-recovered");
+      expect(posts).toBe(3);
+      expect(new Set(keys).size).toBe(1);
+      expect(await readDurableReceipt(request.sessionId)).toMatchObject({
+        runId: "explicit-recovered",
+      });
+    } finally {
+      await close(server);
       setOracleHomeDirOverrideForTest(null);
     }
   });
