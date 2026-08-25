@@ -726,7 +726,7 @@ program
   .addOption(
     new Option(
       "--browser-max-concurrent-tabs <n>",
-      "Soft limit for concurrent ChatGPT tabs sharing one manual-login profile (default 3).",
+      "Soft limit for concurrent ChatGPT tabs sharing one manual-login profile (default 4).",
     ).hideHelp(),
   )
   .addOption(

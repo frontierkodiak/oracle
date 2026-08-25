@@ -488,15 +488,9 @@ export async function createRemoteServer(
           res.end(JSON.stringify(publicDurableSnapshot(snapshot)));
           void pumpDurableQueue();
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          res.writeHead(
-            message === "queue_full"
-              ? 503
-              : message.includes("idempotency key conflicts")
-                ? 409
-                : 400,
-          );
-          res.end(JSON.stringify({ error: message }));
+          const failure = publicAdmissionFailure(error);
+          res.writeHead(failure.statusCode, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: failure.code }));
         }
         return;
       }
@@ -984,6 +978,23 @@ function formatDurableFailure(error: unknown): {
 
 function remoteFailureIdentifier(value: unknown): string | undefined {
   return typeof value === "string" && /^[a-zA-Z0-9._:-]{1,128}$/.test(value) ? value : undefined;
+}
+
+function publicAdmissionFailure(error: unknown): { statusCode: number; code: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message === "queue_full") return { statusCode: 503, code: "queue_full" };
+  if (message.includes("idempotency key conflicts"))
+    return { statusCode: 409, code: "idempotency_conflict" };
+  if (message === "capture_only_disabled")
+    return { statusCode: 400, code: "capture_only_disabled" };
+  if (
+    error instanceof SyntaxError ||
+    message === "invalid_request" ||
+    message === "request body too large" ||
+    message === "stable Idempotency-Key is required"
+  )
+    return { statusCode: 400, code: "invalid_request" };
+  return { statusCode: 500, code: "admission_failed" };
 }
 
 function publicFailureMetadata(

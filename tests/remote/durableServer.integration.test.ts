@@ -203,6 +203,7 @@ describe("durable remote server admission", () => {
       "k".repeat(513),
     );
     expect(oversized.status).toBe(400);
+    expect(oversized.json.error).toBe("invalid_request");
     expect(calls).toBe(0);
     expect(await readdir(path.join(home, "remote-queue", "runs"))).toEqual([]);
   });

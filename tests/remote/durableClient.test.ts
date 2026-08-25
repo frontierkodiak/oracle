@@ -164,6 +164,63 @@ describe("durable remote client receipts", () => {
     }
   });
 
+  it.each(["malformed", "truncated"] as const)(
+    "treats an accepted %s success response as post-submit ambiguity",
+    async (responseKind) => {
+      const home = await mkdtemp(path.join(os.tmpdir(), `oracle-${responseKind}-response-`));
+      setOracleHomeDirOverrideForTest(home);
+      let posts = 0;
+      const keys: string[] = [];
+      const { server, host } = await listen(async (req, res) => {
+        if (req.url === "/health") return void res.end(JSON.stringify(health()));
+        if (req.method === "POST" && req.url === "/v1/runs") {
+          posts += 1;
+          keys.push(String(req.headers["idempotency-key"]));
+          await body(req);
+          if (posts <= 2) {
+            res.statusCode = 202;
+            if (responseKind === "truncated") {
+              res.setHeader("Content-Type", "application/json");
+              res.write('{"id":');
+              return void res.destroy();
+            }
+            return void res.end("accepted-but-malformed");
+          }
+          return void res.end(JSON.stringify(runSnapshot(`${responseKind}-recovered`, "queued")));
+        }
+        res.statusCode = 404;
+        res.end();
+      });
+      const sessionId = `${responseKind}-accepted-response`;
+      const request = {
+        host,
+        sessionId,
+        payload: {
+          prompt: "hello",
+          attachments: [],
+          browserConfig: {} as any,
+          options: { sessionId },
+        },
+      };
+      try {
+        const unknown = await submitDurableRemoteRunWithReceipt(request).catch((error) => error);
+        expect(unknown).toBeInstanceOf(DurableSubmissionUnknownError);
+        expect(unknown).toMatchObject({ sessionId });
+        expect(posts).toBe(2);
+        expect(new Set(keys).size).toBe(1);
+        expect(await readDurableReceipt(sessionId)).toMatchObject({ submission: "unknown" });
+
+        const recovered = await submitDurableRemoteRunWithReceipt(request);
+        expect(recovered.snapshot.id).toBe(`${responseKind}-recovered`);
+        expect(posts).toBe(3);
+        expect(new Set(keys).size).toBe(1);
+      } finally {
+        await close(server);
+        setOracleHomeDirOverrideForTest(null);
+      }
+    },
+  );
+
   it("accepts typed post-submit cancellation snapshots without inventing an error", async () => {
     const { server, host } = await listen((_req, res) => {
       res.end(
@@ -618,7 +675,7 @@ describe("durable remote client receipts", () => {
         posts++;
         await body(req);
         res.statusCode = 401;
-        return void res.end(JSON.stringify({ error: "unauthorized" }));
+        return void res.end("not-json");
       }
       if (req.url === "/health") return void res.end(JSON.stringify(health()));
       res.statusCode = 404;

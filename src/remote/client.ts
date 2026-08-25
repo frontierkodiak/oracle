@@ -951,6 +951,7 @@ function safeMessage(e: unknown): string {
     .replace(/(authorization|token|api[_-]?key)\s*[:=]\s*[^,\s]+/gi, "$1=[redacted]");
 }
 function isRetryableTransport(e: unknown): boolean {
+  if (e instanceof RemoteTransportError) return true;
   return /ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|request timeout|ETIMEDOUT|network/i.test(
     e instanceof Error ? e.message : String(e),
   );
@@ -1008,6 +1009,17 @@ async function requestDurableJson(p: {
       (res) => {
         const chunks: Buffer[] = [];
         let bytes = 0;
+        const responseTransportFailure = (message: string): Error =>
+          res.statusCode !== undefined && (res.statusCode < 200 || res.statusCode >= 300)
+            ? new Error(`remote request failed HTTP ${res.statusCode}: incomplete response`)
+            : new RemoteTransportError(message, "post-submit");
+        res.on("aborted", () => reject(responseTransportFailure("remote response aborted")));
+        res.on("close", () => {
+          if (!res.complete) reject(responseTransportFailure("remote response closed early"));
+        });
+        res.on("error", (error) =>
+          reject(responseTransportFailure(`remote response failed: ${safeMessage(error)}`)),
+        );
         res.on("data", (c) => {
           bytes += Buffer.byteLength(c);
           if (bytes > 8 * 1024 * 1024) {
@@ -1017,14 +1029,22 @@ async function requestDurableJson(p: {
           chunks.push(Buffer.from(c));
         });
         res.on("end", () => {
+          const successful =
+            res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 300;
           let v: unknown;
           try {
             v = JSON.parse(Buffer.concat(chunks).toString("utf8"));
           } catch {
-            reject(new Error(`malformed remote response (HTTP ${res.statusCode})`));
+            if (successful && p.method === "POST" && p.idempotencyKey)
+              reject(
+                responseTransportFailure(`malformed remote response (HTTP ${res.statusCode})`),
+              );
+            else if (!successful)
+              reject(new Error(`remote request failed HTTP ${res.statusCode}: request failed`));
+            else reject(new Error(`malformed remote response (HTTP ${res.statusCode})`));
             return;
           }
-          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300)
+          if (!successful)
             reject(
               new Error(
                 `remote request failed HTTP ${res.statusCode}: ${safeMessage((v as any)?.error ?? "request failed")}`,
