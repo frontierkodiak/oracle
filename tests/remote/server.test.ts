@@ -115,9 +115,15 @@ describe("remote browser service", () => {
       expect(healthOk.statusCode).toBe(200);
       expect(healthOk.json?.ok).toBe(true);
       expect(typeof healthOk.json?.version).toBe("string");
+      expect(healthOk.json?.runtime).toEqual({
+        name: "node",
+        version: process.versions.node,
+        major: Number(process.versions.node.split(".")[0]),
+        minimumMajor: 24,
+      });
       expect(healthOk.json?.capabilities).toMatchObject({
-        artifactTransfer: true,
-        artifactProtocolVersion: 1,
+        schemaVersion: 1,
+        features: [{ id: "oracle.remote.artifact-transfer", version: 1 }],
       });
 
       const artifactUnauthorized = await httpGetJson({
@@ -481,6 +487,27 @@ async function createFakeArtifactBridge({
 }> {
   let artifactRequestCount = 0;
   const server = http.createServer((req, res) => {
+    if (req.method === "GET" && req.url === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          version: "test",
+          runtime: { name: "node", version: "24.0.0", major: 24, minimumMajor: 24 },
+          capabilities: {
+            schemaVersion: 1,
+            features: [
+              {
+                id: "oracle.remote.artifact-transfer",
+                version: 1,
+                limits: { maxBytes: 512 * 1024 * 1024 },
+              },
+            ],
+          },
+        }),
+      );
+      return;
+    }
     if (req.method === "POST" && req.url === "/runs") {
       req.resume();
       res.writeHead(200, { "Content-Type": "application/x-ndjson" });

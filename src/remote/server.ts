@@ -12,13 +12,13 @@ import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/t
 import type { BrowserSessionConfig } from "../sessionManager.js";
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
-import type {
-  RemoteArtifactCapabilities,
-  RemoteArtifactDescriptor,
-  RemoteRunPayload,
-  RemoteRunEvent,
+import type { RemoteArtifactDescriptor, RemoteRunPayload, RemoteRunEvent } from "./types.js";
+import {
+  ARTIFACT_TRANSFER_FEATURE_ID,
+  MAX_REMOTE_ARTIFACT_BYTES,
+  REMOTE_HEALTH_SCHEMA_VERSION,
 } from "./types.js";
-import { MAX_REMOTE_ARTIFACT_BYTES } from "./types.js";
+import { getOracleRuntimeIdentity } from "./runtime.js";
 import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 import { CHATGPT_URL } from "../browser/constants.js";
 import { getCliVersion } from "../version.js";
@@ -68,10 +68,15 @@ interface RegisteredRemoteArtifact {
 const ARTIFACT_PROTOCOL_VERSION = 1;
 const REMOTE_ARTIFACT_TTL_MS = 30 * 60 * 1000;
 
-const ARTIFACT_CAPABILITIES: RemoteArtifactCapabilities = {
-  artifactTransfer: true,
-  artifactProtocolVersion: ARTIFACT_PROTOCOL_VERSION,
-  maxArtifactBytes: MAX_REMOTE_ARTIFACT_BYTES,
+const ARTIFACT_CAPABILITIES = {
+  schemaVersion: REMOTE_HEALTH_SCHEMA_VERSION,
+  features: [
+    {
+      id: ARTIFACT_TRANSFER_FEATURE_ID,
+      version: ARTIFACT_PROTOCOL_VERSION,
+      limits: { maxBytes: MAX_REMOTE_ARTIFACT_BYTES },
+    },
+  ],
 };
 
 async function findAvailablePort(): Promise<number> {
@@ -94,6 +99,7 @@ export async function createRemoteServer(
   options: RemoteServerOptions = {},
   deps: RemoteServerDeps = {},
 ): Promise<RemoteServerInstance> {
+  const runtime = getOracleRuntimeIdentity();
   const runBrowser = deps.runBrowser ?? runBrowserMode;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
@@ -142,6 +148,7 @@ export async function createRemoteServer(
           version: getCliVersion(),
           uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
           capabilities: ARTIFACT_CAPABILITIES,
+          runtime,
         }),
       );
       return;
