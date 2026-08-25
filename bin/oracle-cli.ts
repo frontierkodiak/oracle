@@ -1030,7 +1030,12 @@ function addRemoteConnectionOptions(command: Command): Command {
 }
 
 function remoteHostAndToken(command: Command): { host: string; token?: string } {
-  const options = command.opts<Record<string, unknown>>();
+  // `--remote-host` and `--remote-token` also exist on the root command for
+  // transparent browser delegation. Commander may therefore attribute an
+  // explicitly supplied flag to either this subcommand or an ancestor,
+  // depending on its position. Read the merged option view so every documented
+  // placement reaches the durable command action.
+  const options = command.optsWithGlobals<Record<string, unknown>>();
   const config = resolveRemoteServiceConfig({
     cliHost: options.remoteHost as string | undefined,
     cliToken: options.remoteToken as string | undefined,
