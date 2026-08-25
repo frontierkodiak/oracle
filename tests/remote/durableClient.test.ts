@@ -78,6 +78,7 @@ describe("durable remote client receipts", () => {
             phase: "terminal",
             queuePosition: 0,
             roughEtaMs: 100,
+            requestHash: "a".repeat(64),
             createdAt: "x",
             updatedAt: "x",
             result: {
@@ -156,6 +157,7 @@ describe("durable remote client receipts", () => {
             phase: "accepted",
             queuePosition: 0,
             roughEtaMs: 100,
+            requestHash: "a".repeat(64),
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           }),
@@ -170,6 +172,7 @@ describe("durable remote client receipts", () => {
             phase: "terminal",
             queuePosition: 0,
             roughEtaMs: 0,
+            requestHash: "a".repeat(64),
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             result: {

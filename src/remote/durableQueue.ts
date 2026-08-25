@@ -51,6 +51,7 @@ export interface DurableRunSnapshot {
   result?: unknown;
   error?: string;
   errorMetadata?: DurableErrorMetadata;
+  failure?: DurableErrorMetadata;
   cancellation?: { requestedAt?: string; outcome?: string };
 }
 export interface DurableQueueOptions {
@@ -199,6 +200,7 @@ export class DurableQueueStore {
       ...(r.result ? { result: JSON.parse(String(r.result)) } : {}),
       ...(r.error ? { error: String(r.error) } : {}),
       ...(r.error_meta ? { errorMetadata: JSON.parse(String(r.error_meta)) } : {}),
+      ...(r.error_meta ? { failure: JSON.parse(String(r.error_meta)) } : {}),
       ...(r.cancellation ? { cancellation: JSON.parse(String(r.cancellation)) } : {}),
     };
   }

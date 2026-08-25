@@ -509,6 +509,8 @@ function validateSnapshot(s: DurableRunSnapshot): void {
       s.state,
     ) ||
     typeof s.phase !== "string" ||
+    typeof s.requestHash !== "string" ||
+    !/^[a-f0-9]{64}$/.test(s.requestHash) ||
     !Number.isSafeInteger(s.queuePosition) ||
     !Number.isSafeInteger(s.roughEtaMs)
   )

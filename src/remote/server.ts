@@ -284,13 +284,15 @@ export async function createRemoteServer(
             if (typeof message === "string") logger(`[run ${id}] ${message}`);
           }) as BrowserLogger;
           automationLogger.verbose = Boolean(payload.options?.verbose);
-          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: hostConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId, followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser), runtimeHintCb: async (hint) => {
+          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: hostConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId, followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser), runtimeHintCb: async (hint, modelSelection) => {
             const raw = hint as unknown as Record<string, unknown>;
-            durableQueue.transition(id, "running", raw.promptSubmitted === true ? "prompt_submitted" : "browser_attached", { runtimeHint: raw });
+            durableQueue.transition(id, "running", raw.promptSubmitted === true ? "prompt_submitted" : "browser_attached", { runtimeHint: { ...raw, ...(modelSelection ? { modelSelection } : {}) } });
           } });
           const durable = await persistBrowserRunArtifacts({ queueRoot: durableQueue.root, runId: id, result });
-          const model = typeof (result.modelSelection as any)?.model === "string" ? String((result.modelSelection as any).model) : "";
-          const qualifying = payload.browserConfig.captureOnly !== true && /pro/i.test(model) && result.promptSubmitted === true;
+          const modelEvidence = result.modelSelection as any;
+          const thinkingEvidence = result.thinkingSelection as any;
+          const model = String(modelEvidence?.resolvedLabel ?? modelEvidence?.requestedModel ?? "");
+          const qualifying = payload.browserConfig.captureOnly !== true && /pro/i.test(model) && modelEvidence?.verified === true && thinkingEvidence?.verified === true && /pro/i.test(String(thinkingEvidence?.requestedLevel ?? "")) && result.promptSubmitted === true;
           durableQueue.transition(id, "completed", "terminal", { result: { ...durable.result, artifacts: durable.descriptors }, elapsedMs: Date.now() - started, model, etaQualifying: qualifying });
         } catch (error) {
           const failure = formatDurableFailure(error);
