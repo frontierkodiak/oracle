@@ -6,6 +6,7 @@ import type { SessionArtifactValidation } from "../sessionManager.js";
 export const MAX_REMOTE_ARTIFACT_BYTES = 512 * 1024 * 1024;
 export const REMOTE_HEALTH_SCHEMA_VERSION = 1;
 export const ARTIFACT_TRANSFER_FEATURE_ID = "oracle.remote.artifact-transfer";
+export const CAPTURE_ONLY_FEATURE_ID = "oracle.browser.capture-only";
 
 export interface RemoteCapabilityFeature {
   id: string;

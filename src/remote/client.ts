@@ -19,6 +19,7 @@ import {
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
   ARTIFACT_TRANSFER_FEATURE_ID,
+  CAPTURE_ONLY_FEATURE_ID,
   type RemoteArtifactDescriptor,
   type RemoteRunPayload,
   type RemoteRunEvent,
@@ -72,23 +73,38 @@ export function createRemoteBrowserExecutor({
   ): Promise<BrowserRunResult> {
     if (options.signal?.aborted)
       throw new Error("Remote browser run cancelled before the request was sent.");
-    await ensureHealth(requiredCapabilities ?? []);
+    const required = [...(requiredCapabilities ?? [])];
+    if (options.config?.captureOnly === true) {
+      required.push({ id: CAPTURE_ONLY_FEATURE_ID, version: 1 });
+    }
+    await ensureHealth(required);
     if (options.signal?.aborted) throw new Error("Remote browser run aborted before submission.");
+    const captureOnly = options.config?.captureOnly === true;
+    const browserConfig = captureOnly
+      ? {
+          ...options.config,
+          desiredModel: undefined,
+          modelStrategy: undefined,
+          thinkingTime: undefined,
+          researchMode: undefined,
+        }
+      : (options.config ?? {});
     const payload: RemoteRunPayload = {
-      prompt: options.prompt,
-      attachments: await serializeAttachments(options.attachments ?? []),
-      fallbackSubmission: options.fallbackSubmission
-        ? {
-            prompt: options.fallbackSubmission.prompt,
-            attachments: await serializeAttachments(options.fallbackSubmission.attachments ?? []),
-          }
-        : undefined,
-      browserConfig: options.config ?? {},
+      prompt: captureOnly ? "" : options.prompt,
+      attachments: captureOnly ? [] : await serializeAttachments(options.attachments ?? []),
+      fallbackSubmission:
+        !captureOnly && options.fallbackSubmission
+          ? {
+              prompt: options.fallbackSubmission.prompt,
+              attachments: await serializeAttachments(options.fallbackSubmission.attachments ?? []),
+            }
+          : undefined,
+      browserConfig,
       options: {
         heartbeatIntervalMs: options.heartbeatIntervalMs,
         verbose: options.verbose,
         sessionId: options.sessionId,
-        followUpPrompts: options.followUpPrompts,
+        followUpPrompts: captureOnly ? undefined : options.followUpPrompts,
       },
     };
 
