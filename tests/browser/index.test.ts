@@ -539,6 +539,90 @@ describe("ChatGPT UI warning detection", () => {
   });
 });
 
+describe("remote capture-only boundary", () => {
+  test("skips prompt readiness and asks hydration not to require a prompt", async () => {
+    const ensurePromptReady = vi.fn(async () => undefined);
+    const waitForHydration = vi.fn(async (_requirePromptReady: boolean) => undefined);
+    await __test__.preparePromptBoundaryForTest({
+      captureOnly: true,
+      isResumingConversation: true,
+      ensurePromptReady,
+      waitForHydration,
+    });
+    expect(ensurePromptReady).not.toHaveBeenCalled();
+    expect(waitForHydration).toHaveBeenCalledWith(false);
+  });
+
+  test("retains prompt readiness and prompt-dependent hydration for ordinary runs", async () => {
+    const ensurePromptReady = vi.fn(async () => undefined);
+    const waitForHydration = vi.fn(async (_requirePromptReady: boolean) => undefined);
+    await __test__.preparePromptBoundaryForTest({
+      captureOnly: false,
+      isResumingConversation: true,
+      ensurePromptReady,
+      waitForHydration,
+    });
+    expect(ensurePromptReady).toHaveBeenCalledOnce();
+    expect(waitForHydration).toHaveBeenCalledWith(true);
+  });
+
+  const base = {
+    Runtime: {} as never,
+    config: resolveBrowserConfig({
+      captureOnly: true,
+      captureProviderNative: true,
+      resumeConversationUrl: "https://chatgpt.com/c/existing",
+    }),
+    conversationUrl: "https://chatgpt.com/c/existing",
+    sessionId: "capture-boundary",
+    logger: vi.fn() as never,
+    startedAt: Date.now(),
+    remoteTargetId: "target-1",
+  };
+
+  test("captures after authentication and returns before submission machinery", async () => {
+    const readLocation = vi.fn(async () => "https://chatgpt.com/c/existing");
+    const capture = vi.fn(async () => ({
+      summary: {
+        status: "captured" as const,
+        turnCount: 2,
+        rawBytes: 42,
+        conversationId: "existing",
+      },
+      artifacts: [],
+    }));
+    const result = await __test__.runRemoteCaptureOnlyForTest({
+      ...base,
+      readLocation,
+      capture,
+    });
+
+    expect(result).toMatchObject({
+      answerText: "",
+      promptSubmitted: false,
+      conversationId: "existing",
+      chromeTargetId: "target-1",
+    });
+    expect(readLocation).toHaveBeenCalledOnce();
+    expect(capture).toHaveBeenCalledOnce();
+    // The seam contains no prompt readiness, picker, attachment, typing,
+    // submit, or follow-up call; those remain unreachable after this return.
+  });
+
+  test("leaves normal remote runs on the submission path", async () => {
+    const capture = vi.fn();
+    await expect(
+      __test__.runRemoteCaptureOnlyForTest({
+        ...base,
+        config: resolveBrowserConfig({ captureOnly: false }),
+        readLocation: vi.fn(),
+        capture: capture as never,
+      }),
+    ).resolves.toBeUndefined();
+    expect(capture).not.toHaveBeenCalled();
+  });
+});
+
 describe("browser follow-ups", () => {
   test("rejects copy-profile with manual-login before launching Chrome", async () => {
     await expect(

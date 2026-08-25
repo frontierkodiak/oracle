@@ -7,6 +7,7 @@ import type {
   BrowserSessionConfig,
   BrowserRuntimeMetadata,
   BrowserModelSelectionEvidence,
+  BrowserRunWarning,
   SessionArtifact,
   SessionModelRun,
 } from "../sessionStore.js";
@@ -52,6 +53,11 @@ import { estimateTokenCount } from "../browser/utils.js";
 import type { BrowserLogger } from "../browser/types.js";
 import { formatElapsed } from "../oracle/format.js";
 import { formatBrowserReattachGuidance } from "./reattachGuidance.js";
+import {
+  deriveChatgptProfileId,
+  ingestProviderNativeArtifacts,
+  ledgerWarning,
+} from "../transcriptLedger.js";
 
 const isTty = process.stdout.isTTY;
 const dim = (text: string): string => (isTty ? kleur.dim(text) : text);
@@ -131,7 +137,7 @@ export async function performSessionRun({
           currentBrowser = browser;
         },
       };
-      const result = await runBrowserSessionExecution(
+      let result = await runBrowserSessionExecution(
         {
           runOptions: { ...runOptions, sessionId: runOptions.sessionId ?? sessionMeta.id },
           browserConfig,
@@ -140,6 +146,28 @@ export async function performSessionRun({
         },
         runnerDeps,
       );
+      // Provider-native capture artifacts are already paired and durably written
+      // by the browser adapter at this point. The ledger is deliberately
+      // best-effort: a private archive outage must not turn a completed answer
+      // or capture into a failed provider run.
+      try {
+        const ledgerResult = await ingestProviderNativeArtifacts({
+          artifacts: result.artifacts,
+          requirePair: browserConfig.captureProviderNative === true,
+          profileId: deriveChatgptProfileId(browserConfig),
+          conversationId: result.runtime.conversationId,
+          canonicalUrl: result.runtime.tabUrl,
+        });
+        if (ledgerResult) {
+          log(
+            `[transcript-ledger] captured revision ${ledgerResult.revisionId.slice(0, 12)}${ledgerResult.deduplicated ? " (logical duplicate)" : ""}.`,
+          );
+        }
+      } catch (error) {
+        const warning = ledgerWarning(error) as BrowserRunWarning;
+        result = { ...result, warnings: [...(result.warnings ?? []), warning] };
+        log(`[transcript-ledger] ${warning.code}: ${warning.message}`);
+      }
       await writeAssistantOutput(runOptions.writeOutputPath, result.answerText ?? "", log);
       await sendSessionNotification(
         {

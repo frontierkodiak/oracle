@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -86,6 +87,176 @@ describe("provider conversation normalization", () => {
 });
 
 describe("provider capture failure handling", () => {
+  const MAX_DOCUMENT_BYTES = 64 * 1024 * 1024;
+
+  it("retains the independently fetched document as a separately drained artifact", async () => {
+    const rawText = JSON.stringify({ conversation_id: "abc-123", mapping: {} });
+    const digest = createHash("sha256").update(rawText).digest("hex");
+    const values: unknown[] = [
+      {
+        result: {
+          value: { ok: true, length: rawText.length, bytes: Buffer.byteLength(rawText) },
+        },
+      },
+      { result: { value: rawText } },
+      { result: { value: true } },
+      {
+        result: {
+          value: {
+            ok: true,
+            documentSha256Decimal: [...Buffer.from(digest, "hex")],
+            documentBytes: Buffer.byteLength(rawText),
+            documentChars: rawText.length,
+            perTurn: [],
+            fetchedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      },
+      { result: { value: rawText } },
+      { result: { value: true } },
+    ];
+    let cursor = 0;
+    const outcome = await captureProviderNativeConversation({
+      Runtime: {
+        evaluate: async () => values[cursor++],
+      } as never,
+      conversationId: "abc-123",
+    });
+    expect(outcome).toMatchObject({
+      status: "captured",
+      capture: {
+        rawText,
+        independentRawText: rawText,
+        independentSha256: digest,
+        independentBytes: Buffer.byteLength(rawText),
+      },
+    });
+  });
+
+  it("reassembles a surrogate pair split across an A/B drain chunk boundary", async () => {
+    const document = `${"a".repeat(499_999)}😀`;
+    const bytes = Buffer.byteLength(document, "utf8");
+    const digest = createHash("sha256").update(document).digest("hex");
+    let cursor = 0;
+    const outcome = await captureProviderNativeConversation({
+      Runtime: {
+        evaluate: async () => {
+          cursor += 1;
+          switch (cursor) {
+            case 1:
+              return { result: { value: { ok: true, length: document.length, bytes } } };
+            case 2:
+              return { result: { value: document.slice(0, 500_000) } };
+            case 3:
+              return { result: { value: document.slice(500_000) } };
+            case 4:
+              return { result: { value: true } };
+            case 5:
+              return {
+                result: {
+                  value: {
+                    ok: true,
+                    documentSha256Decimal: [...Buffer.from(digest, "hex")],
+                    documentBytes: bytes,
+                    documentChars: document.length,
+                    perTurn: [],
+                    fetchedAt: "2026-01-01T00:00:00.000Z",
+                  },
+                },
+              };
+            case 6:
+              return { result: { value: document.slice(0, 500_000) } };
+            case 7:
+              return { result: { value: document.slice(500_000) } };
+            case 8:
+              return { result: { value: true } };
+            default:
+              throw new Error(`unexpected evaluation ${cursor}`);
+          }
+        },
+      } as never,
+      conversationId: "abc-123",
+    });
+    expect(outcome).toMatchObject({
+      status: "captured",
+      capture: {
+        rawText: document,
+        independentRawText: document,
+        independentBytes: bytes,
+      },
+    });
+    expect(
+      (outcome as { capture?: { evidenceFailure?: unknown } }).capture?.evidenceFailure,
+    ).toBeUndefined();
+  });
+
+  it("rejects a non-ASCII authoritative document when UTF-8 bytes exceed the ledger ceiling", async () => {
+    const rawText = "é".repeat(MAX_DOCUMENT_BYTES / 2 + 1);
+    let cursor = 0;
+    const values: unknown[] = [
+      {
+        result: {
+          value: { ok: true, length: rawText.length, bytes: Buffer.byteLength(rawText) },
+        },
+      },
+      { result: { value: rawText } },
+      { result: { value: true } },
+    ];
+    const outcome = await captureProviderNativeConversation({
+      Runtime: { evaluate: async () => values[cursor++] } as never,
+      conversationId: "abc-123",
+    });
+    expect(outcome).toEqual({
+      status: "unavailable",
+      failure: {
+        reason: "http-error",
+        detail: `document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
+      },
+    });
+  });
+
+  it("rejects a non-ASCII independent document when UTF-8 bytes exceed the ledger ceiling", async () => {
+    const rawText = "small authoritative document";
+    const independentText = "😀".repeat(Math.floor(MAX_DOCUMENT_BYTES / 4) + 1);
+    expect(Buffer.byteLength(independentText, "utf8")).toBeGreaterThan(MAX_DOCUMENT_BYTES);
+    let cursor = 0;
+    const values: unknown[] = [
+      {
+        result: {
+          value: { ok: true, length: rawText.length, bytes: Buffer.byteLength(rawText) },
+        },
+      },
+      { result: { value: rawText } },
+      { result: { value: true } },
+      {
+        result: {
+          value: {
+            ok: false,
+            reason: "http-error",
+            detail: "document exceeds byte capture ceiling",
+          },
+        },
+      },
+      { result: { value: true } },
+    ];
+    const outcome = await captureProviderNativeConversation({
+      Runtime: { evaluate: async () => values[cursor++] } as never,
+      conversationId: "abc-123",
+    });
+    expect(outcome).toMatchObject({
+      status: "captured",
+      capture: {
+        evidenceFailure: {
+          reason: "http-error",
+          detail: "document exceeds byte capture ceiling",
+        },
+      },
+    });
+    expect(
+      (outcome as { capture?: { independentRawText?: string } }).capture?.independentRawText,
+    ).toBeUndefined();
+  });
+
   it("treats a conversation with no id as a normal unavailable result, not an error", async () => {
     const outcome = await captureProviderNativeConversation({
       Runtime: {
