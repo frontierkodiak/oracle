@@ -127,220 +127,289 @@ async function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: s
   }
 }
 
-/**
- * Canonical turn normalization, ported from the downstream proof-grade
- * normalizer so digests computed here are directly comparable to digests
- * recomputed there from the same bytes.
- *
- * The JSON fallback branches must reproduce Python's
- * `json.dumps(sort_keys=True, ensure_ascii=False)` exactly, which is why numbers
- * carry their source literal through the parse: JSON `1.0` and `1` both become
- * the JS number 1, but Python renders them `1.0` and `1`. A literal-aware parser
- * keeps that distinction, and `pyNumber` applies Python's float repr rules on top
- * (integral floats gain a trailing `.0`; exponent forms are left alone).
- */
-function buildNormalizerSource(): string {
-  return `
-    const PY_INT = Symbol.for('oracle.pyInt');
-    const PY_FLOAT = Symbol.for('oracle.pyFloat');
-    // Literal-preserving JSON parse: numbers become boxed values that remember
-    // whether the source literal was an integer or a float.
-    const parseJsonPreservingNumbers = (text) => {
-      let i = 0;
-      const err = (msg) => { throw new Error(msg + ' at ' + i); };
-      const ws = () => { while (i < text.length && ' \\t\\n\\r'.includes(text[i])) i += 1; };
-      const parseValue = () => {
-        ws();
-        const ch = text[i];
-        if (ch === '{') return parseObject();
-        if (ch === '[') return parseArray();
-        if (ch === '"') return parseString();
-        if (ch === 't') { i += 4; return true; }
-        if (ch === 'f') { i += 5; return false; }
-        if (ch === 'n') { i += 4; return null; }
-        return parseNumber();
-      };
-      const parseObject = () => {
-        const out = {}; i += 1; ws();
-        if (text[i] === '}') { i += 1; return out; }
-        for (;;) {
-          ws();
-          if (text[i] !== '"') err('expected key');
-          const key = parseString();
-          ws();
-          if (text[i] !== ':') err('expected colon');
-          i += 1;
-          out[key] = parseValue();
-          ws();
-          if (text[i] === ',') { i += 1; continue; }
-          if (text[i] === '}') { i += 1; return out; }
-          err('expected , or }');
-        }
-      };
-      const parseArray = () => {
-        const out = []; i += 1; ws();
-        if (text[i] === ']') { i += 1; return out; }
-        for (;;) {
-          out.push(parseValue());
-          ws();
-          if (text[i] === ',') { i += 1; continue; }
-          if (text[i] === ']') { i += 1; return out; }
-          err('expected , or ]');
-        }
-      };
-      const parseString = () => {
-        const start = i; i += 1;
-        while (i < text.length) {
-          const ch = text[i];
-          if (ch === '\\\\') { i += 2; continue; }
-          if (ch === '"') { i += 1; return JSON.parse(text.slice(start, i)); }
-          i += 1;
-        }
-        err('unterminated string');
-      };
-      const parseNumber = () => {
-        const start = i;
-        while (i < text.length && '-+.eE0123456789'.includes(text[i])) i += 1;
-        const literal = text.slice(start, i);
-        if (!literal) err('expected value');
-        const value = Number(literal);
-        const isFloat = /[.eE]/.test(literal);
-        return { [isFloat ? PY_FLOAT : PY_INT]: true, value, literal };
-      };
-      const result = parseValue();
+/** The one canonical provider normalizer used by both the page evidence path and the ledger. */
+export function canonicalNormalizeProviderConversation(rawText: string): Array<{
+  index: number;
+  role: string;
+  contentType: string;
+  body: string;
+  attachments: ProviderNativeTurnAttachment[];
+}> {
+  const PY_INT = Symbol.for("oracle.pyInt");
+  const PY_FLOAT = Symbol.for("oracle.pyFloat");
+  let i = 0;
+  const error = (message: string): never => {
+    throw new Error(`${message} at ${i}`);
+  };
+  const whitespace = (): void => {
+    while (i < rawText.length && " \t\n\r".includes(rawText[i] ?? "")) i += 1;
+  };
+  const parseString = (): string => {
+    const start = i;
+    i += 1;
+    while (i < rawText.length) {
+      const character = rawText[i];
+      if (character === "\\") {
+        i += 2;
+        continue;
+      }
+      if (character === '"') {
+        i += 1;
+        return JSON.parse(rawText.slice(start, i)) as string;
+      }
+      i += 1;
+    }
+    return error("unterminated string");
+  };
+  const parseNumber = (): Record<PropertyKey, unknown> => {
+    const start = i;
+    while (i < rawText.length && "-+.eE0123456789".includes(rawText[i] ?? "")) i += 1;
+    const literal = rawText.slice(start, i);
+    if (!literal) return error("expected value");
+    const value = Number(literal);
+    if (!Number.isFinite(value)) return error("invalid number");
+    const isFloat = /[.eE]/.test(literal);
+    return { [isFloat ? PY_FLOAT : PY_INT]: true, value, literal };
+  };
+  const parseValue = (): unknown => {
+    whitespace();
+    const character = rawText[i];
+    if (character === "{") return parseObject();
+    if (character === "[") return parseArray();
+    if (character === '"') return parseString();
+    if (rawText.startsWith("true", i)) {
+      i += 4;
+      return true;
+    }
+    if (rawText.startsWith("false", i)) {
+      i += 5;
+      return false;
+    }
+    if (rawText.startsWith("null", i)) {
+      i += 4;
+      return null;
+    }
+    return parseNumber();
+  };
+  const parseObject = (): Record<string, unknown> => {
+    const result: Record<string, unknown> = {};
+    i += 1;
+    whitespace();
+    if (rawText[i] === "}") {
+      i += 1;
       return result;
-    };
-    const isBoxedNumber = (v) => v !== null && typeof v === 'object' && (v[PY_INT] === true || v[PY_FLOAT] === true);
-    // Python repr for a float: shortest round-trip, but always visibly a float.
-    const pyFloatRepr = (value) => {
-      if (!Number.isFinite(value)) return value > 0 ? 'Infinity' : (value < 0 ? '-Infinity' : 'NaN');
-      const text = String(value);
-      return /[.eEn]/.test(text) ? text : text + '.0';
-    };
-    const pyNumber = (boxed) => {
-      if (boxed[PY_FLOAT] === true) return pyFloatRepr(boxed.value);
-      // Python int repr; normalizes JSON's permitted "-0".
-      return String(BigInt(boxed.literal));
-    };
-    // json.dumps(sort_keys=True, ensure_ascii=False): keys sorted by code unit,
-    // ", " between items and ": " after keys.
-    const pyDumps = (value) => {
-      if (value === null) return 'null';
-      if (value === true) return 'true';
-      if (value === false) return 'false';
-      if (isBoxedNumber(value)) return pyNumber(value);
-      if (typeof value === 'string') return JSON.stringify(value);
-      if (Array.isArray(value)) return '[' + value.map(pyDumps).join(', ') + ']';
-      if (typeof value === 'object') {
-        const keys = Object.keys(value).sort();
-        return '{' + keys.map((k) => JSON.stringify(k) + ': ' + pyDumps(value[k])).join(', ') + '}';
+    }
+    for (;;) {
+      whitespace();
+      if (rawText[i] !== '"') return error("expected key");
+      const key = parseString();
+      whitespace();
+      if (rawText[i] !== ":") return error("expected colon");
+      i += 1;
+      result[key] = parseValue();
+      whitespace();
+      if (rawText[i] === ",") {
+        i += 1;
+        continue;
       }
-      return 'null';
-    };
-    const plainString = (value) => (typeof value === 'string' ? value : '');
-    // Content extraction, per content type.
-    const contentText = (content) => {
-      const contentType = typeof content?.content_type === 'string' ? content.content_type : 'text';
-      if (contentType === 'text') {
-        const parts = Array.isArray(content.parts) ? content.parts : [];
-        return [contentType, parts.filter((p) => typeof p === 'string').join('\\n\\n')];
+      if (rawText[i] === "}") {
+        i += 1;
+        return result;
       }
-      if (contentType === 'code' || contentType === 'execution_output') {
-        return [contentType, plainString(content.text)];
+      return error("expected , or }");
+    }
+  };
+  const parseArray = (): unknown[] => {
+    const result: unknown[] = [];
+    i += 1;
+    whitespace();
+    if (rawText[i] === "]") {
+      i += 1;
+      return result;
+    }
+    for (;;) {
+      result.push(parseValue());
+      whitespace();
+      if (rawText[i] === ",") {
+        i += 1;
+        continue;
       }
-      if (contentType === 'thoughts') {
-        const thoughts = Array.isArray(content.thoughts) ? content.thoughts : [];
-        const chunks = thoughts.map((thought) => {
-          if (thought !== null && typeof thought === 'object' && !Array.isArray(thought) && !isBoxedNumber(thought)) {
-            const inner = thought.content;
-            return inner === undefined ? 'None' : pyStr(inner);
-          }
-          return pyStr(thought);
-        });
-        return [contentType, chunks.join('\\n\\n')];
+      if (rawText[i] === "]") {
+        i += 1;
+        return result;
       }
-      if (contentType === 'reasoning_recap') {
-        const inner = content.content;
-        return [contentType, inner ? pyStr(inner) : ''];
-      }
-      if (contentType === 'multimodal_text') {
-        const parts = Array.isArray(content.parts) ? content.parts : [];
-        const chunks = parts.map((part) => (typeof part === 'string' ? part : pyDumps(part)));
-        return [contentType, chunks.join('\\n\\n')];
-      }
-      return [contentType, pyDumps(content)];
-    };
-    // Python str() for the scalar cases the normalizer can reach.
-    const pyStr = (value) => {
-      if (typeof value === 'string') return value;
-      if (value === null) return 'None';
-      if (value === true) return 'True';
-      if (value === false) return 'False';
-      if (isBoxedNumber(value)) return pyNumber(value);
-      return pyDumps(value);
-    };
-    // Conversation order: prefer the current-node chain, else the first root's
-    // first-child chain.
-    const nodeOrder = (document) => {
-      const mapping = document.mapping;
-      const current = document.current_node;
-      if (typeof current === 'string' && mapping[current]) {
-        const chain = [];
-        const seen = new Set();
-        let nodeId = current;
-        while (nodeId && mapping[nodeId] && !seen.has(nodeId)) {
-          seen.add(nodeId);
-          chain.push(nodeId);
-          nodeId = mapping[nodeId].parent;
-        }
-        return chain.reverse();
-      }
-      const roots = Object.keys(mapping).filter((key) => !mapping[key].parent);
-      if (roots.length === 0) throw new Error('backend-api mapping has no root node');
-      const order = [];
-      const seen = new Set();
-      let nodeId = roots[0];
-      while (nodeId && !seen.has(nodeId)) {
-        seen.add(nodeId);
-        order.push(nodeId);
-        const children = mapping[nodeId].children || [];
-        nodeId = children.length > 0 ? children[0] : null;
-      }
-      return order;
-    };
-    // Uploaded files are not in the turn's content. ChatGPT records them beside
-    // it, in message.metadata.attachments, so a turn that carried a 50MB archive
-    // and one that carried nothing normalize to exactly the same body — and
-    // therefore to the same digest. Read alongside, never into the body: the
-    // hashed text has to stay comparable to the reference normalizer.
-    const turnAttachments = (message) => {
-      const metadata = message.metadata;
-      const attachments = metadata && Array.isArray(metadata.attachments) ? metadata.attachments : [];
-      return attachments
-        .filter((entry) => entry && typeof entry === 'object')
-        .map((entry) => ({
-          name: typeof entry.name === 'string' ? entry.name : null,
-          bytes: typeof entry.size === 'number' ? entry.size : null,
-          mimeType: typeof entry.mime_type === 'string' ? entry.mime_type : null,
-        }));
-    };
-    const normalizeTurns = (document) => {
-      if (!document || typeof document !== 'object' || !document.mapping) {
-        throw new Error('backend-api JSON has no mapping');
-      }
-      const turns = [];
-      for (const nodeId of nodeOrder(document)) {
-        const node = document.mapping[nodeId];
-        const message = node && node.message;
-        if (!message) continue;
-        const role = (message.author && typeof message.author.role === 'string') ? message.author.role : 'unknown';
-        if (role === 'system') continue;
-        const [contentType, body] = contentText(message.content || {});
-        turns.push({ index: turns.length, role, contentType, body, attachments: turnAttachments(message) });
-      }
-      return turns;
-    };
-  `;
+      return error("expected , or ]");
+    }
+  };
+  const isBoxedNumber = (value: unknown): value is Record<PropertyKey, unknown> =>
+    value !== null &&
+    typeof value === "object" &&
+    ((value as Record<PropertyKey, unknown>)[PY_INT] === true ||
+      (value as Record<PropertyKey, unknown>)[PY_FLOAT] === true);
+  const pyFloatRepr = (value: number): string => {
+    const text = String(value);
+    return /[.eEn]/.test(text) ? text : `${text}.0`;
+  };
+  const pyNumber = (value: Record<PropertyKey, unknown>): string => {
+    if (value[PY_FLOAT] === true) return pyFloatRepr(value.value as number);
+    return String(BigInt(value.literal as string));
+  };
+  const pyDumps = (value: unknown): string => {
+    if (value === null) return "null";
+    if (value === true) return "true";
+    if (value === false) return "false";
+    if (isBoxedNumber(value)) return pyNumber(value);
+    if (typeof value === "string") return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(pyDumps).join(", ")}]`;
+    if (typeof value === "object" && value !== null) {
+      const record = value as Record<string, unknown>;
+      return `{${Object.keys(record)
+        .sort()
+        .map((key) => `${JSON.stringify(key)}: ${pyDumps(record[key])}`)
+        .join(", ")}}`;
+    }
+    return "null";
+  };
+  const pyStr = (value: unknown): string => {
+    if (typeof value === "string") return value;
+    if (value === null) return "None";
+    if (value === true) return "True";
+    if (value === false) return "False";
+    if (isBoxedNumber(value)) return pyNumber(value);
+    return pyDumps(value);
+  };
+  const contentText = (content: Record<string, unknown>): [string, string] => {
+    const contentType = typeof content.content_type === "string" ? content.content_type : "text";
+    if (contentType === "text") {
+      const parts = Array.isArray(content.parts) ? content.parts : [];
+      return [contentType, parts.filter((part) => typeof part === "string").join("\n\n")];
+    }
+    if (contentType === "code" || contentType === "execution_output") {
+      return [contentType, typeof content.text === "string" ? content.text : ""];
+    }
+    if (contentType === "thoughts") {
+      const thoughts = Array.isArray(content.thoughts) ? content.thoughts : [];
+      return [
+        contentType,
+        thoughts
+          .map((thought) => {
+            if (
+              thought !== null &&
+              typeof thought === "object" &&
+              !Array.isArray(thought) &&
+              !isBoxedNumber(thought)
+            ) {
+              const inner = (thought as Record<string, unknown>).content;
+              return inner === undefined ? "None" : pyStr(inner);
+            }
+            return pyStr(thought);
+          })
+          .join("\n\n"),
+      ];
+    }
+    if (contentType === "reasoning_recap") {
+      return [contentType, content.content ? pyStr(content.content) : ""];
+    }
+    if (contentType === "multimodal_text") {
+      const parts = Array.isArray(content.parts) ? content.parts : [];
+      return [
+        contentType,
+        parts.map((part) => (typeof part === "string" ? part : pyDumps(part))).join("\n\n"),
+      ];
+    }
+    return [contentType, pyDumps(content)];
+  };
+  const nodeOrder = (document: Record<string, unknown>): string[] => {
+    const mapping = document.mapping as Record<string, Record<string, unknown>>;
+    const current = document.current_node;
+    const chain: string[] = [];
+    const seen = new Set<string>();
+    let nodeId = typeof current === "string" && mapping[current] ? current : undefined;
+    if (!nodeId) {
+      const roots = Object.keys(mapping).filter((key) => !mapping[key]?.parent);
+      if (roots.length === 0) throw new Error("backend-api mapping has no root node");
+      nodeId = roots[0];
+    }
+    while (nodeId && mapping[nodeId] && !seen.has(nodeId)) {
+      seen.add(nodeId);
+      chain.push(nodeId);
+      if (typeof mapping[nodeId].parent === "string") nodeId = mapping[nodeId].parent as string;
+      else nodeId = undefined;
+    }
+    if (typeof current !== "string" || !mapping[current]) return chain;
+    const reversed: string[] = [];
+    for (let index = chain.length - 1; index >= 0; index -= 1) {
+      reversed.push(chain[index] as string);
+    }
+    return reversed;
+  };
+  const document = parseValue();
+  whitespace();
+  if (
+    i !== rawText.length ||
+    !document ||
+    typeof document !== "object" ||
+    Array.isArray(document)
+  ) {
+    return error("backend-api JSON has no mapping");
+  }
+  const record = document as Record<string, unknown>;
+  if (!record.mapping || typeof record.mapping !== "object" || Array.isArray(record.mapping)) {
+    return error("backend-api JSON has no mapping");
+  }
+  const mapping = record.mapping as Record<string, Record<string, unknown>>;
+  const turns: Array<{
+    index: number;
+    role: string;
+    contentType: string;
+    body: string;
+    attachments: ProviderNativeTurnAttachment[];
+  }> = [];
+  for (const nodeId of nodeOrder(record)) {
+    const message = mapping[nodeId]?.message;
+    if (!message || typeof message !== "object" || Array.isArray(message)) continue;
+    const messageRecord = message as Record<string, unknown>;
+    const author = messageRecord.author;
+    const role =
+      author &&
+      typeof author === "object" &&
+      typeof (author as Record<string, unknown>).role === "string"
+        ? ((author as Record<string, unknown>).role as string)
+        : "unknown";
+    if (role === "system") continue;
+    const content =
+      messageRecord.content &&
+      typeof messageRecord.content === "object" &&
+      !Array.isArray(messageRecord.content)
+        ? (messageRecord.content as Record<string, unknown>)
+        : {};
+    const [contentType, body] = contentText(content);
+    const metadata = messageRecord.metadata;
+    const attachments =
+      metadata &&
+      typeof metadata === "object" &&
+      Array.isArray((metadata as Record<string, unknown>).attachments)
+        ? ((metadata as Record<string, unknown>).attachments as unknown[])
+            .filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry))
+            .map((entry) => {
+              const attachment = entry as Record<string, unknown>;
+              return {
+                name: typeof attachment.name === "string" ? attachment.name : null,
+                bytes: typeof attachment.size === "number" ? attachment.size : null,
+                mimeType: typeof attachment.mime_type === "string" ? attachment.mime_type : null,
+              };
+            })
+        : [];
+    turns.push({ index: turns.length, role, contentType, body, attachments });
+  }
+  return turns;
+}
+
+function buildNormalizerSource(): string {
+  // This serializes the same self-contained function used by Node-side ledger
+  // validation. It is source generation for the page sandbox, not a production
+  // Node eval helper.
+  return `const normalizeTurns = ${canonicalNormalizeProviderConversation.toString()};`;
 }
 
 function buildAuthAndFetchSource(conversationId: string): string {
@@ -423,15 +492,9 @@ function buildDigestSource(sourceExpression: string): string {
       const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
       return { digest: Array.from(new Uint8Array(digest)), bytes: bytes.length };
     };
-    let document;
-    try {
-      document = parseJsonPreservingNumbers(result.text);
-    } catch (error) {
-      return { ok: false, reason: 'evaluate-failed', detail: String(error && error.message ? error.message : error) };
-    }
     let turns;
     try {
-      turns = normalizeTurns(document);
+      turns = normalizeTurns(result.text);
     } catch (error) {
       return { ok: false, reason: 'evaluate-failed', detail: String(error && error.message ? error.message : error) };
     }
@@ -669,10 +732,6 @@ function decimalToHex(bytes: number[]): string {
   return Buffer.from(bytes).toString("hex");
 }
 
-function hexToDecimalString(hex: string): string {
-  return Array.from(Buffer.from(hex, "hex")).join(" ");
-}
-
 /**
  * Compares the run's captured answer against the provider's turns by digest.
  *
@@ -810,12 +869,10 @@ export async function finalizeProviderNativeCapture(params: {
         chatgpt_url: params.conversationUrl ?? null,
         captured_at: capturedAt,
         fetched_at: capture.evidence.fetchedAt,
-        raw_backend_api_json: {
-          // This block describes the document this evidence accompanies — the
-          // one on disk — so a verifier can confirm the file was not altered
-          // between capture and ingest.
-          materialized_to_disk: false,
-          sha256_decimal_bytes: hexToDecimalString(capture.rawSha256),
+        // This descriptor binds the evidence to the exact authoritative raw
+        // bytes materialized immediately above.
+        materialized_document: {
+          sha256: capture.rawSha256,
           bytes: capture.rawBytes,
         },
         // The independent second fetch, kept separate on purpose. Its per-turn
@@ -828,11 +885,6 @@ export async function finalizeProviderNativeCapture(params: {
           document_sha256_decimal_bytes: capture.evidence.documentSha256Decimal.join(" "),
           document_bytes: capture.evidence.documentBytes,
           fetched_at: capture.evidence.fetchedAt,
-        },
-        materialized_document: {
-          path: path.basename(rawPath),
-          sha256: capture.rawSha256,
-          bytes: capture.rawBytes,
         },
         document_hashes_match: capture.documentHashesMatch,
         answer_fidelity: fidelity,

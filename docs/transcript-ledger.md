@@ -11,11 +11,16 @@ The default root is `$ORACLE_HOME_DIR/transcript-ledger` (normally
 SQLite index, and object files are owner-only. Symlinked ledger descendants are
 rejected. The index uses SQLite WAL mode. Raw provider JSON and evidence JSON
 are immutable, content-addressed objects; the raw bytes are authoritative.
-Ingest validates the provider mapping graph, selected current-node chain, and
-evidence-to-turn digest correspondence before publication. Bounded JSON depth,
-node count, turn count, body size, and artifact size prevent untrusted captures
-from exhausting the process. Startup removes unreferenced crash orphans and
-fails closed if an indexed object is missing or altered.
+Ingest validates the provider mapping graph (including exactly one connected
+root), selected current-node chain, and evidence-to-turn digest correspondence
+before publication. The independent-fetch descriptor is closed and requires a
+real 32-byte decimal digest, byte count, and timestamp; the materialized
+descriptor binds the authoritative raw bytes. Bounded JSON depth, node count,
+turn count, body size, and artifact size prevent untrusted captures from
+exhausting the process. Publication uses a state-root lock and generation file;
+startup recovery only removes orphans while holding that lock, then fails closed
+if an indexed object is missing or altered. Reopened objects are repaired to
+owner-only permissions.
 
 ## Commands
 

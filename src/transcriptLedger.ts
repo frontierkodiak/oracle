@@ -5,6 +5,7 @@ import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { getOracleHomeDir } from "./oracleHome.js";
 import { extractStableConversationIdFromUrl } from "./browser/conversationUrl.js";
+import { canonicalNormalizeProviderConversation } from "./browser/chatgptConversation.js";
 
 export const TRANSCRIPT_LEDGER_SCHEMA = "oracle.transcript-ledger/v1";
 export const TRANSCRIPT_LEDGER_NORMALIZATION = "oracle.transcript-ledger-normalized-turns/v1";
@@ -16,6 +17,9 @@ const MAX_JSON_NODES = 250_000;
 const MAX_GRAPH_NODES = 100_000;
 const MAX_TURNS = 25_000;
 const MAX_TURN_BODY_BYTES = 16 * 1024 * 1024;
+const PUBLICATION_LOCK_WAIT_MS = 10;
+const PUBLICATION_LOCK_READ_BYTES = 4096;
+const PUBLICATION_LOCK_MALFORMED_STALE_MS = 5_000;
 
 export type LedgerObservationStatus = "captured" | "failed" | "challenged" | "auth-unavailable";
 
@@ -163,6 +167,7 @@ function checkMode(mode: number, expected: number, target: string): void {
 
 async function ensurePrivateDirectory(target: string): Promise<void> {
   const absolute = path.resolve(target);
+  await assertNoSymlinkAncestors(absolute, absolute);
   const missing: string[] = [];
   let current = absolute;
   while (true) {
@@ -184,7 +189,14 @@ async function ensurePrivateDirectory(target: string): Promise<void> {
   for (let index = missing.length - 1; index >= 0; index -= 1) {
     const dir = missing[index];
     if (!dir) continue;
-    await mkdir(dir, { mode: 0o700 });
+    try {
+      await mkdir(dir, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const existing = await lstat(dir);
+      if (existing.isSymbolicLink() || !existing.isDirectory())
+        throw new Error(`ledger path is not a private directory: ${dir}`);
+    }
     await chmod(dir, 0o700);
     checkMode((await lstat(dir)).mode, 0o700, dir);
     await syncDirectory(path.dirname(dir));
@@ -193,6 +205,45 @@ async function ensurePrivateDirectory(target: string): Promise<void> {
   if (missing.length === 0 || missing[missing.length - 1] === absolute) {
     await chmod(absolute, 0o700);
     checkMode((await lstat(absolute)).mode, 0o700, absolute);
+  }
+}
+
+async function assertNoSymlinkAncestors(target: string, protectedRoot?: string): Promise<void> {
+  const absolute = path.resolve(target);
+  const boundary = protectedRoot ? path.resolve(protectedRoot) : undefined;
+  const parsed = path.parse(absolute);
+  let current = parsed.root;
+  let normalDirectorySeen = false;
+  const remainder = absolute.slice(parsed.root.length);
+  for (const component of remainder.split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    try {
+      const entry = await lstat(current);
+      if (entry.isSymbolicLink()) {
+        const towardBoundary = boundary ? path.relative(current, boundary) : "";
+        const isBeforeProtectedRoot = Boolean(
+          boundary &&
+          towardBoundary &&
+          !towardBoundary.startsWith("..") &&
+          !path.isAbsolute(towardBoundary),
+        );
+        if (!isBeforeProtectedRoot && (boundary || normalDirectorySeen)) {
+          throw new Error(`ledger path may not contain symlinks: ${current}`);
+        }
+      } else if (entry.isDirectory()) {
+        normalDirectorySeen = true;
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+  }
+}
+
+function assertContainedPath(root: string, target: string): void {
+  const relative = path.relative(path.resolve(root), path.resolve(target));
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`ledger path escapes the ledger root: ${target}`);
   }
 }
 
@@ -205,7 +256,108 @@ async function syncDirectory(target: string): Promise<void> {
   }
 }
 
+type PublicationRelease = () => Promise<void>;
+
+async function acquirePublicationLock(root: string): Promise<PublicationRelease> {
+  const state = path.join(root, "state");
+  const lockPath = path.join(state, "publication.lock");
+  await ensurePrivateDirectory(state);
+  const token = randomUUID();
+  for (;;) {
+    try {
+      const handle = await open(
+        lockPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        await handle.writeFile(JSON.stringify({ pid: process.pid, token, startedAt: Date.now() }));
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await chmod(lockPath, 0o600);
+      await syncDirectory(state);
+      return async () => {
+        try {
+          const owner = await readArtifactBytes(lockPath, PUBLICATION_LOCK_READ_BYTES);
+          const parsed = JSON.parse(owner.toString("utf8")) as Record<string, unknown>;
+          if (parsed.token === token) {
+            await rm(lockPath, { force: true });
+            await syncDirectory(state);
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      await assertNoSymlinkAncestors(lockPath);
+      let stale = false;
+      try {
+        const ownerBytes = await readArtifactBytes(lockPath, PUBLICATION_LOCK_READ_BYTES);
+        const owner = JSON.parse(ownerBytes.toString("utf8")) as Record<string, unknown>;
+        const pid = owner.pid;
+        if (!Number.isSafeInteger(pid) || typeof owner.token !== "string") stale = true;
+        else {
+          try {
+            process.kill(pid as number, 0);
+          } catch (probeError) {
+            stale = (probeError as NodeJS.ErrnoException).code !== "EPERM";
+          }
+        }
+      } catch (ownerError) {
+        if ((ownerError as NodeJS.ErrnoException).code === "ENOENT") continue;
+        try {
+          const lockStat = await lstat(lockPath);
+          stale = Date.now() - lockStat.mtimeMs > PUBLICATION_LOCK_MALFORMED_STALE_MS;
+        } catch (statError) {
+          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
+          throw ownerError;
+        }
+      }
+      if (stale) {
+        await rm(lockPath, { force: true });
+        await syncDirectory(state);
+        continue;
+      }
+      await new Promise((resolve) => setTimeout(resolve, PUBLICATION_LOCK_WAIT_MS));
+    }
+  }
+}
+
+async function bumpPublicationGeneration(root: string): Promise<void> {
+  const state = path.join(root, "state");
+  const generationPath = path.join(state, "generation");
+  let generation = 0;
+  try {
+    const bytes = await readArtifactBytes(generationPath, 128);
+    const value = Number(bytes.toString("utf8").trim());
+    if (!Number.isSafeInteger(value) || value < 0)
+      throw new Error("ledger publication generation is invalid");
+    generation = value;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const temp = path.join(state, `.generation.${randomUUID()}.tmp`);
+  const handle = await open(
+    temp,
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await handle.writeFile(`${generation + 1}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await chmod(temp, 0o600);
+  await rename(temp, generationPath);
+  await syncDirectory(state);
+}
+
 async function ensurePrivateFile(target: string): Promise<void> {
+  await assertNoSymlinkAncestors(target);
   const entry = await lstat(target);
   if (entry.isSymbolicLink() || !entry.isFile())
     throw new Error(`ledger file is not a regular file: ${target}`);
@@ -216,13 +368,19 @@ async function ensurePrivateFile(target: string): Promise<void> {
 async function ensureRoot(root: string): Promise<void> {
   await ensurePrivateDirectory(root);
   await ensurePrivateDirectory(path.join(root, "objects", "sha256"));
+  await ensurePrivateDirectory(path.join(root, "state"));
   const index = path.join(root, "index.sqlite");
   try {
     await ensurePrivateFile(index);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    const handle = await open(index, "wx", 0o600);
-    await handle.close();
+    try {
+      const handle = await open(index, "wx", 0o600);
+      await handle.close();
+    } catch (createError) {
+      if ((createError as NodeJS.ErrnoException).code !== "EEXIST") throw createError;
+      await ensurePrivateFile(index);
+    }
     await syncDirectory(root);
   }
 }
@@ -237,17 +395,12 @@ async function writeObject(
   digest: string,
 ): Promise<{ path: string; created: boolean }> {
   const target = objectPath(root, digest);
+  assertContainedPath(root, target);
   const parent = path.dirname(target);
   await ensurePrivateDirectory(parent);
   try {
     await ensurePrivateFile(target);
-    const existingHandle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    let existing: Buffer;
-    try {
-      existing = await existingHandle.readFile();
-    } finally {
-      await existingHandle.close();
-    }
+    const existing = await readArtifactBytes(target, bytes.byteLength);
     if (hashBytes(existing) !== digest)
       throw new Error(`content-addressed object mismatch: ${target}`);
     return { path: target, created: false };
@@ -275,12 +428,27 @@ async function writeObject(
   }
 }
 
-async function readArtifactBytes(target: string): Promise<Buffer> {
+async function readArtifactBytes(target: string, maxBytes: number): Promise<Buffer> {
+  await assertNoSymlinkAncestors(target);
   const handle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
     const entry = await handle.stat();
     if (!entry.isFile()) throw new Error(`capture artifact must be a regular file: ${target}`);
-    return await handle.readFile();
+    if (!Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > maxBytes) {
+      throw new Error(`capture artifact exceeds byte bounds: ${target}`);
+    }
+    const bytes = Buffer.allocUnsafe(entry.size);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const result = await handle.read(bytes, offset, bytes.byteLength - offset, offset);
+      if (result.bytesRead === 0)
+        throw new Error(`capture artifact changed while reading: ${target}`);
+      offset += result.bytesRead;
+    }
+    const after = await handle.stat();
+    if (after.size !== entry.size)
+      throw new Error(`capture artifact changed while reading: ${target}`);
+    return bytes;
   } finally {
     await handle.close();
   }
@@ -309,7 +477,8 @@ async function recoverObjectStore(root: string, db: DatabaseSync): Promise<void>
       if (!/^[a-f0-9]{64}$/.test(entry.name) || entry.name.slice(0, 2) !== prefix.name) {
         throw new Error(`ledger object has an invalid name: ${target}`);
       }
-      const bytes = await readArtifactBytes(target);
+      await ensurePrivateFile(target);
+      const bytes = await readArtifactBytes(target, MAX_RAW_BYTES);
       if (hashBytes(bytes) !== entry.name)
         throw new Error(`ledger object hash mismatch: ${target}`);
       const row = db.prepare("SELECT path FROM objects WHERE sha256=?").get(entry.name) as
@@ -329,12 +498,10 @@ async function recoverObjectStore(root: string, db: DatabaseSync): Promise<void>
   }>;
   for (const row of rows) {
     const target = path.resolve(root, row.path);
-    const relative = path.relative(root, target);
-    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error(`ledger object index path escapes the ledger root: ${row.sha256}`);
-    }
+    assertContainedPath(root, target);
     try {
-      const bytes = await readArtifactBytes(target);
+      await ensurePrivateFile(target);
+      const bytes = await readArtifactBytes(target, MAX_RAW_BYTES);
       if (hashBytes(bytes) !== row.sha256)
         throw new Error(`ledger object hash mismatch: ${target}`);
     } catch (error) {
@@ -424,7 +591,7 @@ function parseConversation(
         throw new Error(`provider raw parent/child mismatch: ${nodeId}`);
     }
   }
-  if (roots.length === 0) throw new Error("provider raw mapping has no root");
+  if (roots.length !== 1) throw new Error("provider raw mapping must have exactly one root");
   const visited = new Set<string>();
   const stack = [...roots];
   while (stack.length > 0) {
@@ -480,64 +647,64 @@ function normalizedAttachments(value: unknown): unknown[] {
     }));
 }
 
-function contentBody(message: Record<string, unknown>): { type: string; body: string } {
-  const content = message.content;
-  const contentType =
-    typeof content === "object" && content !== null && !Array.isArray(content)
-      ? String((content as Record<string, unknown>).content_type ?? "")
-      : "text";
-  const parts =
-    typeof content === "object" && content !== null && !Array.isArray(content)
-      ? (content as Record<string, unknown>).parts
-      : undefined;
-  if (Array.isArray(parts)) {
-    const text = parts
-      .map((part) => (typeof part === "string" ? part : stableJson(part)))
-      .join("\n\n");
-    if (Buffer.byteLength(text, "utf8") > MAX_TURN_BODY_BYTES)
-      throw new Error("provider turn body exceeds bounds");
-    return { type: contentType || "text", body: text };
-  }
-  if (typeof content === "string") {
-    if (Buffer.byteLength(content, "utf8") > MAX_TURN_BODY_BYTES)
-      throw new Error("provider turn body exceeds bounds");
-    return { type: contentType || "text", body: content };
-  }
-  const body = stableJson(content ?? "");
-  if (Buffer.byteLength(body, "utf8") > MAX_TURN_BODY_BYTES)
-    throw new Error("provider turn body exceeds bounds");
-  return { type: contentType || "unknown", body };
+function decimalDigest(value: unknown, label: string): Buffer {
+  if (typeof value !== "string")
+    throw new Error(`${label} must be a space-separated decimal byte string`);
+  const pieces = value.trim().split(/\s+/);
+  if (pieces.length !== 32) throw new Error(`${label} must contain exactly 32 decimal bytes`);
+  const bytes = pieces.map((piece) => {
+    if (!/^\d+$/.test(piece)) throw new Error(`${label} contains a non-decimal byte`);
+    const parsed = Number(piece);
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 255)
+      throw new Error(`${label} contains an invalid byte`);
+    return parsed;
+  });
+  return Buffer.from(bytes);
 }
 
-function selectedTurns(parsed: ReturnType<typeof parseConversation>): NormalizedTurn[] {
-  const turns = parsed.selectedChain.flatMap((nodeId, ordinal) => {
+function selectedTurns(
+  parsed: ReturnType<typeof parseConversation>,
+  rawText: string,
+): NormalizedTurn[] {
+  const canonical = canonicalNormalizeProviderConversation(rawText);
+  const messageNodes = parsed.selectedChain.filter((nodeId) => {
     const node = parsed.mapping[nodeId];
     const message = node?.message;
-    if (!message || typeof message !== "object") return [];
+    if (!message || typeof message !== "object") return false;
     const role =
       typeof message.author === "object" && message.author !== null
         ? String((message.author as Record<string, unknown>).role ?? "unknown")
         : "unknown";
-    const body = contentBody(message);
-    const text = body.body;
-    const attachments = normalizedAttachments(
-      message.metadata && typeof message.metadata === "object"
-        ? (message.metadata as Record<string, unknown>).attachments
-        : undefined,
-    );
-    return [
-      {
-        ordinal,
-        nodeId,
-        parentId: typeof node.parent === "string" ? node.parent : null,
-        role,
-        contentType: body.type,
-        body: text,
-        bodySha256: hashText(text),
-        bodyBytes: Buffer.byteLength(text),
-        attachments,
-      },
-    ];
+    return role !== "system";
+  });
+  if (canonical.length !== messageNodes.length) {
+    throw new Error("canonical provider normalizer disagrees with selected branch");
+  }
+  const turns = canonical.map((normalized, ordinal) => {
+    const nodeId = messageNodes[ordinal];
+    const node = parsed.mapping[nodeId];
+    if (!node) throw new Error("canonical provider normalizer selected an unknown node");
+    const message = node.message;
+    const role =
+      message && typeof message.author === "object" && message.author !== null
+        ? String((message.author as Record<string, unknown>).role ?? "unknown")
+        : "unknown";
+    if (normalized.role !== role)
+      throw new Error(`canonical provider role mismatch at turn ${ordinal}`);
+    const bodyBytes = Buffer.byteLength(normalized.body, "utf8");
+    if (bodyBytes > MAX_TURN_BODY_BYTES) throw new Error("provider turn body exceeds bounds");
+    const attachments = normalizedAttachments(normalized.attachments);
+    return {
+      ordinal,
+      nodeId,
+      parentId: typeof node.parent === "string" ? node.parent : null,
+      role,
+      contentType: normalized.contentType,
+      body: normalized.body,
+      bodySha256: hashText(normalized.body),
+      bodyBytes,
+      attachments,
+    };
   });
   if (turns.length > MAX_TURNS)
     throw new Error("provider selected branch exceeds turn-count bounds");
@@ -562,12 +729,57 @@ function validateEvidence(
     throw new Error("evidence has no materialized document descriptor");
   }
   const materializedRecord = materialized as Record<string, unknown>;
+  if (
+    Object.keys(materializedRecord).some((key) => !["sha256", "bytes"].includes(key)) ||
+    !Object.hasOwn(materializedRecord, "sha256") ||
+    !Object.hasOwn(materializedRecord, "bytes")
+  ) {
+    throw new Error("evidence materialized document descriptor has an unsupported shape");
+  }
+  if (
+    typeof materializedRecord.sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(materializedRecord.sha256)
+  ) {
+    throw new Error("evidence materialized document hash is invalid");
+  }
+  if (
+    typeof materializedRecord.bytes !== "number" ||
+    !Number.isSafeInteger(materializedRecord.bytes)
+  ) {
+    throw new Error("evidence materialized document byte count is invalid");
+  }
   if (materializedRecord.sha256 !== rawSha256 || materializedRecord.bytes !== rawBytes) {
     throw new Error("evidence does not describe the supplied raw bytes");
   }
   const independent = evidence.independent_fetch;
   if (!independent || typeof independent !== "object" || Array.isArray(independent)) {
     throw new Error("evidence has no independent fetch descriptor");
+  }
+  const independentRecord = independent as Record<string, unknown>;
+  const independentKeys = Object.keys(independentRecord).sort();
+  if (
+    independentKeys.join("\u0000") !==
+    ["document_bytes", "document_sha256_decimal_bytes", "fetched_at"].join("\u0000")
+  ) {
+    throw new Error("evidence independent fetch descriptor has an unsupported shape");
+  }
+  decimalDigest(
+    independentRecord.document_sha256_decimal_bytes,
+    "independent fetch document digest",
+  );
+  if (
+    typeof independentRecord.document_bytes !== "number" ||
+    !Number.isSafeInteger(independentRecord.document_bytes) ||
+    independentRecord.document_bytes <= 0 ||
+    independentRecord.document_bytes > MAX_RAW_BYTES
+  ) {
+    throw new Error("independent fetch document byte count is invalid");
+  }
+  if (
+    typeof independentRecord.fetched_at !== "string" ||
+    !Number.isFinite(Date.parse(independentRecord.fetched_at))
+  ) {
+    throw new Error("independent fetch timestamp is invalid");
   }
   const perTurn = evidence.per_turn;
   if (!Array.isArray(perTurn)) throw new Error("evidence has no per-turn digest array");
@@ -588,17 +800,13 @@ function validateEvidence(
     ) {
       throw new Error(`evidence turn ${index} does not correspond to the selected branch`);
     }
+    if (typeof record.sha256_hex !== "string" || !/^[a-f0-9]{64}$/.test(record.sha256_hex))
+      throw new Error(`evidence turn ${index} hex hash is invalid`);
     if (record.sha256_hex !== turn.bodySha256)
       throw new Error(`evidence turn ${index} body hash mismatch`);
     const decimal = record.sha256_dec;
     const expectedDecimal = [...Buffer.from(turn.bodySha256, "hex")];
-    const decimalValues =
-      typeof decimal === "string" && decimal.trim().length > 0
-        ? decimal
-            .trim()
-            .split(/\s+/)
-            .map((value) => Number(value))
-        : [];
+    const decimalValues = [...decimalDigest(decimal, `evidence turn ${index} decimal hash`)];
     if (
       decimalValues.length !== expectedDecimal.length ||
       decimalValues.some((value, i) => value !== expectedDecimal[i])
@@ -678,7 +886,12 @@ export class TranscriptLedger {
       await ensurePrivateFile(path.join(root, "index.sqlite-wal")).catch((error) => {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       });
-      await recoverObjectStore(root, ledger.database);
+      const releasePublication = await acquirePublicationLock(root);
+      try {
+        await recoverObjectStore(root, ledger.database);
+      } finally {
+        await releasePublication();
+      }
     } catch (error) {
       ledger.close();
       throw error;
@@ -697,12 +910,8 @@ export class TranscriptLedger {
   }
 
   async ingestPair(input: IngestPairInput): Promise<LedgerIngestResult> {
-    const rawBytes = await readArtifactBytes(input.rawPath);
-    const evidenceBytes = await readArtifactBytes(input.evidencePath);
-    if (rawBytes.byteLength > MAX_RAW_BYTES)
-      throw new Error("provider raw document exceeds byte bounds");
-    if (evidenceBytes.byteLength > MAX_EVIDENCE_BYTES)
-      throw new Error("provider evidence document exceeds byte bounds");
+    const rawBytes = await readArtifactBytes(input.rawPath, MAX_RAW_BYTES);
+    const evidenceBytes = await readArtifactBytes(input.evidencePath, MAX_EVIDENCE_BYTES);
     let raw: Record<string, unknown>;
     let evidence: Record<string, unknown>;
     try {
@@ -724,7 +933,7 @@ export class TranscriptLedger {
     }
     const rawSha256 = hashBytes(rawBytes);
     const evidenceSha256 = hashBytes(evidenceBytes);
-    const turns = selectedTurns(parsed);
+    const turns = selectedTurns(parsed, rawBytes.toString("utf8"));
     validateEvidence(evidence, parsed, turns, rawSha256, rawBytes.byteLength);
     const sequence = turns.map(
       ({ ordinal, nodeId, parentId, role, contentType, bodySha256, bodyBytes, attachments }) => ({
@@ -743,11 +952,15 @@ export class TranscriptLedger {
     const capturedAt = input.capturedAt ?? now();
     const revisionId = hashText(`${key}\u0000${normalizedSequenceSha256}`);
     const observationId = randomUUID();
-    const rawObject = await writeObject(this.root, rawBytes, rawSha256);
-    const evidenceObject = await writeObject(this.root, evidenceBytes, evidenceSha256);
+    const releasePublication = await acquirePublicationLock(this.root);
+    let rawObject: { path: string; created: boolean } | undefined;
+    let evidenceObject: { path: string; created: boolean } | undefined;
     const db = this.database;
     let committed = false;
     try {
+      rawObject = await writeObject(this.root, rawBytes, rawSha256);
+      evidenceObject = await writeObject(this.root, evidenceBytes, evidenceSha256);
+      await bumpPublicationGeneration(this.root);
       db.exec("BEGIN IMMEDIATE");
       db.prepare(`INSERT INTO conversations(conversation_key,provider,profile_id,conversation_id,canonical_url,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)
         ON CONFLICT(conversation_key) DO UPDATE SET canonical_url=COALESCE(excluded.canonical_url,conversations.canonical_url), state='captured', updated_at=excluded.updated_at`).run(
@@ -853,8 +1066,9 @@ export class TranscriptLedger {
     } finally {
       if (!committed) {
         for (const object of [rawObject, evidenceObject])
-          if (object.created) await rm(object.path, { force: true }).catch(() => undefined);
+          if (object?.created) await rm(object.path, { force: true }).catch(() => undefined);
       }
+      await releasePublication();
     }
   }
 

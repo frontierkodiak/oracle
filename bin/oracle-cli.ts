@@ -1232,7 +1232,7 @@ transcriptCommand
           });
           output.push({
             watchId: row.watchId,
-            status: "failed",
+            status: classifyObservationFailure(error),
             observationId: failure.observationId,
             warning: ledgerWarning(error).code,
           });

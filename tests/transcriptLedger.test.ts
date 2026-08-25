@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mkdir, readFile, symlink, writeFile, lstat } from "node:fs/promises";
+import { chmod, mkdir, readFile, symlink, writeFile, lstat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { mkdtemp } from "node:fs/promises";
@@ -56,7 +56,7 @@ async function fixture(dir: string, suffix: string, body = "hello") {
       bytes: rawBytes.byteLength,
     },
     independent_fetch: {
-      document_sha256_decimal_bytes: "1 2 3",
+      document_sha256_decimal_bytes: Array.from({ length: 32 }, (_, index) => index).join(" "),
       document_bytes: rawBytes.byteLength,
       fetched_at: "2026-01-01T00:00:00.000Z",
     },
@@ -267,6 +267,15 @@ describe("TranscriptLedger", () => {
     expect(await lstat(path.join(objectDir, digest)).catch(() => null)).toBeNull();
     reopened.close();
 
+    await writeFile(
+      path.join(root, "state", "publication.lock"),
+      JSON.stringify({ pid: Number.MAX_SAFE_INTEGER, token: "crashed", startedAt: 0 }),
+      { mode: 0o600 },
+    );
+    const recoveredAfterCrash = await TranscriptLedger.open({ root });
+    expect(await lstat(path.join(root, "state", "publication.lock")).catch(() => null)).toBeNull();
+    recoveredAfterCrash.close();
+
     const files = await fixture(dir, "deep");
     const raw = JSON.parse(await readFile(files.rawPath, "utf8")) as Record<string, any>;
     let nested: Record<string, unknown> = {};
@@ -342,5 +351,192 @@ describe("TranscriptLedger", () => {
         artifacts: [{ path: "/tmp/raw", label: "provider-native-conversation-raw" }],
       }),
     ).rejects.toBeInstanceOf(LedgerArtifactPairError);
+  });
+
+  it("rejects independent evidence placeholders and disconnected multi-root forests", async () => {
+    const dir = await tempRoot();
+    const files = await fixture(dir, "independent");
+    const evidence = JSON.parse(await readFile(files.evidencePath, "utf8")) as Record<string, any>;
+    const ledger = await TranscriptLedger.open({ root: path.join(dir, "ledger") });
+    evidence.independent_fetch = {};
+    await writeFile(files.evidencePath, JSON.stringify(evidence));
+    await expect(
+      ledger.ingestPair({
+        provider: "chatgpt",
+        profileId: "p",
+        rawPath: files.rawPath,
+        evidencePath: files.evidencePath,
+      }),
+    ).rejects.toThrow(/unsupported shape/);
+    evidence.independent_fetch = {
+      document_sha256_decimal_bytes: "1 2 3",
+      document_bytes: 3,
+      fetched_at: "2026-01-01T00:00:00.000Z",
+    };
+    await writeFile(files.evidencePath, JSON.stringify(evidence));
+    await expect(
+      ledger.ingestPair({
+        provider: "chatgpt",
+        profileId: "p",
+        rawPath: files.rawPath,
+        evidencePath: files.evidencePath,
+      }),
+    ).rejects.toThrow(/exactly 32 decimal bytes/);
+    ledger.close();
+
+    const raw = JSON.parse(await readFile(files.rawPath, "utf8")) as Record<string, any>;
+    raw.mapping.other = { id: "other", parent: null, children: [], message: null };
+    await writeFile(files.rawPath, JSON.stringify(raw));
+    const forestLedger = await TranscriptLedger.open({ root: path.join(dir, "forest-ledger") });
+    await expect(
+      forestLedger.ingestPair({
+        provider: "chatgpt",
+        profileId: "p",
+        rawPath: files.rawPath,
+        evidencePath: files.evidencePath,
+      }),
+    ).rejects.toThrow(/exactly one root/);
+    forestLedger.close();
+  });
+
+  it("ingests the canonical all-content-types fixture and fails closed on evidence tampering", async () => {
+    const dir = await tempRoot();
+    const fixturePath = path.join(
+      process.cwd(),
+      "tests/fixtures/provider-conversation-normalization.json",
+    );
+    const source = JSON.parse(await readFile(fixturePath, "utf8")) as {
+      raw: string;
+      expected: Array<{ role: string; content_type: string; bytes: number; sha256: string }>;
+    };
+    const rawBytes = Buffer.from(source.raw, "utf8");
+    const rawPath = path.join(dir, "raw.json");
+    const evidencePath = path.join(dir, "evidence.json");
+    const decimal = (hex: string) => [...Buffer.from(hex, "hex")].join(" ");
+    const evidence = {
+      schema: "oracle.provider-native-capture-evidence/v1",
+      conversation_id: "fixture-0001",
+      materialized_document: {
+        sha256: createHash("sha256").update(rawBytes).digest("hex"),
+        bytes: rawBytes.byteLength,
+      },
+      independent_fetch: {
+        document_sha256_decimal_bytes: Array.from({ length: 32 }, (_, index) => 255 - index).join(
+          " ",
+        ),
+        document_bytes: rawBytes.byteLength,
+        fetched_at: "2026-01-01T00:00:00.000Z",
+      },
+      per_turn: source.expected.map((turn, index) => ({
+        i: index,
+        role: turn.role,
+        ct: turn.content_type,
+        blen: turn.bytes,
+        sha256_hex: turn.sha256,
+        sha256_dec: decimal(turn.sha256),
+        attachments: [],
+      })),
+    };
+    await writeFile(rawPath, rawBytes, { mode: 0o600 });
+    await writeFile(evidencePath, JSON.stringify(evidence), { mode: 0o600 });
+    const ledger = await TranscriptLedger.open({ root: path.join(dir, "ledger") });
+    const result = await ledger.ingestPair({
+      provider: "chatgpt",
+      profileId: "fixture-profile",
+      rawPath,
+      evidencePath,
+    });
+    expect(
+      ledger.getRevisionTurns(result.revisionId).map((turn) => [turn.contentType, turn.bodyBytes]),
+    ).toEqual(source.expected.map((turn) => [turn.content_type, turn.bytes]));
+    const tampered = {
+      ...evidence,
+      per_turn: evidence.per_turn.map((turn, index) =>
+        index === 0 ? { ...turn, sha256_hex: "0".repeat(64) } : turn,
+      ),
+    };
+    await writeFile(evidencePath, JSON.stringify(tampered), { mode: 0o600 });
+    await expect(
+      ledger.ingestPair({
+        provider: "chatgpt",
+        profileId: "fixture-profile",
+        rawPath,
+        evidencePath,
+      }),
+    ).rejects.toThrow(/body hash mismatch/);
+    ledger.close();
+  });
+
+  it("serializes two independent publishers without sweeping either committed object", async () => {
+    const dir = await tempRoot();
+    const first = await fixture(dir, "publisher-a", "first");
+    const second = await fixture(dir, "publisher-b", "second");
+    const root = path.join(dir, "ledger");
+    const firstLedger = await TranscriptLedger.open({ root });
+    const secondLedger = await TranscriptLedger.open({ root });
+    const [a, b] = await Promise.all([
+      firstLedger.ingestPair({
+        provider: "chatgpt",
+        profileId: "p",
+        rawPath: first.rawPath,
+        evidencePath: first.evidencePath,
+      }),
+      secondLedger.ingestPair({
+        provider: "chatgpt",
+        profileId: "p",
+        rawPath: second.rawPath,
+        evidencePath: second.evidencePath,
+      }),
+    ]);
+    expect(a.revisionId).not.toBe(b.revisionId);
+    expect(firstLedger.list()[0]?.revisionCount).toBe(2);
+    expect(firstLedger.list()[0]?.observationCount).toBe(2);
+    expect(
+      await readFile(path.join(root, "objects", "sha256", a.rawSha256.slice(0, 2), a.rawSha256)),
+    ).toEqual(first.rawBytes);
+    expect(
+      await readFile(path.join(root, "objects", "sha256", b.rawSha256.slice(0, 2), b.rawSha256)),
+    ).toEqual(second.rawBytes);
+    firstLedger.close();
+    secondLedger.close();
+  });
+
+  it("repairs reopened object permissions and rejects a symlinked artifact ancestor", async () => {
+    const dir = await tempRoot();
+    const files = await fixture(dir, "permissions");
+    const root = path.join(dir, "ledger");
+    const ledger = await TranscriptLedger.open({ root });
+    const result = await ledger.ingestPair({
+      provider: "chatgpt",
+      profileId: "p",
+      rawPath: files.rawPath,
+      evidencePath: files.evidencePath,
+    });
+    const object = path.join(
+      root,
+      "objects",
+      "sha256",
+      result.rawSha256.slice(0, 2),
+      result.rawSha256,
+    );
+    await chmod(object, 0o644);
+    ledger.close();
+    const reopened = await TranscriptLedger.open({ root });
+    expect((await lstat(object)).mode & 0o777).toBe(0o600);
+    reopened.close();
+
+    const outside = path.join(dir, "outside");
+    await mkdir(outside, { mode: 0o700 });
+    await symlink(outside, path.join(dir, "input-link"));
+    await expect(
+      TranscriptLedger.open({ root: path.join(dir, "other-ledger") }).then((other) =>
+        other.ingestPair({
+          provider: "chatgpt",
+          profileId: "p",
+          rawPath: path.join(dir, "input-link", path.basename(files.rawPath)),
+          evidencePath: files.evidencePath,
+        }),
+      ),
+    ).rejects.toThrow(/symlinks/);
   });
 });
