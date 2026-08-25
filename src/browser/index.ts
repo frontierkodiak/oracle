@@ -1443,18 +1443,22 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       }
       await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
       await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
-      if (!captureOnly) {
-        await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
-      }
-      if (isResumingConversation) {
-        await raceWithDisconnect(
-          waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
-            requirePriorTurns: true,
-            requirePromptReady: !captureOnly,
-            expectedConversationUrl: config.resumeConversationUrl as string,
-          }),
-        );
-      }
+      await preparePromptBoundary({
+        captureOnly,
+        isResumingConversation,
+        ensurePromptReady: async () => {
+          await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+        },
+        waitForHydration: async (requirePromptReady) => {
+          await raceWithDisconnect(
+            waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
+              requirePriorTurns: true,
+              requirePromptReady,
+              expectedConversationUrl: config.resumeConversationUrl as string,
+            }),
+          );
+        },
+      });
     } else {
       const baseUrl = CHATGPT_URL;
       // First load the base ChatGPT homepage to satisfy potential interstitials,
@@ -1479,9 +1483,22 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           navigateToChatGPT(Page, Runtime, config.resumeConversationUrl as string, logger),
         );
         await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
-        if (!captureOnly) {
-          await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
-        }
+        await preparePromptBoundary({
+          captureOnly,
+          isResumingConversation: true,
+          ensurePromptReady: async () => {
+            await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+          },
+          waitForHydration: async (requirePromptReady) => {
+            await raceWithDisconnect(
+              waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
+                requirePriorTurns: true,
+                requirePromptReady,
+                expectedConversationUrl: config.resumeConversationUrl as string,
+              }),
+            );
+          },
+        });
       } else if (config.url !== baseUrl) {
         if (captureOnly) {
           await raceWithDisconnect(navigateToChatGPT(Page, Runtime, config.url, logger));
@@ -1500,20 +1517,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         if (!captureOnly) {
           await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
         }
-      }
-      if (isResumingConversation) {
-        // A resumed thread loads its prior history after navigation; ChatGPT can reset the
-        // composer mid-hydration and wipe a freshly-typed prompt. Wait for hydration to settle
-        // and re-confirm the composer before the prompt is typed/submitted below. Wrapped in
-        // raceWithDisconnect so a dropped client aborts immediately instead of polling to the
-        // hydration deadline. Shared with the remote path via the same helper.
-        await raceWithDisconnect(
-          waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
-            requirePriorTurns: true,
-            requirePromptReady: !captureOnly,
-            expectedConversationUrl: config.resumeConversationUrl as string,
-          }),
-        );
       }
     }
     if (captureOnly) {
@@ -3106,6 +3109,25 @@ type RemoteCaptureOnlyResultDeps = {
   remoteTargetId: string | null;
 };
 
+type PromptBoundaryDeps = {
+  captureOnly: boolean;
+  isResumingConversation: boolean;
+  ensurePromptReady: () => Promise<void>;
+  waitForHydration: (requirePromptReady: boolean) => Promise<void>;
+};
+
+/**
+ * The last pre-capture gate shared by local and remote browser entry paths.
+ * Capture-only may hydrate prior turns, but must never ask the provider for a
+ * writable prompt before returning to the read-only capture branch.
+ */
+async function preparePromptBoundary(deps: PromptBoundaryDeps): Promise<void> {
+  if (!deps.captureOnly) await deps.ensurePromptReady();
+  if (deps.isResumingConversation) {
+    await deps.waitForHydration(!deps.captureOnly);
+  }
+}
+
 async function runRemoteCaptureOnlyIfRequested(
   deps: RemoteCaptureOnlyResultDeps,
 ): Promise<BrowserRunResult | undefined> {
@@ -3341,11 +3363,20 @@ async function runRemoteBrowserMode(
     }
     await ensureNotBlocked(Runtime, config.headless, logger);
     await ensureLoggedIn(Runtime, logger, { remoteSession: true });
-    if (config.resumeConversationUrl) {
-      await waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
-        requirePriorTurns: true,
-        requirePromptReady: !config.captureOnly,
-        expectedConversationUrl: config.resumeConversationUrl,
+    if (config.captureOnly) {
+      await preparePromptBoundary({
+        captureOnly: true,
+        isResumingConversation: Boolean(config.resumeConversationUrl),
+        ensurePromptReady: async () => {
+          await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
+        },
+        waitForHydration: async (requirePromptReady) => {
+          await waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
+            requirePriorTurns: true,
+            requirePromptReady,
+            expectedConversationUrl: config.resumeConversationUrl as string,
+          });
+        },
       });
     }
     const captureOnlyResult = await runRemoteCaptureOnlyIfRequested({
@@ -4246,6 +4277,7 @@ export const __test__ = {
   listIgnoredRemoteChromeFlags,
   normalizeAuthenticatedModelSelectionError,
   resolveManualLoginWaitMs,
+  preparePromptBoundaryForTest: preparePromptBoundary,
   runRemoteCaptureOnlyForTest: runRemoteCaptureOnlyIfRequested,
   shouldCleanupBlankTabsAfterLastLease,
   shouldCloseOwnedRunTargetAfterRun,

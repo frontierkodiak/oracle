@@ -540,6 +540,32 @@ describe("ChatGPT UI warning detection", () => {
 });
 
 describe("remote capture-only boundary", () => {
+  test("skips prompt readiness and asks hydration not to require a prompt", async () => {
+    const ensurePromptReady = vi.fn(async () => undefined);
+    const waitForHydration = vi.fn(async (_requirePromptReady: boolean) => undefined);
+    await __test__.preparePromptBoundaryForTest({
+      captureOnly: true,
+      isResumingConversation: true,
+      ensurePromptReady,
+      waitForHydration,
+    });
+    expect(ensurePromptReady).not.toHaveBeenCalled();
+    expect(waitForHydration).toHaveBeenCalledWith(false);
+  });
+
+  test("retains prompt readiness and prompt-dependent hydration for ordinary runs", async () => {
+    const ensurePromptReady = vi.fn(async () => undefined);
+    const waitForHydration = vi.fn(async (_requirePromptReady: boolean) => undefined);
+    await __test__.preparePromptBoundaryForTest({
+      captureOnly: false,
+      isResumingConversation: true,
+      ensurePromptReady,
+      waitForHydration,
+    });
+    expect(ensurePromptReady).toHaveBeenCalledOnce();
+    expect(waitForHydration).toHaveBeenCalledWith(true);
+  });
+
   const base = {
     Runtime: {} as never,
     config: resolveBrowserConfig({
