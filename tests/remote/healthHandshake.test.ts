@@ -13,7 +13,11 @@ const artifact = {
   version: 1,
   limits: { maxBytes: 1024 * 1024 * 1024 },
 };
-const durable = { id: "oracle.remote.durable-queue", version: 1 };
+const durable = {
+  id: "oracle.remote.durable-queue",
+  version: 1,
+  limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+};
 const envelope = (overrides: Record<string, unknown> = {}) => ({
   ok: true,
   version: "0.18.0",

@@ -8,6 +8,7 @@ import { mkdir, mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/
 import {
   createRemoteServer,
   pickClientBrowserConfig,
+  qualifiesForProEtaSample,
   serveRemote,
 } from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
@@ -29,6 +30,46 @@ const CAN_LISTEN_LOCALHOST =
     ],
     { stdio: "ignore" },
   ).status === 0;
+
+test("qualifies verified GPT-5.6 Sol runs by Pro effort rather than model-label text", () => {
+  const proResult = {
+    answerText: "answer",
+    answerMarkdown: "answer",
+    tookMs: 1,
+    answerTokens: 1,
+    answerChars: 6,
+    promptSubmitted: true,
+    modelSelection: {
+      requestedModel: "gpt-5.6-sol",
+      resolvedLabel: "GPT-5.6 Sol",
+      strategy: "select",
+      status: "already-selected",
+      verified: true,
+      source: "chatgpt-model-picker",
+      capturedAt: "2026-01-01T00:00:00.000Z",
+    },
+    thinkingSelection: {
+      requestedLevel: "pro",
+      status: "already-selected",
+      resolvedLabel: "Pro",
+      verified: true,
+      strictFailClosed: true,
+      source: "chatgpt-thinking-picker",
+      capturedAt: "2026-01-01T00:00:00.000Z",
+    },
+  } as BrowserRunResult;
+  expect(qualifiesForProEtaSample(proResult, false)).toBe(true);
+  expect(qualifiesForProEtaSample(proResult, true)).toBe(false);
+  expect(
+    qualifiesForProEtaSample(
+      {
+        ...proResult,
+        thinkingSelection: { ...proResult.thinkingSelection!, requestedLevel: "standard" },
+      },
+      false,
+    ),
+  ).toBe(false);
+});
 
 describe("remote browser service", () => {
   test("serveRemote refuses unsupported Node before touching browser startup state", async () => {
@@ -62,7 +103,7 @@ describe("remote browser service", () => {
   });
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "streams logs and returns results via client executor",
+    "summarizes host logs and returns results via client executor",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-test-"));
       const attachmentPath = path.join(tmpDir, "note.txt");
@@ -132,7 +173,8 @@ describe("remote browser service", () => {
         },
       });
 
-      expect(clientLogs.some((entry) => entry.includes("uploading attachment"))).toBe(true);
+      expect(clientLogs.some((entry) => entry.includes("[remote]"))).toBe(true);
+      expect(clientLogs.some((entry) => entry.includes("Uploading attachment"))).toBe(true);
       expect(result.answerText).toBe("hi");
       expect(runLog).toEqual(["remote"]);
 
@@ -712,7 +754,11 @@ async function createFakeArtifactBridge({
           capabilities: {
             schemaVersion: 1,
             features: [
-              { id: "oracle.remote.durable-queue", version: 1 },
+              {
+                id: "oracle.remote.durable-queue",
+                version: 1,
+                limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+              },
               {
                 id: "oracle.remote.artifact-transfer",
                 version: 1,
@@ -1390,7 +1436,11 @@ describe("transport failure messages", () => {
               capabilities: {
                 schemaVersion: 1,
                 features: [
-                  { id: "oracle.remote.durable-queue", version: 1 },
+                  {
+                    id: "oracle.remote.durable-queue",
+                    version: 1,
+                    limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+                  },
                   { id: "oracle.remote.artifact-transfer", version: 1, limits: { maxBytes: 1024 } },
                 ],
               },

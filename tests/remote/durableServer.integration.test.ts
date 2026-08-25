@@ -4,6 +4,8 @@ import { mkdtemp, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createRemoteServer } from "../../src/remote/server.js";
+import { getDurableRemoteRun } from "../../src/remote/client.js";
+import { BrowserAutomationError } from "../../src/oracle/errors.js";
 
 const payload = (prompt: string) => ({ prompt, attachments: [], browserConfig: {}, options: {} });
 
@@ -45,6 +47,19 @@ function call(
   });
 }
 
+async function waitForRun(
+  port: number,
+  id: string,
+  predicate: (run: any) => boolean,
+): Promise<any> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const response = await call(port, "GET", `/v1/runs/${id}`);
+    if (predicate(response.json)) return response.json;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`durable run ${id} did not reach the expected state`);
+}
+
 describe("durable remote server admission", () => {
   let server: Awaited<ReturnType<typeof createRemoteServer>> | undefined;
   afterEach(async () => {
@@ -83,6 +98,42 @@ describe("durable remote server admission", () => {
     const canceled = await call(server.port, "POST", `/v1/runs/${accepted[4]?.json.id}/cancel`);
     expect(canceled.status).toBe(200);
     expect(canceled.json.state).toBe("canceled");
+    const health = await call(server.port, "GET", "/health");
+    expect(
+      health.json.capabilities.features.find(
+        (feature: any) => feature.id === "oracle.remote.durable-queue",
+      ).limits,
+    ).toEqual({ maxQueued: 8, maxConcurrentRuns: 4 });
+  });
+
+  it("advertises configured queue capacity and backlog rather than fixed limits", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-health-capacity-"));
+    server = await createRemoteServer(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        token: "test",
+        logger: () => {},
+        queueHomeDir: home,
+        maxConcurrentRuns: 2,
+        maxQueuedRuns: 3,
+      },
+      {
+        runBrowser: async () => ({
+          answerText: "ok",
+          answerMarkdown: "ok",
+          tookMs: 1,
+          answerTokens: 1,
+          answerChars: 2,
+        }),
+      },
+    );
+    const health = await call(server.port, "GET", "/health");
+    const feature = health.json.capabilities.features.find(
+      (item: any) => item.id === "oracle.remote.durable-queue",
+    );
+    expect(feature.limits).toEqual({ maxQueued: 3, maxConcurrentRuns: 2 });
+    expect(health.json.queue).toMatchObject({ capacity: 2, backlog: 3 });
   });
 
   it("removes the legacy endpoint without invoking the browser", async () => {
@@ -209,5 +260,179 @@ describe("durable remote server admission", () => {
     expect(health.json.capabilities.features).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: "oracle.browser.capture-only" })]),
     );
+  });
+
+  it("exposes conversation-safe runtime hints but never host hints or raw browser logs", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-public-events-"));
+    const secretPath = "/Users/carbon/.oracle/browser-profile/Default";
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      {
+        runBrowser: async ({ runtimeHintCb, log }) => {
+          log?.(`Chrome profile: ${secretPath}`);
+          await runtimeHintCb?.(
+            {
+              chromePid: 123,
+              chromePort: 9222,
+              chromeHost: "127.0.0.1",
+              userDataDir: secretPath,
+              chromeTargetId: "host-target",
+              tabUrl: "https://chatgpt.com/c/public-conversation",
+              conversationId: "public-conversation",
+              submissionAttempted: true,
+              promptSubmitted: true,
+              controllerPid: 456,
+            },
+            {
+              requestedModel: "gpt-5.6-sol",
+              resolvedLabel: "GPT-5.6 Sol",
+              status: "already-selected",
+              verified: true,
+              source: "config",
+              capturedAt: "2026-08-25T00:00:00.000Z",
+              path: secretPath,
+            } as never,
+          );
+          return {
+            answerText: "ok",
+            answerMarkdown: "ok",
+            tookMs: 1,
+            answerTokens: 1,
+            answerChars: 2,
+            promptSubmitted: true,
+          };
+        },
+      },
+    );
+    const accepted = await call(server.port, "POST", "/v1/runs", payload("public"), "public-key");
+    const completed = await waitForRun(
+      server.port,
+      accepted.json.id,
+      (run) => run.state === "completed",
+    );
+    const events = await call(server.port, "GET", `/v1/runs/${accepted.json.id}/events?after=-1`);
+    const wire = JSON.stringify({ completed, events: events.json });
+    expect(completed.runtimeHint).toEqual({
+      tabUrl: "https://chatgpt.com/c/public-conversation",
+      conversationId: "public-conversation",
+      submissionAttempted: true,
+      promptSubmitted: true,
+      modelSelection: expect.objectContaining({ resolvedLabel: "GPT-5.6 Sol" }),
+    });
+    expect(wire).not.toContain(secretPath);
+    expect(wire).not.toContain("chromePid");
+    expect(wire).not.toContain("chromeTargetId");
+    expect(events.json.events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: { type: "log", message: "Browser progress updated" },
+        }),
+      ]),
+    );
+  });
+
+  it("fails closed when cancellation wins before the irreversible submit marker", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-cancel-before-send-"));
+    let releaseAttempt!: () => void;
+    let started!: () => void;
+    let attemptFinished!: () => void;
+    const attemptGate = new Promise<void>((resolve) => (releaseAttempt = resolve));
+    const startedGate = new Promise<void>((resolve) => (started = resolve));
+    const attemptFinishedGate = new Promise<void>((resolve) => (attemptFinished = resolve));
+    let dispatched = 0;
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      {
+        runBrowser: async ({ runtimeHintCb }) => {
+          started();
+          await attemptGate;
+          try {
+            await runtimeHintCb?.({ submissionAttempted: true, promptSubmitted: false });
+            dispatched += 1;
+            return {
+              answerText: "must not dispatch",
+              answerMarkdown: "must not dispatch",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 17,
+            };
+          } finally {
+            attemptFinished();
+          }
+        },
+      },
+    );
+    const accepted = await call(server.port, "POST", "/v1/runs", payload("cancel"), "cancel-key");
+    await startedGate;
+    const canceled = await call(server.port, "POST", `/v1/runs/${accepted.json.id}/cancel`);
+    releaseAttempt();
+    await attemptFinishedGate;
+    await waitForRun(server.port, accepted.json.id, (run) => run.state === "canceled");
+    expect(canceled.json.cancellation.outcome).toBe("canceled");
+    expect(dispatched).toBe(0);
+  });
+
+  it("leaves a client-parseable terminal state across graceful shutdown and reopen", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-graceful-shutdown-"));
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      {
+        runBrowser: async ({ signal }) => {
+          if (!signal?.aborted)
+            await new Promise<void>((resolve) =>
+              signal?.addEventListener("abort", () => resolve(), { once: true }),
+            );
+          throw new Error("supervisor abort");
+        },
+      },
+    );
+    const accepted = await call(
+      server.port,
+      "POST",
+      "/v1/runs",
+      payload("shutdown"),
+      "shutdown-key",
+    );
+    await waitForRun(server.port, accepted.json.id, (run) => run.state === "running");
+    await server.close();
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      { runBrowser: async () => Promise.reject(new Error("must not restart terminal work")) },
+    );
+    await expect(
+      getDurableRemoteRun(`127.0.0.1:${server.port}`, accepted.json.id, "test"),
+    ).resolves.toMatchObject({
+      state: "failed",
+      failure: { code: "server_shutdown_before_submit", type: "failed" },
+    });
+  });
+
+  it("surfaces typed throttling without exposing host paths or exception text", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-safe-failure-"));
+    const secret = "/Users/carbon/.oracle/browser-profile bearer-super-secret";
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      {
+        runBrowser: async () => {
+          throw new BrowserAutomationError(`provider failed at ${secret}`, {
+            stage: "chatgpt-throttled",
+          });
+        },
+      },
+    );
+    const accepted = await call(
+      server.port,
+      "POST",
+      "/v1/runs",
+      payload("throttle"),
+      "throttle-key",
+    );
+    const failed = await waitForRun(server.port, accepted.json.id, (run) => run.state === "failed");
+    expect(failed.failure).toEqual({
+      type: "chatgpt-throttled",
+      message: "ChatGPT rate limiting is active for this account; retry later.",
+    });
+    expect(JSON.stringify(failed)).not.toContain(secret);
+    expect(JSON.stringify(failed)).not.toContain("bearer-super-secret");
   });
 });

@@ -49,6 +49,122 @@ export function pickClientBrowserConfig(
   return accepted;
 }
 
+const REMOTE_HOST_PRIVATE_RESULT_KEYS = new Set([
+  "path",
+  "filePath",
+  "localPath",
+  "chromePid",
+  "chromePort",
+  "chromeHost",
+  "chromeBrowserWSEndpoint",
+  "chromeProfileRoot",
+  "userDataDir",
+  "chromeTargetId",
+  "controllerPid",
+  "debugPort",
+  "remoteChrome",
+  "chromePath",
+  "chromeProfile",
+  "chromeCookiePath",
+  "copyProfileSource",
+  "inlineCookies",
+  "inlineCookiesSource",
+  "browserTabRef",
+]);
+
+export function isRemoteHostPrivateResultKey(key: string): boolean {
+  return REMOTE_HOST_PRIVATE_RESULT_KEYS.has(key);
+}
+
+/** Remove host-local process, profile, cookie, debugger, and filesystem state
+ * before a browser value crosses the remote transport boundary. */
+export function sanitizeRemotePublicValue<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(sanitizeRemotePublicValue) as T;
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !isRemoteHostPrivateResultKey(key))
+      .map(([key, child]) => [key, sanitizeRemotePublicValue(child)]),
+  ) as T;
+}
+
+export function isRemotePublicValue(value: unknown): boolean {
+  if (Array.isArray(value)) return value.every(isRemotePublicValue);
+  if (!value || typeof value !== "object") return true;
+  return Object.entries(value).every(
+    ([key, child]) => !isRemoteHostPrivateResultKey(key) && isRemotePublicValue(child),
+  );
+}
+
+const REMOTE_RUNTIME_HINT_FIELDS = [
+  "tabUrl",
+  "conversationId",
+  "submissionAttempted",
+  "promptSubmitted",
+  "modelSelection",
+] as const;
+
+/** Runtime hints are public queue state, so expose only conversation identity and
+ * submission/model evidence. Chrome control handles remain host-private. */
+export function sanitizeRemoteRuntimeHint(
+  hint: Record<string, unknown>,
+  modelSelection?: unknown,
+): Record<string, unknown> {
+  return {
+    ...(typeof hint.tabUrl === "string" ? { tabUrl: hint.tabUrl } : {}),
+    ...(typeof hint.conversationId === "string" ? { conversationId: hint.conversationId } : {}),
+    ...(typeof hint.submissionAttempted === "boolean"
+      ? { submissionAttempted: hint.submissionAttempted }
+      : {}),
+    ...(typeof hint.promptSubmitted === "boolean" ? { promptSubmitted: hint.promptSubmitted } : {}),
+    ...(modelSelection === undefined
+      ? {}
+      : { modelSelection: sanitizeRemotePublicValue(modelSelection) }),
+  };
+}
+
+export function isRemoteRuntimeHint(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const hint = value as Record<string, unknown>;
+  if (Object.keys(hint).some((key) => !REMOTE_RUNTIME_HINT_FIELDS.includes(key as never)))
+    return false;
+  return (
+    (hint.tabUrl === undefined || typeof hint.tabUrl === "string") &&
+    (hint.conversationId === undefined || typeof hint.conversationId === "string") &&
+    (hint.submissionAttempted === undefined || typeof hint.submissionAttempted === "boolean") &&
+    (hint.promptSubmitted === undefined || typeof hint.promptSubmitted === "boolean") &&
+    (hint.modelSelection === undefined || isRemotePublicValue(hint.modelSelection))
+  );
+}
+
+const REMOTE_PUBLIC_LOG_MESSAGES = new Set([
+  "Uploading attachment",
+  "Attachments uploaded",
+  "Prompt ready",
+  "Prompt dispatch attempted",
+  "Prompt dispatched",
+  "Waiting for response",
+  "Capturing response",
+  "Browser progress updated",
+]);
+
+/** Browser logging is rich in local paths and Chrome handles. Convert it to a
+ * small public vocabulary rather than trying to redact arbitrary prose. */
+export function summarizeRemoteBrowserLog(message: string): string {
+  if (/uploading attachment/i.test(message)) return "Uploading attachment";
+  if (/attachments? uploaded|upload.*complete/i.test(message)) return "Attachments uploaded";
+  if (/prompt textarea ready|composer.*ready/i.test(message)) return "Prompt ready";
+  if (/submit.*attempt/i.test(message)) return "Prompt dispatch attempted";
+  if (/submitted prompt|clicked send button/i.test(message)) return "Prompt dispatched";
+  if (/waiting.*(?:response|assistant)|thinking/i.test(message)) return "Waiting for response";
+  if (/captur|harvest/i.test(message)) return "Capturing response";
+  return "Browser progress updated";
+}
+
+export function isRemotePublicLogMessage(value: unknown): value is string {
+  return typeof value === "string" && REMOTE_PUBLIC_LOG_MESSAGES.has(value);
+}
+
 export interface RemoteCapabilityFeature {
   id: string;
   version: number;

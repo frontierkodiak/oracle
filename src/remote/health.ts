@@ -8,6 +8,7 @@ import {
 } from "./runtime.js";
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
+  DURABLE_QUEUE_FEATURE_ID,
   MAX_REMOTE_ARTIFACT_BYTES,
   REMOTE_HEALTH_SCHEMA_VERSION,
   type RemoteArtifactCapabilities,
@@ -181,6 +182,16 @@ export function parseHealthEnvelope(value: unknown):
         limits.maxBytes <= 0)
     )
       return undefined;
+    if (f.id === DURABLE_QUEUE_FEATURE_ID) {
+      if (
+        !limits ||
+        !Number.isSafeInteger(limits.maxQueued) ||
+        Number(limits.maxQueued) < 0 ||
+        !Number.isSafeInteger(limits.maxConcurrentRuns) ||
+        Number(limits.maxConcurrentRuns) < 1
+      )
+        return undefined;
+    }
     features.push({ id: f.id, version: f.version, ...(limits ? { limits: { ...limits } } : {}) });
   }
   const artifactFeature = features.find(

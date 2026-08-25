@@ -32,6 +32,8 @@ describe("durable remote artifacts", () => {
         verified: true,
         source: "config",
         capturedAt: "2026-01-01",
+        path: "/private/model-picker.json",
+        nested: { userDataDir: "/private/nested-profile", safe: "kept" },
       },
       thinkingSelection: {
         requestedLevel: "standard",
@@ -68,6 +70,9 @@ describe("durable remote artifacts", () => {
     });
     expect(run.descriptors[0].sha256).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(run.result)).not.toContain(source);
+    expect(JSON.stringify(run.result)).not.toContain("/private/model-picker.json");
+    expect(JSON.stringify(run.result)).not.toContain("/private/nested-profile");
+    expect((run.result.modelSelection as any).nested).toEqual({ safe: "kept" });
     expect(run.result.thinkingSelection?.requestedLevel).toBe("standard");
     expect(JSON.stringify(JSON.parse(await readFile(run.manifestPath, "utf8")))).not.toContain(
       "/private/profile",

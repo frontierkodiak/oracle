@@ -1009,12 +1009,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
   const runtimeHintCb = options.runtimeHintCb;
   let lastTargetId: string | undefined;
   let lastUrl: string | undefined;
+  let submissionAttempted = false;
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let thinkingSelectionEvidence: BrowserThinkingSelectionEvidence | undefined;
   let tabLease: BrowserTabLease | null = null;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
-  const emitRuntimeHint = async (): Promise<void> => {
+  const emitRuntimeHint = async (failClosed = false): Promise<void> => {
     if (!chrome?.port) {
       return;
     }
@@ -1026,12 +1027,19 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       chromeTargetId: lastTargetId,
       tabUrl: lastUrl,
       conversationId,
+      submissionAttempted,
       promptSubmitted,
       userDataDir,
       controllerPid: process.pid,
     };
     try {
       await runtimeHintCb?.(hint, modelSelectionEvidence);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger(`Failed to persist runtime hint: ${message}`);
+      if (failClosed) throw error;
+    }
+    try {
       await tabLease?.update({
         chromeHost,
         chromePort: chrome.port,
@@ -1040,7 +1048,17 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      logger(`Failed to persist runtime hint: ${message}`);
+      logger(`Failed to update browser tab lease: ${message}`);
+    }
+  };
+  const markPromptSubmitAttempt = async (): Promise<void> => {
+    if (submissionAttempted) return;
+    submissionAttempted = true;
+    try {
+      await emitRuntimeHint(true);
+    } catch (error) {
+      submissionAttempted = false;
+      throw error;
     }
   };
   const markPromptSubmitted = async (): Promise<void> => {
@@ -1762,6 +1780,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
+        onPromptSubmitAttempt: markPromptSubmitAttempt,
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
@@ -3077,6 +3096,7 @@ async function runRemoteBrowserMode(
   let remoteTargetId: string | null = null;
   let tabLease: BrowserTabLease | null = null;
   let lastUrl: string | undefined;
+  let submissionAttempted = false;
   let promptSubmitted = false;
   let modelSelectionEvidence: BrowserModelSelectionEvidence | undefined;
   let thinkingSelectionEvidence: BrowserThinkingSelectionEvidence | undefined;
@@ -3084,7 +3104,7 @@ async function runRemoteBrowserMode(
   let ownsTarget = true;
   let conversationUrlMonitor: ConversationUrlMonitor | null = null;
   const runtimeHintCb = options.runtimeHintCb;
-  const emitRuntimeHint = async () => {
+  const emitRuntimeHint = async (failClosed = false) => {
     if (!runtimeHintCb) return;
     try {
       await runtimeHintCb(
@@ -3096,11 +3116,18 @@ async function runRemoteBrowserMode(
           chromeTargetId: remoteTargetId ?? undefined,
           tabUrl: lastUrl,
           conversationId: lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined,
+          submissionAttempted,
           promptSubmitted,
           controllerPid: process.pid,
         },
         modelSelectionEvidence,
       );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logger(`Failed to persist runtime hint: ${message}`);
+      if (failClosed) throw error;
+    }
+    try {
       await tabLease?.update({
         chromeHost: host,
         chromePort: port,
@@ -3109,7 +3136,17 @@ async function runRemoteBrowserMode(
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      logger(`Failed to persist runtime hint: ${message}`);
+      logger(`Failed to update browser tab lease: ${message}`);
+    }
+  };
+  const markPromptSubmitAttempt = async (): Promise<void> => {
+    if (submissionAttempted) return;
+    submissionAttempted = true;
+    try {
+      await emitRuntimeHint(true);
+    } catch (error) {
+      submissionAttempted = false;
+      throw error;
     }
   };
   const markPromptSubmitted = async (): Promise<void> => {
@@ -3375,6 +3412,7 @@ async function runRemoteBrowserMode(
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
+        onPromptSubmitAttempt: markPromptSubmitAttempt,
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =

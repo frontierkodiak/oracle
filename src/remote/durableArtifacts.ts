@@ -5,7 +5,7 @@ import path from "node:path";
 import type { BrowserRunResult } from "../browserMode.js";
 import type { SessionArtifact } from "../sessionManager.js";
 import type { RemoteArtifactDescriptor } from "./types.js";
-import { MAX_REMOTE_ARTIFACT_BYTES } from "./types.js";
+import { MAX_REMOTE_ARTIFACT_BYTES, sanitizeRemotePublicValue } from "./types.js";
 
 const MANIFEST = "manifest.json";
 const ID_RE = /^[0-9a-f-]{36}$/i;
@@ -418,8 +418,8 @@ export function sanitizeDurableBrowserResult(result: BrowserRunResult): BrowserR
     tookMs: result.tookMs,
     answerTokens: result.answerTokens,
     answerChars: result.answerChars,
-    modelSelection: result.modelSelection,
-    thinkingSelection: result.thinkingSelection,
+    modelSelection: sanitizeRemotePublicValue(result.modelSelection),
+    thinkingSelection: sanitizeRemotePublicValue(result.thinkingSelection),
     archive: result.archive
       ? {
           mode: result.archive.mode,
@@ -432,10 +432,10 @@ export function sanitizeDurableBrowserResult(result: BrowserRunResult): BrowserR
     tabUrl: result.tabUrl,
     conversationId: result.conversationId,
     promptSubmitted: result.promptSubmitted,
-    warnings: result.warnings?.map(({ code, severity, message }) => ({
+    warnings: result.warnings?.map(({ code, severity }) => ({
       code,
       severity,
-      message: message.replace(/(?:\/Users\/|[A-Za-z]:\\|\/home\/)[^\s)]+/g, "[redacted-path]"),
+      message: `Browser host warning (${code || "unspecified"}).`,
     })),
   };
 }

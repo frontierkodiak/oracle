@@ -25,6 +25,9 @@ import {
   CAPTURE_ONLY_FEATURE_ID,
   DURABLE_QUEUE_FEATURE_ID,
   MAX_REMOTE_ARTIFACT_BYTES,
+  isRemotePublicValue,
+  isRemotePublicLogMessage,
+  isRemoteRuntimeHint,
   pickClientBrowserConfig,
   type DurableRunSnapshot,
   type RemoteArtifactDescriptor,
@@ -49,8 +52,11 @@ export interface DurableReceipt {
 }
 export class DurableSubmissionUnknownError extends Error {
   readonly reconnectable = true;
-  constructor(message = "durable run submission outcome is unknown; retry with the saved key") {
-    super(message);
+  constructor(readonly sessionId?: string) {
+    const recovery = sessionId
+      ? ` rerun with --session-id ${sessionId}; receipt: ${receiptPath(sessionId)}`
+      : " retry with the saved key";
+    super(`durable run submission outcome is unknown;${recovery}`);
     this.name = "DurableSubmissionUnknownError";
   }
 }
@@ -206,6 +212,7 @@ export async function submitDurableRemoteRunWithReceipt(p: {
   token?: string;
   sessionId: string;
   payload: RemoteRunPayload;
+  onReceiptReady?: (receipt: DurableReceipt) => void;
 }): Promise<{ receipt: DurableReceipt; snapshot: DurableRunSnapshot }> {
   assertRemoteCapabilities(await checkRemoteHealth({ host: p.host, token: p.token }), p.host, [
     { id: DURABLE_QUEUE_FEATURE_ID, version: 1 },
@@ -222,6 +229,7 @@ export async function submitDurableRemoteRunWithReceipt(p: {
     receipt = { ...receipt, payloadHash };
     await writeDurableReceipt(receipt);
   }
+  p.onReceiptReady?.(receipt);
   let snapshot: DurableRunSnapshot;
   if (receipt.runId) {
     snapshot = await getDurableRemoteRun(p.host, receipt.runId, p.token);
@@ -246,7 +254,7 @@ export async function submitDurableRemoteRunWithReceipt(p: {
         if (isRetryableTransport(retryError) && !isDefinitePreSubmit(retryError)) {
           receipt = { ...receipt, submission: "unknown" };
           await writeDurableReceipt(receipt);
-          throw new DurableSubmissionUnknownError();
+          throw new DurableSubmissionUnknownError(p.sessionId);
         }
         throw retryError;
       }
@@ -309,8 +317,8 @@ function isKnownRemoteEvent(value: unknown): boolean {
   const e = value as Record<string, unknown>;
   const keys = (allowed: string[]) => Object.keys(e).every((key) => allowed.includes(key));
   if (e.type === "accepted") return keys(["type"]);
-  if (e.type === "log" || e.type === "error")
-    return keys(["type", "message"]) && typeof e.message === "string";
+  if (e.type === "log") return keys(["type", "message"]) && isRemotePublicLogMessage(e.message);
+  if (e.type === "error") return keys(["type", "message"]) && typeof e.message === "string";
   if (e.type === "state")
     return (
       keys(["type", "state", "phase"]) &&
@@ -478,7 +486,7 @@ export function createRemoteBrowserExecutor({
         } catch (retryError) {
           if (isRetryableTransport(retryError) && !isDefinitePreSubmit(retryError)) {
             await writeDurableReceipt({ ...receipt, submission: "unknown" });
-            throw new DurableSubmissionUnknownError();
+            throw new DurableSubmissionUnknownError(sessionId);
           }
           throw retryError;
         }
@@ -493,6 +501,10 @@ export function createRemoteBrowserExecutor({
       }
     };
     options.signal?.addEventListener("abort", cancel, { once: true });
+    // An abort can land after the server accepted the run but while the receipt
+    // is being fsynced, before the listener above exists. Close that gap without
+    // coupling ordinary observer disconnects to cancellation.
+    if (options.signal?.aborted) cancel();
     try {
       let w: DurableWatchOutcome;
       try {
@@ -825,12 +837,9 @@ function validateSnapshot(s: DurableRunSnapshot): void {
     throw new Error("malformed failed durable run response");
   if (s.state === "canceled" && !s.cancellation)
     throw new Error("malformed canceled durable run response");
-  if (s.state === "unknown" && typeof s.error !== "string" && !s.failure)
+  if (s.state === "unknown" && typeof s.error !== "string" && !s.failure && !s.cancellation)
     throw new Error("malformed unknown durable run response");
-  if (
-    s.runtimeHint !== undefined &&
-    (!s.runtimeHint || typeof s.runtimeHint !== "object" || Array.isArray(s.runtimeHint))
-  )
+  if (s.runtimeHint !== undefined && !isRemoteRuntimeHint(s.runtimeHint))
     throw new Error("malformed durable runtime hint");
   for (const field of ["failure", "errorMetadata"] as const) {
     if (s[field] !== undefined && !isFailureMetadata(s[field]))
@@ -888,31 +897,8 @@ function isValidResult(result: BrowserRunResult): boolean {
     [result.tookMs, result.answerTokens, result.answerChars].every(
       (n) => Number.isSafeInteger(n) && n >= 0,
     ) &&
-    isSanitizedRemoteValue(result)
+    isRemotePublicValue(result)
   );
-}
-/** A durable remote result may contain answer metadata and artifact descriptors,
- * but never a host-local file, Chrome, or runtime handle. */
-function isSanitizedRemoteValue(value: unknown): boolean {
-  if (Array.isArray(value)) return value.every(isSanitizedRemoteValue);
-  if (!value || typeof value !== "object") return true;
-  return Object.entries(value).every(([key, child]) => {
-    if (
-      [
-        "path",
-        "chromePid",
-        "chromePort",
-        "chromeHost",
-        "chromeBrowserWSEndpoint",
-        "chromeProfileRoot",
-        "userDataDir",
-        "chromeTargetId",
-        "controllerPid",
-      ].includes(key)
-    )
-      return false;
-    return isSanitizedRemoteValue(child);
-  });
 }
 function isFailureMetadata(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;

@@ -80,6 +80,7 @@ import {
   cancelDurableRemoteRun,
   getDurableRemoteQueueStatus,
   getDurableRemoteRun,
+  receiptPath,
   submitDurableRemoteRunWithReceipt,
   watchDurableRemoteRun,
 } from "../src/remote/client.js";
@@ -1099,7 +1100,15 @@ remoteSubmit.action(async function (this: Command) {
     browserConfig: pickClientBrowserConfig(browserConfig),
     options: { sessionId, verbose: options.verbose as boolean | undefined },
   };
-  const submitted = await submitDurableRemoteRunWithReceipt({ host, token, sessionId, payload });
+  const submitted = await submitDurableRemoteRunWithReceipt({
+    host,
+    token,
+    sessionId,
+    payload,
+    onReceiptReady: () => {
+      console.error(`Durable session ${sessionId}; receipt ${receiptPath(sessionId)}`);
+    },
+  });
   const snapshot = submitted.snapshot;
   printRemoteValue(
     {

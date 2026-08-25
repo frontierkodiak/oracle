@@ -39,6 +39,7 @@ export async function submitPrompt(
     baselineTurns?: number | null;
     inputTimeoutMs?: number | null;
     attachmentTimeoutMs?: number | null;
+    onPromptSubmitAttempt?: () => Promise<void> | void;
     onPromptSubmitted?: () => Promise<void> | void;
   },
   prompt: string,
@@ -213,6 +214,10 @@ export async function submitPrompt(
     );
   }
 
+  // Persist the conservative post-submit boundary before the first operation
+  // that may dispatch the turn. A cancel after this point cannot claim that no
+  // provider-side conversation exists.
+  await deps.onPromptSubmitAttempt?.();
   const clicked = await attemptSendButton(
     runtime,
     input,

@@ -5,8 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 import {
+  cancelDurableRemoteRun,
   createRemoteBrowserExecutor,
   DurableSubmissionUnknownError,
+  getDurableRemoteRun,
   getDurableRemoteQueueStatus,
   readDurableReceipt,
   receiptPath,
@@ -46,7 +48,11 @@ const health = () => ({
   capabilities: {
     schemaVersion: 1,
     features: [
-      { id: "oracle.remote.durable-queue", version: 1 },
+      {
+        id: "oracle.remote.durable-queue",
+        version: 1,
+        limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+      },
       { id: "oracle.browser.capture-only", version: 1 },
     ],
   },
@@ -73,8 +79,10 @@ describe("durable remote client receipts", () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "oracle-explicit-submit-"));
     setOracleHomeDirOverrideForTest(home);
     const seen: { key?: string; auth?: string } = {};
+    let receiptReady = false;
     const server = http.createServer((req, res) => {
       if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      expect(receiptReady).toBe(true);
       seen.key = String(req.headers["idempotency-key"]);
       seen.auth = String(req.headers.authorization);
       res.end(JSON.stringify(runSnapshot("run-explicit", "queued")));
@@ -90,6 +98,10 @@ describe("durable remote client receipts", () => {
           attachments: [],
           browserConfig: {} as any,
           options: { sessionId: "explicit-session" },
+        },
+        onReceiptReady: (receipt) => {
+          receiptReady = true;
+          expect(receipt.sessionId).toBe("explicit-session");
         },
       });
       expect(result.snapshot.id).toBe("run-explicit");
@@ -133,9 +145,11 @@ describe("durable remote client receipts", () => {
       },
     };
     try {
-      await expect(submitDurableRemoteRunWithReceipt(request)).rejects.toBeInstanceOf(
-        DurableSubmissionUnknownError,
-      );
+      const unknown = await submitDurableRemoteRunWithReceipt(request).catch((error) => error);
+      expect(unknown).toBeInstanceOf(DurableSubmissionUnknownError);
+      expect(unknown).toMatchObject({ sessionId: "explicit-unknown" });
+      expect(String(unknown.message)).toContain("--session-id explicit-unknown");
+      expect(String(unknown.message)).toContain(receiptPath("explicit-unknown"));
       expect(await readDurableReceipt(request.sessionId)).toMatchObject({ submission: "unknown" });
       const recovered = await submitDurableRemoteRunWithReceipt(request);
       expect(recovered.snapshot.id).toBe("explicit-recovered");
@@ -144,6 +158,99 @@ describe("durable remote client receipts", () => {
       expect(await readDurableReceipt(request.sessionId)).toMatchObject({
         runId: "explicit-recovered",
       });
+    } finally {
+      await close(server);
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
+  it("accepts typed post-submit cancellation snapshots without inventing an error", async () => {
+    const { server, host } = await listen((_req, res) => {
+      res.end(
+        JSON.stringify({
+          ...runSnapshot("post-submit-cancel", "queued"),
+          state: "unknown",
+          phase: "terminal",
+          cancellation: {
+            requestedAt: "2026-01-01T00:00:00.500Z",
+            outcome: "unknown",
+          },
+        }),
+      );
+    });
+    try {
+      await expect(cancelDurableRemoteRun(host, "post-submit-cancel")).resolves.toMatchObject({
+        state: "unknown",
+        cancellation: { outcome: "unknown" },
+      });
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("rejects host-private runtime hints from the wire", async () => {
+    const { server, host } = await listen((_req, res) => {
+      res.end(
+        JSON.stringify({
+          ...runSnapshot("private-runtime", "queued"),
+          runtimeHint: {
+            conversationId: "safe-conversation",
+            chromePid: 123,
+            userDataDir: "/Users/carbon/private-profile",
+          },
+        }),
+      );
+    });
+    try {
+      await expect(getDurableRemoteRun(host, "private-runtime")).rejects.toThrow(
+        "malformed durable runtime hint",
+      );
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("sends one explicit cancel when abort lands after acceptance but before observer setup", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-accepted-abort-"));
+    setOracleHomeDirOverrideForTest(home);
+    const controller = new AbortController();
+    let cancels = 0;
+    const { server, host } = await listen(async (req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      if (req.method === "POST" && req.url === "/v1/runs") {
+        await body(req);
+        res.end(JSON.stringify(runSnapshot("accepted-abort", "queued")));
+        controller.abort();
+        return;
+      }
+      if (req.method === "POST" && req.url === "/v1/runs/accepted-abort/cancel") {
+        cancels += 1;
+        return void res.end(
+          JSON.stringify({
+            ...runSnapshot("accepted-abort", "queued"),
+            state: "canceled",
+            phase: "terminal",
+            cancellation: {
+              requestedAt: "2026-01-01T00:00:00.500Z",
+              outcome: "canceled",
+            },
+          }),
+        );
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    try {
+      await expect(
+        createRemoteBrowserExecutor({ host })({
+          prompt: "abort after acceptance",
+          sessionId: "accepted-abort",
+          signal: controller.signal,
+        }),
+      ).rejects.toThrow(/caller aborted/);
+      for (let attempt = 0; attempt < 20 && cancels === 0; attempt += 1)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(cancels).toBe(1);
     } finally {
       await close(server);
       setOracleHomeDirOverrideForTest(null);
@@ -281,7 +388,13 @@ describe("durable remote client receipts", () => {
             runtime: { name: "node", version: "25.1.0", major: 25, minimumMajor: 24 },
             capabilities: {
               schemaVersion: 1,
-              features: [{ id: "oracle.remote.durable-queue", version: 1 }],
+              features: [
+                {
+                  id: "oracle.remote.durable-queue",
+                  version: 1,
+                  limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+                },
+              ],
             },
           }),
         );
@@ -353,7 +466,13 @@ describe("durable remote client receipts", () => {
             runtime: { name: "node", version: "25.1.0", major: 25, minimumMajor: 24 },
             capabilities: {
               schemaVersion: 1,
-              features: [{ id: "oracle.remote.durable-queue", version: 1 }],
+              features: [
+                {
+                  id: "oracle.remote.durable-queue",
+                  version: 1,
+                  limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+                },
+              ],
             },
           }),
         );

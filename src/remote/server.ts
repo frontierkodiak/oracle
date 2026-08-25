@@ -15,12 +15,17 @@ import { loadUserConfig } from "../config.js";
 import {
   CLIENT_BROWSER_CONFIG_FIELDS,
   pickClientBrowserConfig,
+  sanitizeRemotePublicValue,
   type RemoteRunPayload,
+  sanitizeRemoteRuntimeHint,
+  summarizeRemoteBrowserLog,
 } from "./types.js";
 import {
   DurableQueueStore,
   DURABLE_QUEUE_CAPABILITY_ID,
   DURABLE_QUEUE_CAPABILITY_VERSION,
+  type DurableErrorMetadata,
+  type DurableRunSnapshot as StoredDurableRunSnapshot,
 } from "./durableQueue.js";
 import {
   persistBrowserRunArtifacts,
@@ -66,6 +71,21 @@ export interface RemoteServerOptions {
   queueHomeDir?: string;
 }
 
+export function qualifiesForProEtaSample(
+  result: Awaited<ReturnType<typeof runBrowserMode>>,
+  captureOnly: boolean,
+): boolean {
+  const modelEvidence = result.modelSelection;
+  const thinkingEvidence = result.thinkingSelection;
+  return (
+    !captureOnly &&
+    modelEvidence?.verified === true &&
+    thinkingEvidence?.verified === true &&
+    thinkingEvidence.requestedLevel === "pro" &&
+    result.promptSubmitted === true
+  );
+}
+
 interface RemoteServerDeps {
   runBrowser?: typeof runBrowserMode;
 }
@@ -78,7 +98,10 @@ interface RemoteServerInstance {
 
 const ARTIFACT_PROTOCOL_VERSION = 1;
 
-function artifactCapabilities(allowCaptureOnly: boolean) {
+function artifactCapabilities(
+  allowCaptureOnly: boolean,
+  queue: { capacity: number; backlog: number },
+) {
   const features: Array<{ id: string; version: number; limits?: Record<string, number> }> = [
     {
       id: ARTIFACT_TRANSFER_FEATURE_ID,
@@ -88,7 +111,7 @@ function artifactCapabilities(allowCaptureOnly: boolean) {
     {
       id: DURABLE_QUEUE_CAPABILITY_ID,
       version: DURABLE_QUEUE_CAPABILITY_VERSION,
-      limits: { maxQueued: 8 },
+      limits: { maxQueued: queue.backlog, maxConcurrentRuns: queue.capacity },
     },
   ];
   if (allowCaptureOnly) features.splice(1, 0, { id: CAPTURE_ONLY_FEATURE_ID, version: 1 });
@@ -252,7 +275,10 @@ export async function createRemoteServer(
           const automationLogger: BrowserLogger = ((message?: string) => {
             if (typeof message === "string") {
               logger(`[run ${id}] ${message}`);
-              durableQueue.appendEvent(id, { type: "log", message });
+              durableQueue.appendEvent(id, {
+                type: "log",
+                message: summarizeRemoteBrowserLog(message),
+              });
             }
           }) as BrowserLogger;
           automationLogger.verbose = Boolean(payload.options?.verbose);
@@ -272,12 +298,21 @@ export async function createRemoteServer(
             ),
             runtimeHintCb: async (hint, modelSelection) => {
               const raw = hint as unknown as Record<string, unknown>;
-              transitionIfActive(
-                id,
-                "running",
-                raw.promptSubmitted === true ? "prompt_submitted" : "browser_attached",
-                { runtimeHint: { ...raw, ...(modelSelection ? { modelSelection } : {}) } },
-              );
+              const publicHint = sanitizeRemoteRuntimeHint(raw, modelSelection);
+              if (raw.submissionAttempted === true || raw.promptSubmitted === true) {
+                // This write is the durable side of an irreversible send fence.
+                // If cancel/shutdown won first, throw so the browser must not
+                // dispatch a provider turn after recording definite cancellation.
+                if (closing || controller.signal.aborted)
+                  throw new Error("durable run ended before prompt dispatch");
+                durableQueue.transition(id, "running", "prompt_submitted", {
+                  runtimeHint: publicHint,
+                });
+              } else {
+                transitionIfActive(id, "running", "browser_attached", {
+                  runtimeHint: publicHint,
+                });
+              }
             },
           });
           let durable: Awaited<ReturnType<typeof persistBrowserRunArtifacts>> | undefined;
@@ -288,11 +323,15 @@ export async function createRemoteServer(
               result,
             });
           } catch (artifactError) {
+            logger(
+              `[run ${id}] artifact persistence failed: ${
+                artifactError instanceof Error ? artifactError.message : String(artifactError)
+              }`,
+            );
             const warning = {
               code: "remote-artifact-persistence-failed",
               severity: "warning" as const,
-              message:
-                artifactError instanceof Error ? artifactError.message : String(artifactError),
+              message: "Remote artifact persistence failed on the browser host.",
             };
             transitionIfActive(id, "completed", "terminal", {
               result: sanitizeDurableBrowserResult({
@@ -317,30 +356,43 @@ export async function createRemoteServer(
                 }
               : durable.result;
           const modelEvidence = durableResult.modelSelection as any;
-          const thinkingEvidence = result.thinkingSelection as any;
           const model = String(modelEvidence?.resolvedLabel ?? modelEvidence?.requestedModel ?? "");
-          const qualifying =
-            payload.browserConfig.captureOnly !== true &&
-            /pro/i.test(model) &&
-            modelEvidence?.verified === true &&
-            thinkingEvidence?.verified === true &&
-            /pro/i.test(String(thinkingEvidence?.requestedLevel ?? "")) &&
-            result.promptSubmitted === true;
+          const qualifying = qualifiesForProEtaSample(
+            result,
+            payload.browserConfig.captureOnly === true,
+          );
           transitionIfActive(id, "completed", "terminal", {
             result: { ...durableResult, artifacts: durable.descriptors },
             elapsedMs: Date.now() - started,
-            model,
+            model: qualifying ? "pro" : model,
             etaQualifying: qualifying,
           });
         } catch (error) {
-          const failure = formatDurableFailure(error);
           const phase = durableQueue.get(id)?.phase;
+          const interruptedByShutdown = closing && controller.signal.aborted;
+          const failure = interruptedByShutdown
+            ? {
+                message: "remote service shut down while the durable run was active",
+                metadata: {
+                  code:
+                    phase === "prompt_submitted" ||
+                    phase === "awaiting_response" ||
+                    phase === "capturing"
+                      ? "server_shutdown_after_submit"
+                      : "server_shutdown_before_submit",
+                  type:
+                    phase === "prompt_submitted" ||
+                    phase === "awaiting_response" ||
+                    phase === "capturing"
+                      ? "unknown"
+                      : "failed",
+                },
+              }
+            : formatDurableFailure(error);
           const terminalState =
             phase === "prompt_submitted" || phase === "awaiting_response" || phase === "capturing"
               ? "unknown"
-              : controller.signal.aborted
-                ? "canceled"
-                : "failed";
+              : "failed";
           transitionIfActive(id, terminalState, "terminal", {
             error: failure.message,
             errorMetadata: failure.metadata,
@@ -389,20 +441,21 @@ export async function createRemoteServer(
         res.end(JSON.stringify({ error: "unauthorized" }));
         return;
       }
+      const queueStatus = durableQueue.status();
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
           ok: true,
           version: getCliVersion(),
           uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
-          capabilities: artifactCapabilities(options.allowCaptureOnly === true),
+          capabilities: artifactCapabilities(options.allowCaptureOnly === true, queueStatus),
           // So a caller can decide whether to send work now or later, instead of
           // discovering the answer by being queued.
-          activeRuns: durableQueue.status().active,
-          queuedRuns: durableQueue.status().queued,
-          maxConcurrentRuns: durableQueue.status().capacity,
+          activeRuns: queueStatus.active,
+          queuedRuns: queueStatus.queued,
+          maxConcurrentRuns: queueStatus.capacity,
           runtime,
-          queue: durableQueue.status(),
+          queue: queueStatus,
         }),
       );
       return;
@@ -432,7 +485,7 @@ export async function createRemoteServer(
           normalizeRemotePayload(payload);
           const snapshot = await durableQueue.submit(key, payload as any);
           res.writeHead(202, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(snapshot));
+          res.end(JSON.stringify(publicDurableSnapshot(snapshot)));
           void pumpDurableQueue();
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -459,7 +512,11 @@ export async function createRemoteServer(
         const after = Number(url.searchParams.get("after") ?? -1);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
-          JSON.stringify({ events: durableQueue.events(id, Number.isFinite(after) ? after : -1) }),
+          JSON.stringify({
+            events: publicDurableEvents(
+              durableQueue.events(id, Number.isFinite(after) ? after : -1),
+            ),
+          }),
         );
         return;
       }
@@ -472,7 +529,7 @@ export async function createRemoteServer(
         }
         durableControllers.get(id)?.abort();
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(durableQueue.get(id)));
+        res.end(JSON.stringify(publicDurableSnapshot(durableQueue.get(id)!)));
         return;
       }
       if (req.method === "GET" && !action) {
@@ -483,7 +540,7 @@ export async function createRemoteServer(
           return;
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(snap));
+        res.end(JSON.stringify(publicDurableSnapshot(snap)));
         return;
       }
       res.writeHead(404);
@@ -903,22 +960,114 @@ function formatDurableFailure(error: unknown): {
 } {
   const oracleError = asOracleUserError(error);
   if (!oracleError) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { message, metadata: { message } };
+    const message = "Remote browser run failed on the host.";
+    return { message, metadata: { type: "internal", message } };
   }
   const details = oracleError.details ?? {};
-  const uiWarning = details.uiWarning;
+  const type = remoteFailureIdentifier(details.stage ?? details.code ?? oracleError.category);
+  const code = remoteFailureIdentifier(details.code);
+  const message =
+    type === "chatgpt-throttled"
+      ? "ChatGPT rate limiting is active for this account; retry later."
+      : type
+        ? `Remote browser run failed (${type}).`
+        : "Remote browser run failed on the host.";
   return {
-    message: oracleError.message,
+    message,
     metadata: {
-      type: String(details.stage ?? details.code ?? oracleError.category),
-      code: typeof details.code === "string" ? details.code : undefined,
-      message:
-        uiWarning && typeof uiWarning === "object" && typeof (uiWarning as any).type === "string"
-          ? String((uiWarning as any).type)
-          : oracleError.message,
+      type,
+      code,
+      message,
     },
   };
+}
+
+function remoteFailureIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" && /^[a-zA-Z0-9._:-]{1,128}$/.test(value) ? value : undefined;
+}
+
+function publicFailureMetadata(
+  value: DurableErrorMetadata | undefined,
+): DurableErrorMetadata | undefined {
+  if (!value) return undefined;
+  const type = remoteFailureIdentifier(value.type);
+  const code = remoteFailureIdentifier(value.code);
+  const throttleMs =
+    Number.isSafeInteger(value.throttleMs) && Number(value.throttleMs) >= 0
+      ? value.throttleMs
+      : undefined;
+  const message =
+    type === "chatgpt-throttled"
+      ? "ChatGPT rate limiting is active for this account; retry later."
+      : type
+        ? `Remote browser run failed (${type}).`
+        : "Remote browser run failed on the host.";
+  return {
+    ...(code ? { code } : {}),
+    ...(type ? { type } : {}),
+    ...(throttleMs !== undefined ? { throttleMs } : {}),
+    message,
+  };
+}
+
+function publicDurableResult(value: unknown): unknown {
+  if (
+    value &&
+    typeof value === "object" &&
+    typeof (value as any).answerText === "string" &&
+    typeof (value as any).answerMarkdown === "string"
+  ) {
+    const result = value as Awaited<ReturnType<typeof runBrowserMode>> & {
+      artifacts?: unknown[];
+    };
+    return {
+      ...sanitizeDurableBrowserResult(result),
+      ...(Array.isArray(result.artifacts)
+        ? { artifacts: sanitizeRemotePublicValue(result.artifacts) }
+        : {}),
+    };
+  }
+  return sanitizeRemotePublicValue(value);
+}
+
+function publicDurableSnapshot(snapshot: StoredDurableRunSnapshot): StoredDurableRunSnapshot {
+  const failure = publicFailureMetadata(snapshot.failure ?? snapshot.errorMetadata);
+  return {
+    ...snapshot,
+    ...(snapshot.runtimeHint
+      ? {
+          runtimeHint: sanitizeRemoteRuntimeHint(
+            snapshot.runtimeHint,
+            snapshot.runtimeHint.modelSelection,
+          ),
+        }
+      : {}),
+    ...(snapshot.result !== undefined ? { result: publicDurableResult(snapshot.result) } : {}),
+    ...(snapshot.error !== undefined
+      ? { error: failure?.message ?? "Remote browser run failed on the host." }
+      : {}),
+    ...(failure ? { errorMetadata: failure, failure } : {}),
+  };
+}
+
+function publicDurableEvents(
+  events: Array<{ seq: number; event: unknown }>,
+): Array<{ seq: number; event: unknown }> {
+  return events.map(({ seq, event }) => {
+    if (!event || typeof event !== "object" || Array.isArray(event))
+      return { seq, event: { type: "error", message: "Remote browser event unavailable." } };
+    const raw = event as Record<string, unknown>;
+    if (raw.type === "log")
+      return {
+        seq,
+        event: { type: "log", message: summarizeRemoteBrowserLog(String(raw.message ?? "")) },
+      };
+    if (raw.type === "error")
+      return { seq, event: { type: "error", message: "Remote browser event failed." } };
+    if (raw.type === "result")
+      return { seq, event: { type: "result", result: publicDurableResult(raw.result) } };
+    return { seq, event: sanitizeRemotePublicValue(event) };
+  });
 }
 
 // Preserve the existing public import while keeping the wire allowlist shared

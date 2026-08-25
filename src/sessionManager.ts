@@ -102,6 +102,8 @@ export interface BrowserRuntimeMetadata {
   chromeTargetId?: string;
   tabUrl?: string;
   conversationId?: string;
+  /** True once Oracle has durably recorded that it is about to invoke an irreversible send. */
+  submissionAttempted?: boolean;
   /** True after Oracle has submitted the prompt to ChatGPT. */
   promptSubmitted?: boolean;
   /** PID of the controller process that launched this browser run. Helps detect orphaned sessions. */
