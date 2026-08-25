@@ -97,6 +97,14 @@ import {
   isTraceValueFlag,
 } from "../src/cli/perfTrace.js";
 import { resolveBrowserFollowupReference } from "../src/cli/followup.js";
+import {
+  TranscriptLedger,
+  canonicalConversationId,
+  deriveChatgptProfileId,
+  ingestProviderNativeArtifacts,
+  ledgerWarning,
+  buildCaptureOnlySyncRequest,
+} from "../src/transcriptLedger.js";
 
 interface CliOptions extends OptionValues {
   prompt?: string;
@@ -1016,6 +1024,217 @@ program
       cookieSyncDefault: commandOptions.browserCookieSync,
       allowCaptureOnly: commandOptions.allowCaptureOnly === true,
     });
+  });
+
+const transcriptCommand = program
+  .command("transcript")
+  .description("Capture and privately archive provider-native ChatGPT conversations.");
+
+function transcriptProfile(options: Record<string, unknown>): string {
+  const explicit = typeof options.profile === "string" ? options.profile.trim() : "";
+  return (
+    explicit ||
+    deriveChatgptProfileId({
+      manualLoginProfileDir: options.profileDir as string | undefined,
+      chromeProfile: options.chromeProfile as string | undefined,
+    })
+  );
+}
+
+function transcriptThread(value: string): { conversationId: string; canonicalUrl: string } {
+  const conversationId = canonicalConversationId(value);
+  return { conversationId, canonicalUrl: `https://chatgpt.com/c/${conversationId}` };
+}
+
+transcriptCommand
+  .command("seed <thread>")
+  .alias("watch")
+  .description("Create a lazy watch for a canonical ChatGPT thread URL or id; do not crawl it.")
+  .option("--root <path>", "Private transcript ledger root.")
+  .option("--profile <id>", "Opaque provider-profile id (defaults to a local profile fingerprint).")
+  .option("--profile-dir <path>", "Profile path used only to derive a stable opaque profile id.")
+  .option(
+    "--interval <seconds>",
+    "Optional periodic-sync interval; no scheduler is started.",
+    parseIntOption,
+  )
+  .action(async (thread: string, options: Record<string, unknown>) => {
+    const ledger = await TranscriptLedger.open({ root: options.root as string | undefined });
+    try {
+      const target = transcriptThread(thread);
+      const result = ledger.watch({
+        provider: "chatgpt",
+        profileId: transcriptProfile(options),
+        conversationId: target.conversationId,
+        canonicalUrl: target.canonicalUrl,
+        intervalSeconds: options.interval as number | undefined,
+      });
+      console.log(
+        JSON.stringify({
+          watchId: result.watchId,
+          conversationKey: result.conversationKey,
+          conversationId: target.conversationId,
+          state: "watched",
+        }),
+      );
+    } finally {
+      ledger.close();
+    }
+  });
+
+transcriptCommand
+  .command("schedule <thread>")
+  .description("Set a periodic-sync interval on a watch; this command does not run a daemon.")
+  .option("--root <path>", "Private transcript ledger root.")
+  .option("--profile <id>", "Opaque provider-profile id.")
+  .requiredOption("--interval <seconds>", "Requested scheduler interval.", parseIntOption)
+  .action(async (thread: string, options: Record<string, unknown>) => {
+    const ledger = await TranscriptLedger.open({ root: options.root as string | undefined });
+    try {
+      const target = transcriptThread(thread);
+      const result = ledger.watch({
+        provider: "chatgpt",
+        profileId: transcriptProfile(options),
+        conversationId: target.conversationId,
+        canonicalUrl: target.canonicalUrl,
+        intervalSeconds: options.interval as number,
+      });
+      console.log(
+        JSON.stringify({
+          watchId: result.watchId,
+          intervalSeconds: options.interval,
+          scheduler: "external",
+        }),
+      );
+    } finally {
+      ledger.close();
+    }
+  });
+
+transcriptCommand
+  .command("ingest")
+  .description("Atomically ingest an existing paired provider-native raw/evidence artifact.")
+  .requiredOption("--raw <path>", "Provider-native raw JSON artifact.")
+  .requiredOption("--evidence <path>", "Paired provider-native evidence JSON artifact.")
+  .option("--conversation <url-or-id>", "Conversation URL or id when raw JSON omits it.")
+  .option("--profile <id>", "Opaque provider-profile id.")
+  .option("--root <path>", "Private transcript ledger root.")
+  .action(async (options: Record<string, unknown>) => {
+    const ledger = await TranscriptLedger.open({ root: options.root as string | undefined });
+    try {
+      const target = options.conversation
+        ? transcriptThread(options.conversation as string)
+        : undefined;
+      const result = await ledger.ingestPair({
+        provider: "chatgpt",
+        profileId: transcriptProfile(options),
+        conversationId: target?.conversationId,
+        canonicalUrl: target?.canonicalUrl,
+        rawPath: options.raw as string,
+        evidencePath: options.evidence as string,
+      });
+      console.log(JSON.stringify(result));
+    } finally {
+      ledger.close();
+    }
+  });
+
+for (const name of ["status", "list"]) {
+  transcriptCommand
+    .command(name)
+    .description("List watched conversations and archive counts.")
+    .option("--root <path>", "Private transcript ledger root.")
+    .action(async (options: Record<string, unknown>) => {
+      const ledger = await TranscriptLedger.open({ root: options.root as string | undefined });
+      try {
+        console.log(JSON.stringify({ conversations: ledger.list(), watches: ledger.watchRows() }));
+      } finally {
+        ledger.close();
+      }
+    });
+}
+
+transcriptCommand
+  .command("sync [thread]")
+  .description(
+    "Explicitly capture one or all watched conversations in capture-only mode; never submits a prompt.",
+  )
+  .option("--all", "Sync every enabled watch.", false)
+  .option("--root <path>", "Private transcript ledger root.")
+  .option("--profile <id>", "Opaque provider-profile id override.")
+  .option("--profile-dir <path>", "Persistent signed-in profile directory.")
+  .option("--browser-timeout <ms>", "Capture timeout.", parseIntOption)
+  .action(async (thread: string | undefined, options: Record<string, unknown>) => {
+    const ledger = await TranscriptLedger.open({ root: options.root as string | undefined });
+    try {
+      const rows = ledger
+        .watchRows()
+        .filter(
+          (row) => options.all || !thread || row.conversationId === canonicalConversationId(thread),
+        );
+      if (rows.length === 0) throw new Error("no matching enabled transcript watch");
+      const { runBrowserMode } = await import("../src/browserMode.js");
+      const output: Array<Record<string, unknown>> = [];
+      for (const row of rows) {
+        const conversationUrl = String(
+          row.canonicalUrl ?? `https://chatgpt.com/c/${row.conversationId}`,
+        );
+        try {
+          const syncRequest = buildCaptureOnlySyncRequest(
+            conversationUrl,
+            options.profileDir as string | undefined,
+          );
+          const result = await runBrowserMode({
+            ...syncRequest,
+            config: {
+              ...syncRequest.config,
+              timeoutMs: options.browserTimeout as number | undefined,
+            },
+            sessionId: `transcript-sync-${String(row.watchId)}`,
+            log: (message?: string) => {
+              if (message?.startsWith("[browser]")) console.error(message);
+            },
+          });
+          const ingested = await ingestProviderNativeArtifacts({
+            artifacts: result.artifacts,
+            profileId: String(options.profile ?? row.profileId),
+            conversationId: String(row.conversationId),
+            canonicalUrl: conversationUrl,
+          });
+          if (!ingested) throw new Error("capture returned no paired provider artifacts");
+          ledger.recordWatchAttempt(String(row.watchId), { observationId: ingested.observationId });
+          output.push({
+            watchId: row.watchId,
+            status: "captured",
+            revisionId: ingested.revisionId,
+            deduplicated: ingested.deduplicated,
+          });
+        } catch (error) {
+          const failure = ledger.recordFailedObservation({
+            provider: "chatgpt",
+            profileId: String(options.profile ?? row.profileId),
+            conversationId: String(row.conversationId),
+            canonicalUrl: conversationUrl,
+            status: "failed",
+            errorCode: "capture-failed",
+            errorMessage: error instanceof Error ? error.message : String(error),
+          });
+          ledger.recordWatchAttempt(String(row.watchId), {
+            observationId: failure.observationId,
+            errorCode: "capture-failed",
+          });
+          output.push({
+            watchId: row.watchId,
+            status: "failed",
+            observationId: failure.observationId,
+            warning: ledgerWarning(error).code,
+          });
+        }
+      }
+      console.log(JSON.stringify({ captureOnly: true, submissions: 0, results: output }));
+    } finally {
+      ledger.close();
+    }
   });
 
 const remoteCommand = program
