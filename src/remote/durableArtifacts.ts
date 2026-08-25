@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, rename, rm, stat } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { BrowserRunResult } from "../browserMode.js";
+import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
 import type { SessionArtifact } from "../sessionManager.js";
 import type { RemoteArtifactDescriptor } from "./types.js";
 import { MAX_REMOTE_ARTIFACT_BYTES, sanitizeRemotePublicValue } from "./types.js";
@@ -140,6 +141,118 @@ export async function resolveDurableArtifact(params: {
       descriptor.artifactId + "-" + descriptor.filename,
     ),
   };
+}
+
+/**
+ * Digests the public descriptor manifest in a stable form that a remote
+ * verifier can reproduce without access to the host-only artifact manifest.
+ */
+export function digestDurableArtifactDescriptors(
+  descriptors: readonly RemoteArtifactDescriptor[],
+): string {
+  const canonical = [...descriptors]
+    .sort((left, right) =>
+      left.artifactId < right.artifactId ? -1 : left.artifactId > right.artifactId ? 1 : 0,
+    )
+    .map((descriptor) => ({
+      artifactId: descriptor.artifactId,
+      runId: descriptor.runId,
+      kind: descriptor.kind,
+      filename: descriptor.filename,
+      ...(descriptor.mimeType ? { mimeType: descriptor.mimeType } : {}),
+      byteSize: descriptor.byteSize,
+      sha256: descriptor.sha256,
+      ...(descriptor.validation
+        ? {
+            validation: {
+              type: descriptor.validation.type,
+              ok: descriptor.validation.ok,
+              ...(descriptor.validation.error ? { error: descriptor.validation.error } : {}),
+            },
+          }
+        : {}),
+      sourceUrlKind: descriptor.sourceUrlKind,
+      transferStatus: descriptor.transferStatus,
+    }));
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+/**
+ * Requires the three proof-grade provider capture artifacts and verifies that
+ * the evidence document binds their copied bytes to the granted conversation.
+ */
+export async function verifyProviderNativeCaptureArtifacts(params: {
+  queueRoot: string;
+  runId: string;
+  descriptors: readonly RemoteArtifactDescriptor[];
+  conversationId: string;
+  conversationUrl: string;
+}): Promise<string> {
+  const required = {
+    raw: "provider-native-conversation-raw",
+    independent: "provider-native-conversation-independent",
+    evidence: "provider-native-conversation-evidence",
+  } as const;
+  const findExactlyOne = (filename: string): RemoteArtifactDescriptor => {
+    const matches = params.descriptors.filter((descriptor) => descriptor.filename === filename);
+    if (matches.length !== 1) throw new Error("maintenance capture artifact set is incomplete");
+    const descriptor = matches[0]!;
+    if (
+      descriptor.runId !== params.runId ||
+      descriptor.transferStatus !== "ready" ||
+      descriptor.validation?.ok !== true ||
+      descriptor.byteSize <= 0 ||
+      !/^[a-f0-9]{64}$/.test(descriptor.sha256)
+    )
+      throw new Error("maintenance capture artifact descriptor is invalid");
+    return descriptor;
+  };
+  const raw = findExactlyOne(required.raw);
+  const independent = findExactlyOne(required.independent);
+  const evidence = findExactlyOne(required.evidence);
+  const readDescriptor = async (descriptor: RemoteArtifactDescriptor): Promise<Buffer> => {
+    const resolved = await resolveDurableArtifact({
+      queueRoot: params.queueRoot,
+      runId: params.runId,
+      artifactId: descriptor.artifactId,
+    });
+    return await readFile(resolved.filePath);
+  };
+  const [rawBytes, independentBytes, evidenceBytes] = await Promise.all([
+    readDescriptor(raw),
+    readDescriptor(independent),
+    readDescriptor(evidence),
+  ]);
+  try {
+    JSON.parse(rawBytes.toString("utf8"));
+    JSON.parse(independentBytes.toString("utf8"));
+  } catch {
+    throw new Error("maintenance capture provider documents are not valid JSON");
+  }
+  let document: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(evidenceBytes.toString("utf8")) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+    document = parsed as Record<string, unknown>;
+  } catch {
+    throw new Error("maintenance capture evidence is not valid JSON");
+  }
+  const materialized = document.materialized_document as Record<string, unknown> | undefined;
+  const independentlyFetched = document.independent_document as Record<string, unknown> | undefined;
+  if (
+    document.schema !== "oracle.provider-native-capture-evidence/v1" ||
+    document.conversation_id !== params.conversationId ||
+    typeof document.chatgpt_url !== "string" ||
+    extractStableConversationIdFromUrl(document.chatgpt_url) !== params.conversationId ||
+    materialized?.sha256 !== raw.sha256 ||
+    materialized?.bytes !== raw.byteSize ||
+    independentlyFetched?.sha256 !== independent.sha256 ||
+    independentlyFetched?.bytes !== independent.byteSize ||
+    !Array.isArray(document.per_turn) ||
+    document.per_turn.length === 0
+  )
+    throw new Error("maintenance capture evidence does not bind the granted conversation");
+  return digestDurableArtifactDescriptors(params.descriptors);
 }
 
 function localArtifacts(result: BrowserRunResult): SessionArtifact[] {

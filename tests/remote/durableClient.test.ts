@@ -576,6 +576,61 @@ describe("durable remote client receipts", () => {
     }
   });
 
+  it("accepts exact maintenance audit events and rejects malformed evidence", async () => {
+    const validEvents = [
+      {
+        seq: 0,
+        event: {
+          type: "maintenance-capture-authorized",
+          grantId: "grant-1",
+          drainId: "drain-1",
+          conversationId: "conversation-1",
+        },
+      },
+      {
+        seq: 1,
+        event: {
+          type: "maintenance-capture-verified",
+          grantId: "grant-1",
+          drainId: "drain-1",
+          conversationId: "conversation-1",
+          submissionAttempted: false,
+          promptSubmitted: false,
+          artifactCount: 3,
+          artifactManifestSha256: "a".repeat(64),
+        },
+      },
+    ];
+    let malformed = false;
+    const server = http.createServer((_req, res) => {
+      res.end(
+        JSON.stringify({
+          events: malformed
+            ? [
+                {
+                  ...validEvents[1],
+                  event: { ...validEvents[1]!.event, promptSubmitted: true },
+                },
+              ]
+            : validEvents,
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+    try {
+      await expect(getDurableRemoteRunEvents(`127.0.0.1:${port}`, "r")).resolves.toEqual(
+        validEvents,
+      );
+      malformed = true;
+      await expect(getDurableRemoteRunEvents(`127.0.0.1:${port}`, "r")).rejects.toThrow(
+        /malformed or nonmonotonic/,
+      );
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("reuses the idempotency key when the accepted POST response is destroyed", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "oracle-client-"));
     setOracleHomeDirOverrideForTest(home);
