@@ -97,6 +97,7 @@ export async function createRemoteServer(
   const runBrowser = deps.runBrowser ?? runBrowserMode;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
+  const suppliedToken = options.token !== undefined;
   const authToken = options.token ?? randomBytes(16).toString("hex");
   const startedAt = Date.now();
   const verbose = process.argv.includes("--verbose") || process.env.ORACLE_SERVE_VERBOSE === "1";
@@ -378,7 +379,11 @@ export async function createRemoteServer(
   const extras = reachable.slice(1);
   const also = extras.length ? `, also [${extras.join(", ")}]` : "";
   logger(color(chalk.cyanBright.bold, `Listening at ${primary}${also}`));
-  logger(color(chalk.yellowBright, `Access token: ${authToken}`));
+  logger(
+    suppliedToken
+      ? "Access token supplied by caller."
+      : color(chalk.yellowBright, `Access token: ${authToken}`),
+  );
   logger("Leave this terminal running; press Ctrl+C to stop oracle serve.");
 
   return {

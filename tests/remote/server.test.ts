@@ -642,6 +642,42 @@ describe("client browser-config allowlist", () => {
 });
 
 describe("advertised addresses", () => {
+  test.skipIf(!CAN_LISTEN_LOCALHOST)("does not log a caller-supplied access token", async () => {
+    const suppliedToken = "sentinel-supplied-bridge-token";
+    const lines: string[] = [];
+    const server = await createRemoteServer(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        token: suppliedToken,
+        logger: (message: string) => lines.push(message),
+      },
+      {
+        runBrowser: async () => ({
+          answerText: "",
+          answerMarkdown: "",
+          tookMs: 0,
+          answerTokens: 0,
+          answerChars: 0,
+        }),
+      },
+    );
+
+    try {
+      const health = await httpGetJson({
+        hostname: "127.0.0.1",
+        port: server.port,
+        path: "/health",
+        token: suppliedToken,
+      });
+      expect(health.statusCode).toBe(200);
+      expect(lines.join("\n")).not.toContain(suppliedToken);
+      expect(lines).toContain("Access token supplied by caller.");
+    } finally {
+      await server.close();
+    }
+  });
+
   test.skipIf(!CAN_LISTEN_LOCALHOST)("a loopback bind advertises only loopback", async () => {
     // The banner is how an operator decides whether this port needs a tunnel or
     // a firewall rule. Listing LAN and tailnet addresses for a service bound to
