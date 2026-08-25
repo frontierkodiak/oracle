@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import http from "node:http";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createRemoteServer } from "../../src/remote/server.js";
@@ -83,5 +83,43 @@ describe("durable remote server admission", () => {
     const canceled = await call(server.port, "POST", `/v1/runs/${accepted[4]?.json.id}/cancel`);
     expect(canceled.status).toBe(200);
     expect(canceled.json.state).toBe("canceled");
+  });
+
+  it("removes the legacy endpoint without invoking the browser", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-legacy-server-"));
+    let calls = 0;
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      { runBrowser: async () => { calls += 1; throw new Error("must not run"); } },
+    );
+    const response = await call(server.port, "POST", "/runs", payload("legacy"), "legacy-key");
+    expect(response.status).toBe(410);
+    expect(calls).toBe(0);
+    expect(await readdir(path.join(home, "remote-queue", "runs"))).toEqual([]);
+  });
+
+  it("rejects malformed durable payloads before creating run residue", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-malformed-server-"));
+    let calls = 0;
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      { runBrowser: async () => { calls += 1; throw new Error("must not run"); } },
+    );
+    const malformed = [
+      [payload("unknown"), { "x-unknown": true }],
+      [{ ...payload("negative"), browserConfig: { timeoutMs: -1 } }, undefined],
+      [{ ...payload("nonfinite"), browserConfig: { timeoutMs: null } }, undefined],
+      [{ ...payload("base64"), attachments: [{ fileName: "a", displayPath: "a", sizeBytes: 2, contentBase64: "YQ==" }] }, undefined],
+      [{ ...payload("aggregate"), attachments: Array.from({ length: 129 }, () => ({ fileName: "a", displayPath: "a", sizeBytes: 0, contentBase64: "" })) }, undefined],
+    ] as const;
+    for (const [body, extra] of malformed) {
+      const request = extra ? { ...(body as any), ...extra } : body;
+      const response = await call(server.port, "POST", "/v1/runs", request, `bad-${Math.random()}`);
+      expect(response.status).toBe(400);
+    }
+    const oversized = await call(server.port, "POST", "/v1/runs", payload("oversized"), "k".repeat(513));
+    expect(oversized.status).toBe(400);
+    expect(calls).toBe(0);
+    expect(await readdir(path.join(home, "remote-queue", "runs"))).toEqual([]);
   });
 });
