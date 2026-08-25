@@ -27,6 +27,7 @@ import { getCookies, type Cookie } from "@steipete/sweet-cookie";
 import { CHATGPT_URL } from "../browser/constants.js";
 import { getCliVersion } from "../version.js";
 import { getOracleHomeDir } from "../oracleHome.js";
+import { asOracleUserError } from "../oracle/errors.js";
 import {
   cleanupStaleProfileState,
   readDevToolsPort,
@@ -283,7 +284,7 @@ export async function createRemoteServer(
           const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: hostConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId, followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser) });
           durableQueue.transition(id, "completed", "terminal", { result, elapsedMs: Date.now() - started });
         } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
+          const message = formatDurableFailure(error);
           durableQueue.transition(id, controller.signal.aborted ? "canceled" : "failed", "terminal", { error: message, elapsedMs: Date.now() - started });
         } finally { durableControllers.delete(id); durableWorkers -= 1; void pumpDurableQueue(); }
       })();
@@ -1038,6 +1039,14 @@ function normalizeRemotePayload(payload: RemoteRunPayload): void {
     payload.browserConfig.desiredModel = undefined; payload.browserConfig.modelStrategy = undefined;
     payload.browserConfig.thinkingTime = undefined; payload.browserConfig.researchMode = undefined;
   }
+}
+
+function formatDurableFailure(error: unknown): string {
+  const oracleError = asOracleUserError(error);
+  if (!oracleError) return error instanceof Error ? error.message : String(error);
+  const details = oracleError.details ?? {};
+  const uiWarning = details.uiWarning;
+  return JSON.stringify({ message: oracleError.message, category: oracleError.category, stage: details.stage, code: details.code, uiWarning });
 }
 
 /**
