@@ -51,6 +51,7 @@ export interface DurableWatchOptions {
   reconnectDelayMs?: number;
   pollMs?: number;
   onSnapshot?: (snapshot: DurableRunSnapshot) => void;
+  onEvent?: (event: unknown) => void;
 }
 export type DurableWatchOutcome = { snapshot: DurableRunSnapshot; detached: boolean };
 export interface QueueStatus {
@@ -225,7 +226,7 @@ export async function watchDurableRemoteRun(
     if (o.signal?.aborted) throw new Error("observer aborted");
     try {
       const events = await getDurableRemoteRunEvents(host, id, after, o.token);
-      for (const e of events) after = Math.max(after, e.seq);
+      for (const e of events) { after = Math.max(after, e.seq); o.onEvent?.(e.event); }
       const s = await getDurableRemoteRun(host, id, o.token);
       o.onSnapshot?.(s);
       if (TERMINAL.has(s.state)) return { snapshot: s, detached };
@@ -331,6 +332,7 @@ export function createRemoteBrowserExecutor({
           if (hint && options.runtimeHintCb)
             void options.runtimeHintCb(hint, (hint as any).modelSelection);
         },
+        onEvent: (event) => { if (event && typeof event === "object" && (event as any).type === "log") options.log?.(String((event as any).message ?? "")); },
       }); } catch (error) { if (options.signal?.aborted) throw new Error("Remote browser run cancelled: the caller aborted."); throw error; }
       if (w.snapshot.state === "completed" && w.snapshot.result) {
         const raw = [

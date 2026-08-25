@@ -292,6 +292,11 @@ export class DurableQueueStore {
         .all(id, after) as Row[]
     ).map((r) => ({ seq: Number(r.seq), event: JSON.parse(String(r.event)) }));
   }
+  appendEvent(id: string, event: unknown): void {
+    const t = this.now();
+    this.db.exec("BEGIN IMMEDIATE");
+    try { this.append(id, t, event); this.db.exec("COMMIT"); } catch (e) { this.db.exec("ROLLBACK"); throw e; }
+  }
   cancel(id: string): DurableRunSnapshot | undefined {
     const r = this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Row | undefined;
     if (!r) return;

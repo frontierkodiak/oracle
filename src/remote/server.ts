@@ -281,7 +281,7 @@ export async function createRemoteServer(
           const hostConfig = { ...payload.browserConfig, inlineCookies: null, inlineCookiesSource: null, cookieSync: options.cookieSyncDefault === true, ...(options.manualLoginDefault ? { manualLogin: true, manualLoginProfileDir: options.manualLoginProfileDir, keepBrowser: true } : {}) };
           const sessionId = payload.options?.sessionId ? `${String(payload.options.sessionId)}-${id.slice(0, 8)}` : id;
           const automationLogger: BrowserLogger = ((message?: string) => {
-            if (typeof message === "string") logger(`[run ${id}] ${message}`);
+            if (typeof message === "string") { logger(`[run ${id}] ${message}`); durableQueue.appendEvent(id, { type: "log", message }); }
           }) as BrowserLogger;
           automationLogger.verbose = Boolean(payload.options?.verbose);
           const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: hostConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId, followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser), runtimeHintCb: async (hint, modelSelection) => {
