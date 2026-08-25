@@ -1,0 +1,216 @@
+{
+  "schema": "oracle.downstream-patch-policy/v2",
+  "trustedUpstream": {
+    "repository": "https://github.com/steipete/oracle.git",
+    "mainRef": "refs/heads/main",
+    "identityMatching": "authenticated-github-account-and-exact-git-identity",
+    "trustedReleaseIdentity": {
+      "name": "Peter Steinberger",
+      "email": "steipete@gmail.com",
+      "githubLogin": "steipete"
+    },
+    "candidateClasses": [
+      {
+        "kind": "tagged-release",
+        "requiresReachableFromMain": true,
+        "requiresTrustedTagger": true,
+        "requiresVerifiedSignature": true
+      },
+      {
+        "kind": "main-commit",
+        "requiresReachableFromMain": true,
+        "requiresTrustedAuthor": true,
+        "requiresTrustedCommitter": true,
+        "requiresVerifiedSignature": true
+      }
+    ],
+    "excludedCandidateClasses": [
+      "open-pull-request",
+      "unmerged-branch",
+      "third-party-authored-commit",
+      "third-party-committed-commit"
+    ]
+  },
+  "downstreamLineage": {
+    "upstreamBaseCommit": "083bba7e61f487ad3d99b42039d9f603f61dc4ff",
+    "lastReviewedRuntimeHeadCommit": "1f82a2d082a5a1c49623a0f5f407b471b6c87cc8",
+    "firstParentCommits": [
+      "7d7c41e6a8332fae13118519d93fc06ab1135463",
+      "020c111f8cb3c662072e53100b9b6247a967edcb",
+      "26c3a32ff4d78eef74ff15b341f5ef481324c567",
+      "404d8a744bfd22893a898c9657d906f5aa94b6bb",
+      "abc2f08ba5a220fdd9bdd70058548816bd320cf3",
+      "12f3b3c31516fd8c81d97eead9b33be4d2e0eaa3",
+      "eac19ac8f413c7d6127345b8b575b36cff5eea02",
+      "ca620e80438d178e1fb7c29dea524a09c452c297",
+      "93295dd1cf40cf5225eb8c2a010d4e4f8e7476b9",
+      "7e1fac21c8d46c542b11a65a707ee55ab12a5133",
+      "2703e4af501b3da3c786da77cf213affa4e543b4",
+      "f4b163c180066542ca941cc36d73097e1bb8b8d3",
+      "039371da0865f4b6072e88a4d60e36ac8cb8596f",
+      "f35985fa9c7ad83c168267e9012f1aa6da2e4512",
+      "229c35bd45bbdb62f6242c3983180c1affff76d3",
+      "dd76fef88f6408675e77d44a793cb10055021c8a",
+      "0a7a50cc0caa5dd3a9d6100ab24e1ad5af4b3cee",
+      "d9466be0f1e98cbede5c3157637e19eedd2d93d1",
+      "0d468b2fbd726c3a69c0cb0af94d5890949edf24",
+      "a5784e076fe56500290d9749d49f6c6ae652a3b2",
+      "92acdbdb11ce47e53d07c2a17be36802770788f9",
+      "de00da4bd5ca7c50a92dc97560b02c69fb10fc0d",
+      "7b89cfa022e55383b8d18533c1fc85b8212eac60",
+      "1f82a2d082a5a1c49623a0f5f407b471b6c87cc8"
+    ]
+  },
+  "semanticPatchFamilies": [
+    {
+      "id": "selection-evidence",
+      "firstParentCommits": [
+        "7d7c41e6a8332fae13118519d93fc06ab1135463",
+        "020c111f8cb3c662072e53100b9b6247a967edcb"
+      ],
+      "affectedPaths": ["src/browser", "src/remote/server.ts"],
+      "verificationInvariants": [
+        "Requested model and effort retain picker evidence.",
+        "Run identity and selection evidence survive remote bridging."
+      ],
+      "verificationTests": ["tests/browser/thinkingTime.test.ts", "tests/remote/server.test.ts"]
+    },
+    {
+      "id": "remote-policy-and-token-safety",
+      "firstParentCommits": [
+        "26c3a32ff4d78eef74ff15b341f5ef481324c567",
+        "eac19ac8f413c7d6127345b8b575b36cff5eea02",
+        "d9466be0f1e98cbede5c3157637e19eedd2d93d1"
+      ],
+      "affectedPaths": ["src/remote", "src/cli/bridge/host.ts"],
+      "verificationInvariants": [
+        "Remote clients can supply only conversation-scoped fields.",
+        "Service tokens never enter results, errors, or logs.",
+        "Advertised remote addresses are reachable by their intended clients."
+      ],
+      "verificationTests": ["tests/remote/server.test.ts", "tests/remote/healthHandshake.test.ts"]
+    },
+    {
+      "id": "profile-lease-and-provider-capture",
+      "firstParentCommits": [
+        "404d8a744bfd22893a898c9657d906f5aa94b6bb",
+        "abc2f08ba5a220fdd9bdd70058548816bd320cf3",
+        "12f3b3c31516fd8c81d97eead9b33be4d2e0eaa3",
+        "93295dd1cf40cf5225eb8c2a010d4e4f8e7476b9",
+        "f35985fa9c7ad83c168267e9012f1aa6da2e4512",
+        "dd76fef88f6408675e77d44a793cb10055021c8a",
+        "0a7a50cc0caa5dd3a9d6100ab24e1ad5af4b3cee"
+      ],
+      "affectedPaths": ["src/browser", "src/cli/browserConfig.ts", "bin/oracle-cli.ts"],
+      "verificationInvariants": [
+        "Uncertain shared-profile leases fail closed.",
+        "Provider-native material and independently derived evidence remain distinct.",
+        "Capture-only observations never submit a prompt.",
+        "Attachment evidence describes the material sent with each turn."
+      ],
+      "verificationTests": [
+        "tests/browser/tabLeaseRegistry.test.ts",
+        "tests/browser/chatgptConversation.test.ts",
+        "tests/browser/index.test.ts"
+      ]
+    },
+    {
+      "id": "bounded-admission-cancellation-and-throttle",
+      "firstParentCommits": [
+        "ca620e80438d178e1fb7c29dea524a09c452c297",
+        "7e1fac21c8d46c542b11a65a707ee55ab12a5133",
+        "2703e4af501b3da3c786da77cf213affa4e543b4",
+        "f4b163c180066542ca941cc36d73097e1bb8b8d3",
+        "039371da0865f4b6072e88a4d60e36ac8cb8596f",
+        "229c35bd45bbdb62f6242c3983180c1affff76d3"
+      ],
+      "affectedPaths": ["src/remote", "src/browser/chatgptThrottle.ts", "src/oracle/errors.ts"],
+      "verificationInvariants": [
+        "Admission is bounded and first-in-first-out.",
+        "Cancellation releases capacity exactly once across the bridge.",
+        "Provider throttling remains a typed retryable condition."
+      ],
+      "verificationTests": [
+        "tests/remote/server.test.ts",
+        "tests/browser/chatgptThrottle.test.ts",
+        "tests/remote/durableServer.integration.test.ts"
+      ]
+    },
+    {
+      "id": "remote-health-durability-and-cli-inheritance",
+      "firstParentCommits": [
+        "0d468b2fbd726c3a69c0cb0af94d5890949edf24",
+        "a5784e076fe56500290d9749d49f6c6ae652a3b2",
+        "92acdbdb11ce47e53d07c2a17be36802770788f9",
+        "de00da4bd5ca7c50a92dc97560b02c69fb10fc0d",
+        "7b89cfa022e55383b8d18533c1fc85b8212eac60"
+      ],
+      "affectedPaths": ["src/remote", "bin/oracle-cli.ts"],
+      "verificationInvariants": [
+        "Incompatible remote hosts are rejected before submission.",
+        "Accepted runs survive disconnects and service recovery.",
+        "Inherited options and explicit submission preserve request identity."
+      ],
+      "verificationTests": [
+        "tests/remote/healthHandshake.test.ts",
+        "tests/remote/durableQueue.test.ts",
+        "tests/remote/durableClient.test.ts",
+        "tests/cli/remoteCommands.test.ts"
+      ]
+    },
+    {
+      "id": "provider-faithful-transcript-ledger",
+      "firstParentCommits": ["1f82a2d082a5a1c49623a0f5f407b471b6c87cc8"],
+      "affectedPaths": [
+        "src/transcriptLedger.ts",
+        "src/browser/chatgptConversation.ts",
+        "src/browser/index.ts",
+        "bin/oracle-cli.ts"
+      ],
+      "verificationInvariants": [
+        "Provider JSON remains the authoritative immutable source object.",
+        "Independent capture evidence is bound to exact bytes and normalized turns.",
+        "Capture limits bound untrusted document depth, count, and size.",
+        "Failed observations never imply conversation deletion.",
+        "Ledger synchronization uses capture-only observation and never submits."
+      ],
+      "verificationTests": [
+        "tests/transcriptLedger.test.ts",
+        "tests/browser/chatgptConversation.test.ts",
+        "tests/browser/index.test.ts"
+      ]
+    }
+  ],
+  "advertisedCapabilities": [
+    {
+      "id": "selection-evidence",
+      "description": "Remote results retain explicit model and effort selection evidence.",
+      "verifiedByFamilies": ["selection-evidence"]
+    },
+    {
+      "id": "remote-policy-boundary",
+      "description": "Authenticated remote clients remain inside the conversation-scoped policy boundary.",
+      "verifiedByFamilies": ["remote-policy-and-token-safety"]
+    },
+    {
+      "id": "provider-native-capture-only",
+      "description": "Existing ChatGPT conversations can be observed without submitting a prompt.",
+      "verifiedByFamilies": ["profile-lease-and-provider-capture"]
+    },
+    {
+      "id": "bounded-remote-admission",
+      "description": "Remote work has bounded admission, cancellation, and retryable throttle semantics.",
+      "verifiedByFamilies": ["bounded-admission-cancellation-and-throttle"]
+    },
+    {
+      "id": "durable-remote-recovery",
+      "description": "Accepted remote work and request identity survive disconnects and recovery.",
+      "verifiedByFamilies": ["remote-health-durability-and-cli-inheritance"]
+    },
+    {
+      "id": "provider-faithful-transcript-ledger",
+      "description": "Private transcript history preserves authoritative provider bytes and independent evidence.",
+      "verifiedByFamilies": ["provider-faithful-transcript-ledger"]
+    }
+  ]
+}
