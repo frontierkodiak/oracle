@@ -18,23 +18,62 @@ import {
 } from "../browser/artifacts.js";
 import {
   MAX_REMOTE_ARTIFACT_BYTES,
+  ARTIFACT_TRANSFER_FEATURE_ID,
   type RemoteArtifactDescriptor,
   type RemoteRunPayload,
   type RemoteRunEvent,
   type RemoteAttachmentPayload,
+  type RemoteCapabilityRequirement,
 } from "./types.js";
 import { parseHostPort } from "../bridge/connection.js";
+import { checkRemoteHealth } from "./health.js";
 
-interface RemoteExecutorOptions {
+export interface RemoteExecutorOptions {
   host: string;
   token?: string;
+  requiredCapabilities?: RemoteCapabilityRequirement[];
 }
 
-export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptions) {
+export function createRemoteBrowserExecutor({
+  host,
+  token,
+  requiredCapabilities,
+}: RemoteExecutorOptions) {
+  let healthPromise: ReturnType<typeof checkRemoteHealth> | undefined;
+  const ensureHealth = async (required: RemoteCapabilityRequirement[]) => {
+    const health = await (healthPromise ??= checkRemoteHealth({ host, token }));
+    if (!health.ok || !health.runtime || !health.manifest) {
+      const detail = health.error ?? "remote health handshake failed";
+      if (!health.statusCode && /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT/.test(detail)) {
+        throw new Error(`Could not reach the research bridge at ${host} (${detail}).`, {
+          cause: new Error(detail),
+        });
+      }
+      throw new Error(`${detail}; upgrade oracle on the host and retry`);
+    }
+    const features = new Set(
+      health.manifest.features.map((feature) => `${feature.id}@${feature.version}`),
+    );
+    for (const capability of required)
+      if (
+        !features.has(`${capability.id}@${capability.version}`) ||
+        (capability.id === ARTIFACT_TRANSFER_FEATURE_ID &&
+          capability.version === 1 &&
+          !health.capabilities?.artifactTransfer)
+      )
+        throw new Error(
+          `Remote host does not support required capability ${capability.id} v${capability.version}`,
+        );
+    return health;
+  };
   // Return a drop-in replacement for runBrowserMode so the browser session runner can stay unchanged.
   return async function remoteBrowserExecutor(
     options: BrowserRunOptions,
   ): Promise<BrowserRunResult> {
+    if (options.signal?.aborted)
+      throw new Error("Remote browser run cancelled before the request was sent.");
+    await ensureHealth(requiredCapabilities ?? []);
+    if (options.signal?.aborted) throw new Error("Remote browser run aborted before submission.");
     const payload: RemoteRunPayload = {
       prompt: options.prompt,
       attachments: await serializeAttachments(options.attachments ?? []),
@@ -54,6 +93,7 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
     };
 
     const body = Buffer.from(JSON.stringify(payload));
+    if (options.signal?.aborted) throw new Error("Remote browser run aborted before submission.");
     const { hostname, port } = parseHost(host);
 
     // `BrowserRunOptions.signal` has to mean the same thing on both sides of the

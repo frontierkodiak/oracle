@@ -4,6 +4,24 @@ import type { BrowserAttachment } from "../browser/types.js";
 import type { SessionArtifactValidation } from "../sessionManager.js";
 
 export const MAX_REMOTE_ARTIFACT_BYTES = 512 * 1024 * 1024;
+export const REMOTE_HEALTH_SCHEMA_VERSION = 1;
+export const ARTIFACT_TRANSFER_FEATURE_ID = "oracle.remote.artifact-transfer";
+
+export interface RemoteCapabilityFeature {
+  id: string;
+  version: number;
+  limits?: Record<string, unknown>;
+}
+
+export interface RemoteCapabilityRequirement {
+  id: string;
+  version: number;
+}
+
+export interface RemoteCapabilityManifest {
+  schemaVersion: 1;
+  features: RemoteCapabilityFeature[];
+}
 
 export interface RemoteAttachmentPayload {
   fileName: string;
