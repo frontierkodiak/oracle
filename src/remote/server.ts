@@ -120,111 +120,6 @@ async function findAvailablePort(): Promise<number> {
   });
 }
 
-/**
- * Admission control for the shared browser profile.
- *
- * The service used to be single-flight: a second caller got HTTP 409 and was
- * expected to retry. That is the wrong shape for research runs, which are long —
- * a Pro answer can take ten minutes — and the wait is nearly all of it. Callers
- * can share one browser as long as only one of them is driving the composer at a
- * time, and the profile run lock already enforces that. What was missing was a
- * way to let several of them wait for their answers at once, and a place for the
- * next caller to wait rather than fail.
- *
- * So: a bounded number of concurrent runs, and a FIFO queue for the rest.
- * Refusal is reserved for the case where even the queue is full, because a
- * caller that is told "later" can wait, while a caller that is told "no" has to
- * invent a retry policy.
- *
- * Cancellation matters as much as admission here: a client that disconnects
- * while queued must give up its place, and one that disconnects while running
- * must release both its slot and its browser tab. Otherwise a long-lived service
- * leaks capacity until it stops accepting work entirely.
- */
-export class RunSlots {
-  private active = 0;
-  private readonly waiting: {
-    resolve: (release: () => void) => void;
-    reject: (error: Error) => void;
-    onAbort: () => void;
-  }[] = [];
-
-  constructor(
-    private readonly maxConcurrent: number,
-    private readonly maxQueued: number,
-  ) {}
-
-  get activeCount(): number {
-    return this.active;
-  }
-
-  get queuedCount(): number {
-    return this.waiting.length;
-  }
-
-  get capacity(): number {
-    return this.maxConcurrent;
-  }
-
-  /** True when even the queue is full, i.e. the only honest answer is "no". */
-  get isSaturated(): boolean {
-    return this.active >= this.maxConcurrent && this.waiting.length >= this.maxQueued;
-  }
-
-  /** Position a caller would take in the queue, 1-based; 0 means it runs now. */
-  positionFor(): number {
-    return this.active < this.maxConcurrent ? 0 : this.waiting.length + 1;
-  }
-
-  acquire(signal?: {
-    aborted: boolean;
-    addEventListener: (type: "abort", listener: () => void) => void;
-    removeEventListener: (type: "abort", listener: () => void) => void;
-  }): Promise<() => void> {
-    if (signal?.aborted) {
-      return Promise.reject(new Error("cancelled before a slot was available"));
-    }
-    if (this.active < this.maxConcurrent) {
-      this.active += 1;
-      return Promise.resolve(this.makeRelease());
-    }
-    return new Promise((resolve, reject) => {
-      const entry = {
-        resolve,
-        reject,
-        onAbort: () => {
-          const index = this.waiting.indexOf(entry);
-          if (index >= 0) {
-            this.waiting.splice(index, 1);
-          }
-          signal?.removeEventListener("abort", entry.onAbort);
-          reject(new Error("cancelled while waiting for a slot"));
-        },
-      };
-      this.waiting.push(entry);
-      signal?.addEventListener("abort", entry.onAbort);
-    });
-  }
-
-  private makeRelease(): () => void {
-    let released = false;
-    return () => {
-      if (released) {
-        return;
-      }
-      released = true;
-      const next = this.waiting.shift();
-      if (next) {
-        // The slot passes straight to the next caller rather than being freed and
-        // re-taken, so a burst of arrivals cannot jump the queue.
-        next.resolve(this.makeRelease());
-        return;
-      }
-      this.active -= 1;
-    };
-  }
-}
-
 export async function createRemoteServer(
   options: RemoteServerOptions = {},
   deps: RemoteServerDeps = {},
@@ -246,15 +141,6 @@ export async function createRemoteServer(
   const color = process.stdout.isTTY
     ? (formatter: (msg: string) => string, msg: string) => formatter(msg)
     : (_formatter: (msg: string) => string, msg: string) => msg;
-  // Admission control. The browser profile is shared, so concurrency is bounded;
-  // the profile run lock inside the browser stack keeps composer interaction
-  // serialized underneath this.
-  // Admission is bounded by the browser's own cap, not the other way round. The
-  // tab cap is the physical constraint on a shared profile; a service that
-  // admitted more than it would simply move the waiting from the queue, where it
-  // is visible, into the lease loop, where it is not. Overwriting the browser
-  // cap to match would be worse still — it silently discards an operator's lower
-  // choice, which is exactly what someone avoiding account throttling would set.
   const browserTabCap = normalizeMaxConcurrentTabs(
     (await loadUserConfig().catch(() => null))?.config.browser?.maxConcurrentTabs,
   );
@@ -265,7 +151,6 @@ export async function createRemoteServer(
       `[serve] Admitting ${effectiveConcurrency} concurrent run(s): the shared-profile tab cap (${browserTabCap}) is lower than the requested ${requestedConcurrency}.`,
     );
   }
-  const slots = new RunSlots(effectiveConcurrency, Math.max(0, options.maxQueuedRuns ?? 8));
   const artifactRegistry = new Map<string, RegisteredRemoteArtifact>();
   const durableQueue = await DurableQueueStore.open({
     homeDir: options.queueHomeDir,
@@ -398,7 +283,19 @@ export async function createRemoteServer(
             });
             return;
           }
-          const modelEvidence = result.modelSelection as any;
+          // Capture-only is deliberately a non-submission operation. Keep the
+          // durable result honest even if a browser adapter accidentally returns
+          // stale selection/submission fields.
+          const durableResult =
+            payload.browserConfig.captureOnly === true
+              ? {
+                  ...result,
+                  promptSubmitted: false,
+                  modelSelection: undefined,
+                  thinkingSelection: undefined,
+                }
+              : result;
+          const modelEvidence = durableResult.modelSelection as any;
           const thinkingEvidence = result.thinkingSelection as any;
           const model = String(modelEvidence?.resolvedLabel ?? modelEvidence?.requestedModel ?? "");
           const qualifying =
@@ -409,7 +306,7 @@ export async function createRemoteServer(
             /pro/i.test(String(thinkingEvidence?.requestedLevel ?? "")) &&
             result.promptSubmitted === true;
           durableQueue.transition(id, "completed", "terminal", {
-            result: { ...durable.result, artifacts: durable.descriptors },
+            result: { ...durableResult, artifacts: durable.descriptors },
             elapsedMs: Date.now() - started,
             model,
             etaQualifying: qualifying,
@@ -612,21 +509,16 @@ export async function createRemoteServer(
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
     }
-    if (slots.isSaturated) {
-      if (verbose) {
-        logger(
-          `[serve] Saturated: refusing run from ${formatSocket(req)} (${slots.activeCount} active, ${slots.queuedCount} queued)`,
-        );
-      }
-      res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "60" });
-      res.end(JSON.stringify({ error: "queue_full" }));
-      return;
-    }
+    // This legacy handler is retained only to return the explicit 410 above.
+    // Durable admission below is the sole execution path.
+    res.writeHead(410, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "legacy_run_endpoint_removed", endpoint: "/v1/runs" }));
+    return;
     const runStartedAt = Date.now();
 
     // Read the body before taking a slot, so a malformed request cannot occupy
     // capacity that a well-formed one is waiting for.
-    let payload: RemoteRunPayload | null = null;
+    let payload = null as unknown as RemoteRunPayload;
     try {
       const body = await readRequestBody(req);
       payload = JSON.parse(body) as RemoteRunPayload;
@@ -659,34 +551,6 @@ export async function createRemoteServer(
     const onClientGone = () => controller.abort();
     res.on("close", onClientGone);
     req.on("aborted", onClientGone);
-
-    const queuePosition = slots.positionFor();
-    if (queuePosition > 0) {
-      // Sent as a `log` event on purpose: older clients ignore event types they
-      // do not know, so telling the caller it is waiting costs no compatibility.
-      res.write(
-        `${JSON.stringify({
-          type: "log",
-          message: `[serve] Waiting for a browser slot (position ${queuePosition}; ${slots.activeCount} active).`,
-        })}\n`,
-      );
-    }
-
-    let release: () => void;
-    try {
-      release = await slots.acquire(controller.signal);
-    } catch (error) {
-      res.write(
-        `${JSON.stringify({
-          type: "error",
-          message: error instanceof Error ? error.message : String(error),
-        })}\n`,
-      );
-      res.end();
-      res.off("close", onClientGone);
-      req.off("aborted", onClientGone);
-      return;
-    }
 
     const runId = randomUUID();
     logger(
@@ -721,12 +585,13 @@ export async function createRemoteServer(
         });
       }
 
-      if (payload.fallbackSubmission) {
+      const fallbackPayloadRequest = payload.fallbackSubmission;
+      if (fallbackPayloadRequest) {
         const fallbackAttachmentDir = path.join(runDir, "fallback-attachments");
         await mkdir(fallbackAttachmentDir, { recursive: true });
         const fallbackAttachments: BrowserAttachment[] = [];
-        const fallbackPayload = Array.isArray(payload.fallbackSubmission.attachments)
-          ? payload.fallbackSubmission.attachments
+        const fallbackPayload = Array.isArray(fallbackPayloadRequest!.attachments)
+          ? fallbackPayloadRequest!.attachments
           : [];
         for (const [index, attachment] of fallbackPayload.entries()) {
           const safeName = sanitizeName(attachment.fileName ?? `fallback-attachment-${index + 1}`);
@@ -739,7 +604,7 @@ export async function createRemoteServer(
           });
         }
         fallbackSubmission = {
-          prompt: payload.fallbackSubmission.prompt,
+          prompt: fallbackPayloadRequest!.prompt,
           attachments: fallbackAttachments,
         };
       }
@@ -847,13 +712,13 @@ export async function createRemoteServer(
         }`,
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const caught = error as { message?: unknown };
+      const message: string = typeof caught.message === "string" ? String(caught.message) : "remote run failed";
       sendEvent({ type: "error", message });
       logger(`[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${message}`);
     } finally {
       res.off("close", onClientGone);
       req.off("aborted", onClientGone);
-      release();
       res.end();
       try {
         await rm(runDir, { recursive: true, force: true });
@@ -1341,11 +1206,12 @@ function validateRemotePayload(payload: unknown): asserts payload is RemoteRunPa
   };
   for (const [key, type] of Object.entries(configTypes)) {
     if (p.browserConfig[key] !== undefined && typeof p.browserConfig[key] !== type) throw new Error("invalid_request");
-    if (type === "number" && p.browserConfig[key] !== undefined && !Number.isFinite(p.browserConfig[key] as number)) throw new Error("invalid_request");
+    if (type === "number" && p.browserConfig[key] !== undefined &&
+      (!Number.isFinite(p.browserConfig[key] as number) || (p.browserConfig[key] as number) < 0)) throw new Error("invalid_request");
   }
   if (!isRecord(p.options) || !exact(p.options, ["heartbeatIntervalMs", "verbose", "sessionId", "followUpPrompts"]))
     throw new Error("invalid_request");
-  if (p.options.heartbeatIntervalMs !== undefined && (!Number.isFinite(p.options.heartbeatIntervalMs as number) || typeof p.options.heartbeatIntervalMs !== "number")) throw new Error("invalid_request");
+  if (p.options.heartbeatIntervalMs !== undefined && (typeof p.options.heartbeatIntervalMs !== "number" || !Number.isFinite(p.options.heartbeatIntervalMs as number) || (p.options.heartbeatIntervalMs as number) < 0)) throw new Error("invalid_request");
   if (p.options.verbose !== undefined && typeof p.options.verbose !== "boolean") throw new Error("invalid_request");
   if (p.options.sessionId !== undefined && (typeof p.options.sessionId !== "string" || p.options.sessionId.length > 128)) throw new Error("invalid_request");
   if (p.options.followUpPrompts !== undefined && (!Array.isArray(p.options.followUpPrompts) || p.options.followUpPrompts.length > 32 || p.options.followUpPrompts.some((x) => typeof x !== "string" || x.length > 20_000_000))) throw new Error("invalid_request");

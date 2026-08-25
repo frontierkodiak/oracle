@@ -8,7 +8,6 @@ import { mkdir, mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/
 import {
   createRemoteServer,
   pickClientBrowserConfig,
-  RunSlots,
   serveRemote,
 } from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
@@ -1145,124 +1144,6 @@ describe("advertised addresses", () => {
     expect(banner).not.toMatch(/\b100\.\d+\.\d+\.\d+\b/);
     expect(banner).not.toMatch(/\b192\.168\.\d+\.\d+\b/);
     await server.close();
-  });
-});
-
-describe("run admission", () => {
-  // The required semantics, stated as tests: four conversations may be active at
-  // once, the fifth caller WAITS rather than being refused, refusal is reserved
-  // for a full queue, and giving up frees whatever the caller was holding.
-  const noSignal = undefined;
-
-  test("admits up to the limit immediately", async () => {
-    const slots = new RunSlots(4, 8);
-    const releases = await Promise.all([
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-    ]);
-    expect(slots.activeCount).toBe(4);
-    expect(slots.queuedCount).toBe(0);
-    for (const release of releases) release();
-    expect(slots.activeCount).toBe(0);
-  });
-
-  test("the caller past the limit waits instead of failing", async () => {
-    const slots = new RunSlots(4, 8);
-    const held = await Promise.all([
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-    ]);
-
-    let fifthAdmitted = false;
-    const fifth = slots.acquire(noSignal).then((release) => {
-      fifthAdmitted = true;
-      return release;
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(fifthAdmitted).toBe(false);
-    expect(slots.queuedCount).toBe(1);
-    expect(slots.positionFor()).toBe(2);
-
-    held[0]();
-    const fifthRelease = await fifth;
-    expect(fifthAdmitted).toBe(true);
-    expect(slots.activeCount).toBe(4);
-
-    fifthRelease();
-    for (const release of held.slice(1)) release();
-    expect(slots.activeCount).toBe(0);
-  });
-
-  test("the queue is FIFO", async () => {
-    const slots = new RunSlots(1, 8);
-    const first = await slots.acquire(noSignal);
-    const order: number[] = [];
-    const second = slots.acquire(noSignal).then((release) => {
-      order.push(2);
-      return release;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    const third = slots.acquire(noSignal).then((release) => {
-      order.push(3);
-      return release;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-
-    first();
-    (await second)();
-    (await third)();
-    expect(order).toEqual([2, 3]);
-  });
-
-  test("saturation is only reached when the queue is full too", async () => {
-    const slots = new RunSlots(2, 1);
-    const held = [await slots.acquire(noSignal), await slots.acquire(noSignal)];
-    expect(slots.isSaturated).toBe(false);
-    const queued = slots.acquire(noSignal);
-    expect(slots.isSaturated).toBe(true);
-    held[0]();
-    (await queued)();
-    held[1]();
-  });
-
-  test("a caller that gives up while queued frees its place", async () => {
-    // Without this a long-lived service leaks capacity to clients that walked
-    // away, until it stops accepting work at all.
-    const slots = new RunSlots(1, 8);
-    const held = await slots.acquire(noSignal);
-    const controller = new AbortController();
-    const abandoned = slots.acquire(controller.signal);
-    expect(slots.queuedCount).toBe(1);
-
-    controller.abort();
-    await expect(abandoned).rejects.toThrow(/cancelled while waiting/);
-    expect(slots.queuedCount).toBe(0);
-
-    held();
-    const next = await slots.acquire(noSignal);
-    expect(slots.activeCount).toBe(1);
-    next();
-  });
-
-  test("an already-cancelled caller never takes a slot", async () => {
-    const slots = new RunSlots(4, 8);
-    const controller = new AbortController();
-    controller.abort();
-    await expect(slots.acquire(controller.signal)).rejects.toThrow(/cancelled before/);
-    expect(slots.activeCount).toBe(0);
-  });
-
-  test("releasing twice does not hand out capacity that does not exist", async () => {
-    const slots = new RunSlots(2, 8);
-    const release = await slots.acquire(noSignal);
-    release();
-    release();
-    expect(slots.activeCount).toBe(0);
   });
 });
 
