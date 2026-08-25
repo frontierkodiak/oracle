@@ -122,6 +122,7 @@ export interface BrowserAutomationConfig {
 
 export interface BrowserRunOptions {
   prompt: string;
+  signal?: AbortSignal;
   attachments?: BrowserAttachment[];
   /**
    * Optional secondary submission to try if the initial prompt is rejected by ChatGPT

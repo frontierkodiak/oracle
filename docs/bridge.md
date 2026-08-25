@@ -9,7 +9,7 @@ Oracle’s bridge workflow lets you keep an authenticated ChatGPT session on a W
 
 ## Generated artifact transfer
 
-Bridge runs now keep the Windows browser host and Linux client separated while still returning ChatGPT-generated files, such as ZIP, CSV, PDF, wheels, and source distributions, to a cloud-readable path. The host advertises artifact-transfer support from the token-protected `GET /health` response. The Linux client uses that capability signal in `oracle bridge client --test` and `oracle bridge doctor`; older hosts remain usable for text responses, but generated files require manual copy from the Windows browser until both sides are upgraded.
+Bridge runs now keep the Windows browser host and Linux client separated while still returning ChatGPT-generated files, such as ZIP, CSV, PDF, wheels, and source distributions, to a cloud-readable path. The host advertises artifact-transfer support from the token-protected `GET /health` response. The client and host must run a handshake-compatible Oracle release and Node.js 24 or newer; this is an intentional fail-closed boundary. A legacy, malformed, unauthenticated, or unsupported health response is diagnosed as an upgrade problem and results in zero `/runs` requests.
 
 The transfer protocol is pull-based and keeps secrets local to the host:
 
@@ -20,7 +20,7 @@ The transfer protocol is pull-based and keeps secrets local to the host:
 
 Operational notes:
 
-- Run the same patched Oracle version on both Windows host and Linux client before relying on automatic file transfer. Mixed versions remain backward compatible for text-only runs.
+- Upgrade the remote host first, restart it, then upgrade the Linux client and rerun `oracle bridge client --test` (or `oracle bridge doctor`). Do not send runs during the transition: the client requires the authenticated generic `/health` envelope, runtime identity, and Node.js >=24 before any `/runs` request. Mixed-version text-only compatibility is not supported.
 - `oracle bridge doctor` reports `Artifact transfer: bridge v1` when the host supports the protocol, including the advertised maximum artifact size.
 - The default bridge transfer size limit is 512 MiB. Larger files stay on the browser host and require manual copy.
 - Session inspection prints artifact path, size, SHA-256 prefix, validation status, and transfer status so agents can verify whether the returned path is local to the Linux client.
