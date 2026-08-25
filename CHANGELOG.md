@@ -2,6 +2,10 @@
 
 ## 0.18.0 — 2026-08-14
 
+### Added
+
+- Bridge: add authenticated idle maintenance drains and one-conversation capture grants so immutable service upgrades can verify an accepted conversation without submitting a prompt. Health now binds the running Node process and CLI to the installed source commit, and releasing an idle drain revokes any unused grant.
+
 ### Changed
 
 - Browser: stop copying cookies from a live Chrome profile by default because ChatGPT token rotation can invalidate the user's interactive session. Use the persistent `--browser-manual-login` profile (recommended), inline cookies, or explicitly restore the old behavior with `--browser-cookie-sync` / `browser.cookieSync=true`. Fixes #367.
@@ -10,6 +14,7 @@
 ### Fixed
 
 - Browser: detect a disabled ChatGPT effort tier (e.g. an exhausted Pro allotment) before clicking it, and report the account's own reset notice instead of a misleading "selection unverified" failure. Thanks @enieuwy!
+
 ## 0.17.3 — 2026-08-13
 
 **Highlight:** browser-mode answers and recovery are reliable again — no more

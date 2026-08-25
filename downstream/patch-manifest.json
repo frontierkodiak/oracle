@@ -14,6 +14,8 @@
         "kind": "tagged-release",
         "requiresReachableFromMain": true,
         "requiresTrustedTagger": true,
+        "requiresTrustedAuthor": true,
+        "requiresTrustedCommitter": true,
         "requiresVerifiedSignature": true
       },
       {
@@ -33,7 +35,7 @@
   },
   "downstreamLineage": {
     "upstreamBaseCommit": "083bba7e61f487ad3d99b42039d9f603f61dc4ff",
-    "lastReviewedRuntimeHeadCommit": "1f82a2d082a5a1c49623a0f5f407b471b6c87cc8",
+    "lastReviewedRuntimeHeadCommit": "60b4919eb55723305a25288988affc9cc5236d8f",
     "firstParentCommits": [
       "7d7c41e6a8332fae13118519d93fc06ab1135463",
       "020c111f8cb3c662072e53100b9b6247a967edcb",
@@ -58,7 +60,8 @@
       "92acdbdb11ce47e53d07c2a17be36802770788f9",
       "de00da4bd5ca7c50a92dc97560b02c69fb10fc0d",
       "7b89cfa022e55383b8d18533c1fc85b8212eac60",
-      "1f82a2d082a5a1c49623a0f5f407b471b6c87cc8"
+      "1f82a2d082a5a1c49623a0f5f407b471b6c87cc8",
+      "60b4919eb55723305a25288988affc9cc5236d8f"
     ]
   },
   "semanticPatchFamilies": [
@@ -179,6 +182,24 @@
         "tests/browser/chatgptConversation.test.ts",
         "tests/browser/index.test.ts"
       ]
+    },
+    {
+      "id": "upkeep-admission-safety",
+      "firstParentCommits": ["60b4919eb55723305a25288988affc9cc5236d8f"],
+      "affectedPaths": ["src/remote"],
+      "verificationInvariants": [
+        "Maintenance admission closes atomically only when the durable queue is idle.",
+        "A one-use capture grant binds one accepted conversation and cannot submit a prompt.",
+        "Bridge-owned events, artifact descriptors, and exact artifact bytes prove capture completion.",
+        "Service health binds the running Node process and CLI to the immutable source commit.",
+        "Drain release revokes unused grants and never strands ordinary admission."
+      ],
+      "verificationTests": [
+        "tests/remote/durableQueue.test.ts",
+        "tests/remote/durableServer.integration.test.ts",
+        "tests/remote/durableClient.test.ts",
+        "tests/remote/server.test.ts"
+      ]
     }
   ],
   "advertisedCapabilities": [
@@ -211,6 +232,16 @@
       "id": "provider-faithful-transcript-ledger",
       "description": "Private transcript history preserves authoritative provider bytes and independent evidence.",
       "verifiedByFamilies": ["provider-faithful-transcript-ledger"]
+    },
+    {
+      "id": "oracle.remote.maintenance-drain",
+      "description": "An authenticated operator can fence new work only from an idle durable queue and preserve that fence across restart.",
+      "verifiedByFamilies": ["upkeep-admission-safety"]
+    },
+    {
+      "id": "oracle.remote.capture-grant",
+      "description": "A one-use bearer authorizes capture-only verification of one accepted conversation while the maintenance fence is active.",
+      "verifiedByFamilies": ["upkeep-admission-safety"]
     }
   ]
 }

@@ -119,6 +119,8 @@ describe("downstream patch policy", () => {
             kind: "tagged-release",
             requiresReachableFromMain: true,
             requiresTrustedTagger: true,
+            requiresTrustedAuthor: true,
+            requiresTrustedCommitter: true,
             requiresVerifiedSignature: true,
           },
           {
@@ -148,15 +150,15 @@ describe("downstream patch policy", () => {
     );
     expect(lineage).toMatchObject({
       upstreamBaseCommit: "083bba7e61f487ad3d99b42039d9f603f61dc4ff",
-      lastReviewedRuntimeHeadCommit: "1f82a2d082a5a1c49623a0f5f407b471b6c87cc8",
+      lastReviewedRuntimeHeadCommit: "60b4919eb55723305a25288988affc9cc5236d8f",
     });
-    expect(lineageCommits).toHaveLength(24);
+    expect(lineageCommits).toHaveLength(25);
 
     const familyValues = requireArray(manifest.semanticPatchFamilies, "semanticPatchFamilies");
     const families = familyValues.map((value, index) =>
       requireObject(value, `semanticPatchFamilies[${index}]`),
     );
-    expect(families).toHaveLength(6);
+    expect(families).toHaveLength(7);
 
     const familyCommits = families.flatMap((family, index) =>
       requireStringArray(
@@ -197,7 +199,7 @@ describe("downstream patch policy", () => {
       manifest.advertisedCapabilities,
       "advertisedCapabilities",
     );
-    expect(capabilityValues).toHaveLength(6);
+    expect(capabilityValues).toHaveLength(8);
     for (const [index, value] of capabilityValues.entries()) {
       const capability = requireObject(value, `advertisedCapabilities[${index}]`);
       const verifiedByFamilies = requireStringArray(
