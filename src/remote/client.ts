@@ -251,10 +251,12 @@ export function createRemoteBrowserExecutor({
   let healthPromise: ReturnType<typeof checkRemoteHealth> | undefined;
   const ensureHealth = async (required: RemoteCapabilityRequirement[]) => {
     const h = await (healthPromise ??= checkRemoteHealth({ host, token }));
-    if (!h.ok || !h.runtime || !h.manifest)
-      throw new Error(
-        `${h.error ?? "remote health handshake failed"}; upgrade oracle on the host and retry`,
-      );
+    if (!h.ok || !h.runtime || !h.manifest) {
+      const detail = h.error ?? "remote health handshake failed";
+      if (!h.statusCode && /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT/.test(detail))
+        throw new Error(`Could not reach the research bridge at ${host} (${detail}).`, { cause: new Error(detail) });
+      throw new Error(`${detail}; upgrade oracle on the host and retry`);
+    }
     const features = new Set(h.manifest.features.map((f) => `${f.id}@${f.version}`));
     for (const c of required)
       if (
@@ -344,11 +346,13 @@ export function createRemoteBrowserExecutor({
         );
         const transferResults = await Promise.allSettled(descriptors.map((descriptor) => transferRemoteArtifact({ host, token, descriptor, sessionId, log: options.log })));
         const transferred = transferResults.flatMap((item) => item.status === "fulfilled" ? [item.value] : []);
-        for (const failure of transferResults) if (failure.status === "rejected") options.log?.(`[remote] artifact transfer failed: ${safeMessage(failure.reason)}`);
+        const transferWarnings = transferResults.flatMap((item, index) => item.status === "rejected" ? [{ code: "remote-artifact-transfer-failed", severity: "warning" as const, message: `Artifact ${descriptors[index]?.artifactId ?? "unknown"} transfer failed: ${safeMessage(item.reason)}` }] : []);
+        for (const warning of transferWarnings) options.log?.(`[remote] ${warning.message}`);
         return {
           ...w.snapshot.result,
           savedFiles: [...(w.snapshot.result.savedFiles ?? []), ...transferred],
           artifacts: [...(w.snapshot.result.artifacts ?? []), ...transferred],
+          warnings: [...(w.snapshot.result.warnings ?? []), ...transferWarnings],
         };
       }
       throw new Error(w.snapshot.error ?? `remote durable run ended ${w.snapshot.state}`);

@@ -704,6 +704,7 @@ async function createFakeArtifactBridge({
           capabilities: {
             schemaVersion: 1,
             features: [
+              { id: "oracle.remote.durable-queue", version: 1 },
               {
                 id: "oracle.remote.artifact-transfer",
                 version: 1,
@@ -1439,6 +1440,7 @@ describe("transport failure messages", () => {
               capabilities: {
                 schemaVersion: 1,
                 features: [
+                  { id: "oracle.remote.durable-queue", version: 1 },
                   { id: "oracle.remote.artifact-transfer", version: 1, limits: { maxBytes: 1024 } },
                 ],
               },

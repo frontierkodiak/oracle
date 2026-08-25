@@ -272,7 +272,7 @@ export async function createRemoteServer(
           const runDir = durableQueue.runDirectory(id);
           const materialize = async (items: any[] | undefined, folder: string) => {
             const destination = path.join(runDir, folder); await mkdir(destination, { recursive: true, mode: 0o700 });
-            return await Promise.all((items ?? []).map(async (item, index) => { const name = sanitizeName(item.fileName ?? `attachment-${index + 1}`); const target = path.join(destination, name); await writeFile(target, Buffer.from(String(item.contentBase64 ?? ""), "base64"), { mode: 0o600 }); return { path: target, displayPath: item.displayPath, sizeBytes: item.sizeBytes }; }));
+            return await Promise.all((items ?? []).map(async (item, index) => { const base = sanitizeName(item.fileName ?? `attachment-${index + 1}`); const ext = path.extname(base); const stem = ext ? base.slice(0, -ext.length) : base; const bytes = Buffer.from(String(item.contentBase64 ?? ""), "base64"); for (let n = 0; n < 1000; n++) { const name = n === 0 ? base : `${stem}-${n}${ext}`; const target = path.join(destination, name); try { await writeFile(target, bytes, { flag: "wx", mode: 0o600 }); return { path: target, displayPath: item.displayPath, sizeBytes: item.sizeBytes }; } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; } } throw new Error("too many attachment name collisions"); }));
           };
           const attachments = await materialize(payload.attachments as any[] | undefined, "attachments");
           const fallback = payload.fallbackSubmission as any;
@@ -288,7 +288,13 @@ export async function createRemoteServer(
             const raw = hint as unknown as Record<string, unknown>;
             durableQueue.transition(id, "running", raw.promptSubmitted === true ? "prompt_submitted" : "browser_attached", { runtimeHint: { ...raw, ...(modelSelection ? { modelSelection } : {}) } });
           } });
-          const durable = await persistBrowserRunArtifacts({ queueRoot: durableQueue.root, runId: id, result });
+          let durable: Awaited<ReturnType<typeof persistBrowserRunArtifacts>> | undefined;
+          try { durable = await persistBrowserRunArtifacts({ queueRoot: durableQueue.root, runId: id, result }); }
+          catch (artifactError) {
+            const warning = { code: "remote-artifact-persistence-failed", severity: "warning" as const, message: artifactError instanceof Error ? artifactError.message : String(artifactError) };
+            durableQueue.transition(id, "completed", "terminal", { result: { ...result, warnings: [...(result.warnings ?? []), warning] }, elapsedMs: Date.now() - started, etaQualifying: false });
+            return;
+          }
           const modelEvidence = result.modelSelection as any;
           const thinkingEvidence = result.thinkingSelection as any;
           const model = String(modelEvidence?.resolvedLabel ?? modelEvidence?.requestedModel ?? "");
@@ -297,7 +303,7 @@ export async function createRemoteServer(
         } catch (error) {
           const failure = formatDurableFailure(error);
           const phase = durableQueue.get(id)?.phase;
-          const terminalState = controller.signal.aborted ? "canceled" : (phase === "prompt_submitted" || phase === "awaiting_response" || phase === "capturing") ? "unknown" : "failed";
+          const terminalState = (phase === "prompt_submitted" || phase === "awaiting_response" || phase === "capturing") ? "unknown" : controller.signal.aborted ? "canceled" : "failed";
           durableQueue.transition(id, terminalState, "terminal", { error: failure.message, errorMetadata: failure.metadata, elapsedMs: Date.now() - started, etaQualifying: false });
         } finally { durableControllers.delete(id); durableWorkers -= 1; void pumpDurableQueue(); }
       })();
@@ -357,6 +363,7 @@ export async function createRemoteServer(
         const key = req.headers["idempotency-key"]; if (typeof key !== "string" || !key.trim()) { res.writeHead(400); res.end(JSON.stringify({ error: "idempotency_key_required" })); return; }
         try {
           const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload;
+          validateRemotePayload(payload);
           normalizeRemotePayload(payload);
           const snapshot = await durableQueue.submit(key, payload as any);
           res.writeHead(202, { "Content-Type": "application/json" }); res.end(JSON.stringify(snapshot)); void pumpDurableQueue();
@@ -1066,6 +1073,14 @@ function normalizeRemotePayload(payload: RemoteRunPayload): void {
     payload.browserConfig.desiredModel = undefined; payload.browserConfig.modelStrategy = undefined;
     payload.browserConfig.thinkingTime = undefined; payload.browserConfig.researchMode = undefined;
   }
+}
+
+function validateRemotePayload(payload: unknown): asserts payload is RemoteRunPayload {
+  if (!payload || typeof payload !== "object") throw new Error("invalid_request");
+  const p = payload as any;
+  if (typeof p.prompt !== "string" || p.prompt.length > 20_000_000 || !Array.isArray(p.attachments) || !p.browserConfig || typeof p.browserConfig !== "object" || !p.options || typeof p.options !== "object") throw new Error("invalid_request");
+  for (const a of p.attachments) if (!a || typeof a.fileName !== "string" || typeof a.contentBase64 !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(a.contentBase64)) throw new Error("invalid_request");
+  if (p.fallbackSubmission !== undefined) { const f = p.fallbackSubmission; if (!f || typeof f.prompt !== "string" || !Array.isArray(f.attachments)) throw new Error("invalid_request"); for (const a of f.attachments) if (!a || typeof a.fileName !== "string" || typeof a.contentBase64 !== "string" || !/^[A-Za-z0-9+/]*={0,2}$/.test(a.contentBase64)) throw new Error("invalid_request"); }
 }
 
 function formatDurableFailure(error: unknown): { message: string; metadata: { code?: string; type?: string; message?: string } } {
