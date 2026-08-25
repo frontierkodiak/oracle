@@ -17,6 +17,7 @@ import type { BrowserRunResult } from "../browserMode.js";
 import type { RemoteArtifactDescriptor, RemoteRunPayload, RemoteRunEvent } from "./types.js";
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
+  CAPTURE_ONLY_FEATURE_ID,
   MAX_REMOTE_ARTIFACT_BYTES,
   REMOTE_HEALTH_SCHEMA_VERSION,
 } from "./types.js";
@@ -82,6 +83,7 @@ const ARTIFACT_CAPABILITIES = {
       version: ARTIFACT_PROTOCOL_VERSION,
       limits: { maxBytes: MAX_REMOTE_ARTIFACT_BYTES },
     },
+    { id: CAPTURE_ONLY_FEATURE_ID, version: 1 },
   ],
 };
 
@@ -345,6 +347,17 @@ export async function createRemoteServer(
       payload = JSON.parse(body) as RemoteRunPayload;
       if (payload?.browserConfig) {
         payload.browserConfig.url = normalizeChatgptUrl(payload.browserConfig.url, CHATGPT_URL);
+      }
+      payload.browserConfig = pickClientBrowserConfig(payload?.browserConfig);
+      if (payload.browserConfig.captureOnly === true) {
+        payload.prompt = "";
+        payload.attachments = [];
+        payload.fallbackSubmission = undefined;
+        payload.options = { ...payload.options, followUpPrompts: undefined };
+        payload.browserConfig.desiredModel = undefined;
+        payload.browserConfig.modelStrategy = undefined;
+        payload.browserConfig.thinkingTime = undefined;
+        payload.browserConfig.researchMode = undefined;
       }
     } catch {
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -951,6 +964,7 @@ const CLIENT_BROWSER_CONFIG_FIELDS = [
   "archiveConversations",
   "resumeConversationUrl",
   "captureProviderNative",
+  "captureOnly",
   "timeoutMs",
   "inputTimeoutMs",
   "attachmentTimeoutMs",

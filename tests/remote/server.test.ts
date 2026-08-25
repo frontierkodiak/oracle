@@ -12,7 +12,7 @@ import {
   serveRemote,
 } from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
-import type { BrowserRunResult } from "../../src/browserMode.js";
+import type { BrowserRunOptions, BrowserRunResult } from "../../src/browserMode.js";
 import type { RemoteArtifactDescriptor } from "../../src/remote/types.js";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
 
@@ -161,7 +161,10 @@ describe("remote browser service", () => {
       });
       expect(healthOk.json?.capabilities).toMatchObject({
         schemaVersion: 1,
-        features: [{ id: "oracle.remote.artifact-transfer", version: 1 }],
+        features: expect.arrayContaining([
+          expect.objectContaining({ id: "oracle.remote.artifact-transfer", version: 1 }),
+          expect.objectContaining({ id: "oracle.browser.capture-only", version: 1 }),
+        ]),
       });
 
       const artifactUnauthorized = await httpGetJson({
@@ -189,6 +192,67 @@ describe("remote browser service", () => {
 
       await server.close();
       await rm(tmpDir, { recursive: true, force: true });
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "transports capture-only runs without creating a prompt submission",
+    async () => {
+      let runBrowserCalls = 0;
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          runBrowser: async (options) => {
+            runBrowserCalls += 1;
+            expect(options.prompt).toBe("");
+            expect(options.fallbackSubmission).toBeUndefined();
+            expect(options.config).toMatchObject({
+              resumeConversationUrl: "https://chatgpt.com/c/existing-conversation",
+              captureProviderNative: true,
+              captureOnly: true,
+            });
+            expect(options.config?.desiredModel).toBeUndefined();
+            expect(options.config?.modelStrategy).toBeUndefined();
+            expect(options.config?.thinkingTime).toBeUndefined();
+
+            // This is the injected browser boundary: the capture-only path has
+            // already returned before any selection, typing, or submit action.
+            return {
+              answerText: "captured transcript",
+              answerMarkdown: "captured transcript",
+              tookMs: 1,
+              answerTokens: 2,
+              answerChars: 19,
+              conversationId: "existing-conversation",
+              promptSubmitted: false,
+            };
+          },
+        },
+      );
+
+      try {
+        const executor = createRemoteBrowserExecutor({
+          host: `127.0.0.1:${server.port}`,
+          token: "secret",
+        });
+        const result = await executor({
+          prompt: "",
+          config: {
+            resumeConversationUrl: "https://chatgpt.com/c/existing-conversation",
+            captureProviderNative: true,
+            captureOnly: true,
+          },
+        });
+
+        expect(runBrowserCalls).toBe(1);
+        expect(result.answerText).toBe("captured transcript");
+        expect(result.conversationId).toBe("existing-conversation");
+        expect(result.promptSubmitted).toBe(false);
+        expect(result.modelSelection).toBeUndefined();
+        expect(result.thinkingSelection).toBeUndefined();
+      } finally {
+        await server.close();
+      }
     },
   );
 
@@ -492,6 +556,109 @@ describe("remote browser service", () => {
       }
     },
   );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "refuses capture-only requests from a host without the capture capability",
+    async () => {
+      const payload = Buffer.from("zip");
+      const bridge = await createFakeArtifactBridge({
+        descriptor: createArtifactDescriptor(payload),
+        payload,
+      });
+
+      try {
+        await expect(
+          createRemoteBrowserExecutor({
+            host: `127.0.0.1:${bridge.port}`,
+            token: "secret",
+          })({
+            prompt: "",
+            config: {
+              resumeConversationUrl: "https://chatgpt.com/c/existing-conversation",
+              captureProviderNative: true,
+              captureOnly: true,
+            },
+          }),
+        ).rejects.toThrow("required capability oracle.browser.capture-only v1");
+        expect(bridge.runRequests()).toBe(0);
+      } finally {
+        await bridge.close();
+      }
+    },
+  );
+
+  test.skipIf(!CAN_LISTEN_LOCALHOST)(
+    "normalizes adversarial capture-only payloads before attachment materialization",
+    async () => {
+      let received: BrowserRunOptions | undefined;
+      const server = await createRemoteServer(
+        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          runBrowser: async (options) => {
+            received = options;
+            return {
+              answerText: "captured",
+              answerMarkdown: "captured",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 8,
+              promptSubmitted: false,
+            };
+          },
+        },
+      );
+
+      try {
+        const response = await httpPostJsonLines({
+          hostname: "127.0.0.1",
+          port: server.port,
+          token: "secret",
+          payload: {
+            prompt: "do not send this",
+            attachments: [
+              {
+                fileName: "secret.txt",
+                displayPath: "secret.txt",
+                contentBase64: Buffer.from("secret").toString("base64"),
+              },
+            ],
+            fallbackSubmission: {
+              prompt: "fallback must not exist",
+              attachments: [],
+            },
+            browserConfig: {
+              resumeConversationUrl: "https://chatgpt.com/c/existing-conversation",
+              captureProviderNative: true,
+              captureOnly: true,
+              desiredModel: "gpt-5.6-sol",
+              modelStrategy: "select",
+              thinkingTime: "pro",
+              researchMode: "deep",
+            },
+            options: { followUpPrompts: ["follow-up must not exist"] },
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        expect(received).toBeDefined();
+        expect(received?.prompt).toBe("");
+        expect(received?.attachments).toEqual([]);
+        expect(received?.fallbackSubmission).toBeUndefined();
+        expect(received?.followUpPrompts).toBeUndefined();
+        expect(received?.config).toMatchObject({
+          resumeConversationUrl: "https://chatgpt.com/c/existing-conversation",
+          captureProviderNative: true,
+          captureOnly: true,
+        });
+        expect(received?.config?.desiredModel).toBeUndefined();
+        expect(received?.config?.modelStrategy).toBeUndefined();
+        expect(received?.config?.thinkingTime).toBeUndefined();
+        expect(received?.config?.researchMode).toBeUndefined();
+      } finally {
+        await server.close();
+      }
+    },
+  );
 });
 
 function createArtifactDescriptor(
@@ -521,9 +688,11 @@ async function createFakeArtifactBridge({
 }): Promise<{
   port: number;
   artifactRequests(): number;
+  runRequests(): number;
   close(): Promise<void>;
 }> {
   let artifactRequestCount = 0;
+  let runRequestCount = 0;
   const server = http.createServer((req, res) => {
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -547,6 +716,7 @@ async function createFakeArtifactBridge({
       return;
     }
     if (req.method === "POST" && req.url === "/runs") {
+      runRequestCount += 1;
       req.resume();
       res.writeHead(200, { "Content-Type": "application/x-ndjson" });
       res.write(
@@ -594,6 +764,7 @@ async function createFakeArtifactBridge({
   return {
     port: address.port,
     artifactRequests: () => artifactRequestCount,
+    runRequests: () => runRequestCount,
     close: async () => {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -644,6 +815,43 @@ async function httpGetJson({
     );
     req.on("error", reject);
     req.end();
+  });
+}
+
+async function httpPostJsonLines({
+  hostname,
+  port,
+  token,
+  payload,
+}: {
+  hostname: string;
+  port: number;
+  token: string;
+  payload: unknown;
+}): Promise<{ statusCode: number; body: string }> {
+  return await new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const req = http.request(
+      {
+        hostname,
+        port,
+        path: "/runs",
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        res.setEncoding("utf8");
+        let responseBody = "";
+        res.on("data", (chunk: string) => (responseBody += chunk));
+        res.on("end", () => resolve({ statusCode: res.statusCode ?? 0, body: responseBody }));
+      },
+    );
+    req.on("error", reject);
+    req.end(body);
   });
 }
 
@@ -731,6 +939,7 @@ describe("client browser-config allowlist", () => {
       archiveConversations: "never",
       resumeConversationUrl: "https://chatgpt.com/c/abc-123",
       captureProviderNative: true,
+      captureOnly: true,
       timeoutMs: 900_000,
     });
     expect(accepted).toEqual({
@@ -741,6 +950,7 @@ describe("client browser-config allowlist", () => {
       archiveConversations: "never",
       resumeConversationUrl: "https://chatgpt.com/c/abc-123",
       captureProviderNative: true,
+      captureOnly: true,
       timeoutMs: 900_000,
     });
   });
