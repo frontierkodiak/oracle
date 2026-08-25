@@ -326,7 +326,7 @@ export function createRemoteBrowserExecutor({
       let w: DurableWatchOutcome;
       try { w = await watchDurableRemoteRun(host, accepted.id, {
         token,
-        timeoutMs: Math.max(600_000, options.config?.timeoutMs ?? 0),
+        timeoutMs: options.config?.timeoutMs ?? 600_000,
         signal: options.signal,
         onSnapshot: (s) => {
           options.log?.(`[remote] ${s.state} (${s.phase})`);
@@ -344,14 +344,18 @@ export function createRemoteBrowserExecutor({
         const descriptors = raw.filter((x): x is RemoteArtifactDescriptor =>
           Boolean(x && typeof x === "object" && "artifactId" in x && "runId" in x),
         );
-        const transferResults = await Promise.allSettled(descriptors.map((descriptor) => transferRemoteArtifact({ host, token, descriptor, sessionId, log: options.log })));
+        const transferResults: PromiseSettledResult<SavedBrowserFile>[] = [];
+        for (const descriptor of descriptors) {
+          try { transferResults.push({ status: "fulfilled", value: await transferRemoteArtifact({ host, token, descriptor, sessionId, log: options.log }) }); }
+          catch (reason) { transferResults.push({ status: "rejected", reason }); }
+        }
         const transferred = transferResults.flatMap((item) => item.status === "fulfilled" ? [item.value] : []);
         const transferWarnings = transferResults.flatMap((item, index) => item.status === "rejected" ? [{ code: "remote-artifact-transfer-failed", severity: "warning" as const, message: `Artifact ${descriptors[index]?.artifactId ?? "unknown"} transfer failed: ${safeMessage(item.reason)}` }] : []);
         for (const warning of transferWarnings) options.log?.(`[remote] ${warning.message}`);
         return {
           ...w.snapshot.result,
-          savedFiles: [...(w.snapshot.result.savedFiles ?? []), ...transferred],
-          artifacts: [...(w.snapshot.result.artifacts ?? []), ...transferred],
+          savedFiles: transferred.length || w.snapshot.result.savedFiles?.length ? [...(w.snapshot.result.savedFiles ?? []), ...transferred] : undefined,
+          artifacts: transferred.length ? transferred : undefined,
           warnings: [...(w.snapshot.result.warnings ?? []), ...transferWarnings],
         };
       }
