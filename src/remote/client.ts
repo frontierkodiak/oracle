@@ -1,15 +1,13 @@
 import http from "node:http";
+import path from "node:path";
+import { createHash, randomBytes } from "node:crypto";
+import { mkdir, open, readFile, rename, rm, stat, chmod, lstat } from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import path from "node:path";
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, stat } from "node:fs/promises";
-import type { BrowserRunOptions } from "../browserMode.js";
-import type { BrowserRunResult } from "../browserMode.js";
+import type { BrowserRunOptions, BrowserRunResult } from "../browserMode.js";
 import type { BrowserAttachment, SavedBrowserFile } from "../browser/types.js";
 import {
-  appendArtifacts,
   computeFileSha256,
   resolveSessionArtifactsDir,
   resolveUniqueArtifactPath,
@@ -17,60 +15,226 @@ import {
   sanitizeArtifactMimeType,
   validateArtifactFile,
 } from "../browser/artifacts.js";
-import {
-  MAX_REMOTE_ARTIFACT_BYTES,
-  ARTIFACT_TRANSFER_FEATURE_ID,
-  CAPTURE_ONLY_FEATURE_ID,
-  type RemoteArtifactDescriptor,
-  type RemoteRunPayload,
-  type RemoteRunEvent,
-  type RemoteAttachmentPayload,
-  type RemoteCapabilityRequirement,
-} from "./types.js";
-import type { DurableRunSnapshot } from "./types.js";
+import { getOracleHomeDir } from "../oracleHome.js";
 import { parseHostPort } from "../bridge/connection.js";
 import { checkRemoteHealth } from "./health.js";
+import {
+  ARTIFACT_TRANSFER_FEATURE_ID,
+  CAPTURE_ONLY_FEATURE_ID,
+  DURABLE_QUEUE_FEATURE_ID,
+  MAX_REMOTE_ARTIFACT_BYTES,
+  type DurableRunSnapshot,
+  type RemoteArtifactDescriptor,
+  type RemoteAttachmentPayload,
+  type RemoteCapabilityRequirement,
+  type RemoteRunPayload,
+} from "./types.js";
 
+const DEFAULT_TIMEOUT_MS = 15_000;
+const TERMINAL = new Set(["completed", "failed", "canceled", "unknown"]);
 export interface RemoteExecutorOptions {
   host: string;
   token?: string;
   requiredCapabilities?: RemoteCapabilityRequirement[];
 }
+export interface DurableReceipt {
+  sessionId: string;
+  idempotencyKey: string;
+  runId?: string;
+  payloadHash?: string;
+}
+export interface DurableWatchOptions {
+  token?: string;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  reconnectDelayMs?: number;
+  pollMs?: number;
+  onSnapshot?: (snapshot: DurableRunSnapshot) => void;
+}
+export type DurableWatchOutcome = { snapshot: DurableRunSnapshot; detached: boolean };
+export interface QueueStatus {
+  active: number;
+  queued: number;
+  capacity: number;
+  [key: string]: unknown;
+}
 
-export async function submitDurableRemoteRun(params: {
+export function receiptPath(sessionId: string): string {
+  if (!/^[a-zA-Z0-9_-]{1,128}$/.test(sessionId)) throw new Error("invalid Oracle session id");
+  return path.join(getOracleHomeDir(), "sessions", sessionId, "durable-queue.json");
+}
+async function privateReceiptParent(target: string): Promise<void> {
+  const root = getOracleHomeDir();
+  const dirs = [root, path.join(root, "sessions"), path.dirname(target)];
+  for (const dir of dirs) {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const info = await lstat(dir);
+    if (!info.isDirectory() || info.isSymbolicLink())
+      throw new Error("unsafe durable receipt directory");
+    await chmod(dir, 0o700);
+  }
+}
+export async function readDurableReceipt(sessionId: string): Promise<DurableReceipt | undefined> {
+  try {
+    const target = receiptPath(sessionId);
+    const info = await lstat(target);
+    if (!info.isFile() || info.isSymbolicLink()) throw new Error("unsafe durable receipt file");
+    await chmod(target, 0o600);
+    return validateReceipt(JSON.parse(await readFile(target, "utf8")), sessionId);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new Error("invalid durable queue receipt");
+  }
+}
+export async function writeDurableReceipt(receipt: DurableReceipt): Promise<void> {
+  validateReceipt(receipt, receipt.sessionId);
+  const target = receiptPath(receipt.sessionId);
+  await privateReceiptParent(target);
+  const temp = `${target}.tmp-${randomBytes(8).toString("hex")}`;
+  const handle = await open(temp, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(receipt)}\n`);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(temp, target);
+  await chmod(target, 0o600);
+  const dir = await open(path.dirname(target), "r");
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
+  await rm(temp, { force: true });
+}
+function validateReceipt(value: unknown, sessionId: string): DurableReceipt {
+  const r = value as Record<string, unknown>;
+  if (
+    !r ||
+    r.sessionId !== sessionId ||
+    typeof r.idempotencyKey !== "string" ||
+    !/^[a-f0-9]{64}$/.test(r.idempotencyKey) ||
+    (r.runId !== undefined &&
+      (typeof r.runId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(r.runId))) ||
+    (r.payloadHash !== undefined &&
+      (typeof r.payloadHash !== "string" || !/^[a-f0-9]{64}$/.test(r.payloadHash)))
+  )
+    throw new Error("invalid durable queue receipt");
+  return r as unknown as DurableReceipt;
+}
+
+export async function submitDurableRemoteRun(p: {
   host: string;
   token?: string;
   idempotencyKey: string;
   payload: RemoteRunPayload;
 }): Promise<DurableRunSnapshot> {
-  return await requestDurableJson({ ...params, method: "POST", path: "/v1/runs" });
+  if (!/^[a-f0-9]{64}$/.test(p.idempotencyKey))
+    throw new Error("idempotency key must be 32 cryptorandom bytes");
+  const s = await requestDurableJson({ ...p, method: "POST", path: "/v1/runs" });
+  validateSnapshot(s);
+  return s;
 }
-
-export async function getDurableRemoteRun(host: string, id: string, token?: string): Promise<DurableRunSnapshot> {
-  return await requestDurableJson({ host, token, method: "GET", path: `/v1/runs/${encodeURIComponent(id)}` });
-}
-
-export async function getDurableRemoteQueueStatus(host: string, token?: string): Promise<Record<string, unknown>> {
-  return await requestDurableJson({ host, token, method: "GET", path: "/v1/queue/status" }) as Record<string, unknown>;
-}
-
-export async function cancelDurableRemoteRun(host: string, id: string, token?: string): Promise<DurableRunSnapshot> {
-  return await requestDurableJson({ host, token, method: "POST", path: `/v1/runs/${encodeURIComponent(id)}/cancel` });
-}
-
-async function requestDurableJson(params: { host: string; token?: string; method: string; path: string; idempotencyKey?: string; payload?: unknown }): Promise<any> {
-  const { hostname, port } = parseHost(params.host);
-  const body = params.payload === undefined ? undefined : Buffer.from(JSON.stringify(params.payload));
-  return await new Promise((resolve, reject) => {
-    const req = http.request({ hostname, port, path: params.path, method: params.method, headers: { "content-type": "application/json", ...(body ? { "content-length": body.length } : {}), ...(params.idempotencyKey ? { "idempotency-key": params.idempotencyKey } : {}), ...(params.token ? { authorization: `Bearer ${params.token}` } : {}) } }, (res) => {
-      collectErrorOrJson(res).then((value) => res.statusCode && res.statusCode >= 200 && res.statusCode < 300 ? resolve(value) : reject(new Error(String((value as any)?.error ?? `HTTP ${res.statusCode}`)))).catch(reject);
-    });
-    req.on("error", reject); if (body) req.write(body); req.end();
+export async function getDurableRemoteRun(
+  host: string,
+  id: string,
+  token?: string,
+): Promise<DurableRunSnapshot> {
+  const s = await requestDurableJson({
+    host,
+    token,
+    method: "GET",
+    path: `/v1/runs/${encodeURIComponent(id)}`,
   });
+  validateSnapshot(s);
+  return s;
+}
+export async function getDurableRemoteRunEvents(
+  host: string,
+  id: string,
+  after = -1,
+  token?: string,
+): Promise<Array<{ seq: number; event: unknown }>> {
+  const v = await requestDurableJson({
+    host,
+    token,
+    method: "GET",
+    path: `/v1/runs/${encodeURIComponent(id)}/events?after=${encodeURIComponent(String(after))}`,
+  });
+  if (
+    !v ||
+    !Array.isArray(v.events) ||
+    v.events.some(
+      (e: unknown) => !e || typeof e !== "object" || !Number.isSafeInteger((e as any).seq),
+    )
+  )
+    throw new Error("malformed durable events response");
+  let prior = after;
+  for (const e of v.events) {
+    if ((e as any).seq <= prior) throw new Error("nonmonotonic durable events response");
+    prior = (e as any).seq;
+  }
+  return v.events;
+}
+export async function getDurableRemoteQueueStatus(
+  host: string,
+  token?: string,
+): Promise<QueueStatus> {
+  const value = await requestDurableJson({ host, token, method: "GET", path: "/v1/queue/status" });
+  if (
+    !value ||
+    !Number.isSafeInteger(value.active) ||
+    !Number.isSafeInteger(value.queued) ||
+    !Number.isSafeInteger(value.capacity) ||
+    value.active < 0 ||
+    value.queued < 0 ||
+    value.capacity < 1
+  )
+    throw new Error("malformed durable queue status");
+  return value;
+}
+export async function cancelDurableRemoteRun(
+  host: string,
+  id: string,
+  token?: string,
+): Promise<DurableRunSnapshot> {
+  const s = await requestDurableJson({
+    host,
+    token,
+    method: "POST",
+    path: `/v1/runs/${encodeURIComponent(id)}/cancel`,
+  });
+  validateSnapshot(s);
+  return s;
 }
 
-function collectErrorOrJson(res: http.IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => { const chunks: Buffer[] = []; res.on("data", (chunk) => chunks.push(Buffer.from(chunk))); res.on("end", () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf8"))); } catch { resolve({ error: Buffer.concat(chunks).toString("utf8") }); } }); res.on("error", reject); });
+export async function watchDurableRemoteRun(
+  host: string,
+  id: string,
+  o: DurableWatchOptions = {},
+): Promise<DurableWatchOutcome> {
+  let after = -1;
+  let detached = false;
+  const deadline = Date.now() + (o.timeoutMs ?? 600_000);
+  for (;;) {
+    if (o.signal?.aborted) throw new Error("observer aborted");
+    try {
+      const events = await getDurableRemoteRunEvents(host, id, after, o.token);
+      for (const e of events) after = Math.max(after, e.seq);
+      const s = await getDurableRemoteRun(host, id, o.token);
+      o.onSnapshot?.(s);
+      if (TERMINAL.has(s.state)) return { snapshot: s, detached };
+    } catch (e) {
+      detached = true;
+      if (Date.now() >= deadline)
+        throw new Error(`durable run observer timed out while detached: ${safeMessage(e)}`);
+      await delay(o.reconnectDelayMs ?? 250, o.signal);
+      continue;
+    }
+    if (Date.now() >= deadline) throw new Error("durable run observer timed out");
+    await delay(o.pollMs ?? 400, o.signal);
+  }
 }
 
 export function createRemoteBrowserExecutor({
@@ -80,565 +244,360 @@ export function createRemoteBrowserExecutor({
 }: RemoteExecutorOptions) {
   let healthPromise: ReturnType<typeof checkRemoteHealth> | undefined;
   const ensureHealth = async (required: RemoteCapabilityRequirement[]) => {
-    const health = await (healthPromise ??= checkRemoteHealth({ host, token }));
-    if (!health.ok || !health.runtime || !health.manifest) {
-      const detail = health.error ?? "remote health handshake failed";
-      if (!health.statusCode && /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ETIMEDOUT/.test(detail)) {
-        throw new Error(`Could not reach the research bridge at ${host} (${detail}).`, {
-          cause: new Error(detail),
-        });
-      }
-      throw new Error(`${detail}; upgrade oracle on the host and retry`);
-    }
-    const features = new Set(
-      health.manifest.features.map((feature) => `${feature.id}@${feature.version}`),
-    );
-    for (const capability of required)
+    const h = await (healthPromise ??= checkRemoteHealth({ host, token }));
+    if (!h.ok || !h.runtime || !h.manifest)
+      throw new Error(
+        `${h.error ?? "remote health handshake failed"}; upgrade oracle on the host and retry`,
+      );
+    const features = new Set(h.manifest.features.map((f) => `${f.id}@${f.version}`));
+    for (const c of required)
       if (
-        !features.has(`${capability.id}@${capability.version}`) ||
-        (capability.id === ARTIFACT_TRANSFER_FEATURE_ID &&
-          capability.version === 1 &&
-          !health.capabilities?.artifactTransfer)
+        !features.has(`${c.id}@${c.version}`) ||
+        (c.id === ARTIFACT_TRANSFER_FEATURE_ID && !h.capabilities?.artifactTransfer)
       )
-        throw new Error(
-          `Remote host does not support required capability ${capability.id} v${capability.version}`,
-        );
-    return health;
+        throw new Error(`Remote host does not support required capability ${c.id} v${c.version}`);
   };
-  // Return a drop-in replacement for runBrowserMode so the browser session runner can stay unchanged.
-  return async function remoteBrowserExecutor(
-    options: BrowserRunOptions,
-  ): Promise<BrowserRunResult> {
+  return async (options: BrowserRunOptions): Promise<BrowserRunResult> => {
     if (options.signal?.aborted)
       throw new Error("Remote browser run cancelled before the request was sent.");
-    const required = [{ id: "oracle.remote.durable-queue", version: 1 }, ...(requiredCapabilities ?? [])];
-    if (options.config?.captureOnly === true) {
-      required.push({ id: CAPTURE_ONLY_FEATURE_ID, version: 1 });
-    }
-    await ensureHealth(required);
-    if (options.signal?.aborted) throw new Error("Remote browser run aborted before submission.");
     const captureOnly = options.config?.captureOnly === true;
-    const browserConfig = captureOnly
-      ? {
-          ...options.config,
-          desiredModel: undefined,
-          modelStrategy: undefined,
-          thinkingTime: undefined,
-          researchMode: undefined,
-        }
-      : (options.config ?? {});
-    const payload: RemoteRunPayload = {
-      prompt: captureOnly ? "" : options.prompt,
-      attachments: captureOnly ? [] : await serializeAttachments(options.attachments ?? []),
-      fallbackSubmission:
-        !captureOnly && options.fallbackSubmission
-          ? {
-              prompt: options.fallbackSubmission.prompt,
-              attachments: await serializeAttachments(options.fallbackSubmission.attachments ?? []),
-            }
-          : undefined,
-      browserConfig,
-      options: {
-        heartbeatIntervalMs: options.heartbeatIntervalMs,
-        verbose: options.verbose,
-        sessionId: options.sessionId,
-        followUpPrompts: captureOnly ? undefined : options.followUpPrompts,
-      },
-    };
-
-    const body = Buffer.from(JSON.stringify(payload));
+    await ensureHealth([
+      { id: DURABLE_QUEUE_FEATURE_ID, version: 1 },
+      ...(requiredCapabilities ?? []),
+      ...(captureOnly ? [{ id: CAPTURE_ONLY_FEATURE_ID, version: 1 }] : []),
+    ]);
+    const sessionId = options.sessionId ?? `remote-${randomBytes(12).toString("hex")}`;
+    let receipt = await readDurableReceipt(sessionId);
+    if (!receipt) {
+      receipt = { sessionId, idempotencyKey: randomBytes(32).toString("hex") };
+      await writeDurableReceipt(receipt);
+    }
+    const payload = await serializePayload(options, captureOnly);
     if (options.signal?.aborted) throw new Error("Remote browser run aborted before submission.");
-    const { hostname, port } = parseHost(host);
-
-    // Durable runs are the sole admission path. Keep the old streaming code
-    // below for source compatibility with pre-queue hosts; current health
-    // requires the durable capability before this branch is reached.
-    return await runDurableRemoteExecutor({ host, token, payload, options, required });
-
-    // `BrowserRunOptions.signal` has to mean the same thing on both sides of the
-    // bridge. Observed only locally, it would look like cancellation while the
-    // remote run kept its slot and its browser tab until it finished on its own —
-    // the exact failure the signal exists to prevent, made harder to see because
-    // the caller believes it cancelled.
-    const callerSignal = options.signal;
-
-    return new Promise<BrowserRunResult>((resolve, reject) => {
-      if (callerSignal?.aborted) {
-        reject(new Error("Browser run cancelled before the request was sent."));
-        return;
+    const payloadHash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
+    if (receipt.payloadHash && receipt.payloadHash !== payloadHash)
+      throw new Error("durable receipt payload does not match the current request");
+    if (!receipt.payloadHash) {
+      receipt = { ...receipt, payloadHash };
+      await writeDurableReceipt(receipt);
+    }
+    let accepted: DurableRunSnapshot;
+    if (receipt.runId) {
+      accepted = await getDurableRemoteRun(host, receipt.runId, token);
+    } else {
+      if (options.signal?.aborted) throw new Error("Remote browser run aborted before submission.");
+      try {
+        accepted = await submitDurableRemoteRun({
+          host,
+          token,
+          idempotencyKey: receipt.idempotencyKey,
+          payload,
+        });
+      } catch (error) {
+        if (options.signal?.aborted)
+          throw new Error("Remote browser run aborted before submission.");
+        if (!isRetryableTransport(error)) throw error;
+        accepted = await submitDurableRemoteRun({
+          host,
+          token,
+          idempotencyKey: receipt.idempotencyKey,
+          payload,
+        });
       }
-      const transferredFiles: SavedBrowserFile[] = [];
-      const transferFailures: string[] = [];
-      const transferPromises: Promise<void>[] = [];
-      let artifactTransferQueue = Promise.resolve();
-      let settled = false;
-      let runAccepted = false;
-      let resolved: BrowserRunResult | null = null;
-
-      const fail = (error: Error) => {
-        if (settled) return;
-        settled = true;
-        reject(error);
-      };
-
-      /**
-       * A transport error after the run was accepted usually means the bridge
-       * went away mid-run, and the bare socket error ("aborted", "ECONNRESET")
-       * describes the symptom rather than the situation. The important part for
-       * whoever reads this is that the conversation may well exist on the bridge
-       * host regardless — the browser work is not undone by losing the stream.
-       */
-      const failTransport = (error: Error) => {
-        const wasAccepted = runAccepted;
-        fail(
-          wasAccepted
-            ? new Error(
-                `Lost the connection to the research bridge at ${hostname}:${port} while the run was in progress (${error.message}). ` +
-                  "The run may have started in ChatGPT before the connection dropped: check `oracle status` on the bridge host " +
-                  "for a session from this run and reattach to it rather than resubmitting, which would create a second conversation.",
-                { cause: error },
-              )
-            : new Error(
-                `Could not reach the research bridge at ${hostname}:${port} (${error.message}). ` +
-                  "Confirm the service is running on that host and that the port is reachable from here.",
-                { cause: error },
-              ),
+      await writeDurableReceipt({ ...receipt, runId: accepted.id });
+    }
+    let cancelSent = false;
+    const cancel = () => {
+      if (!cancelSent) {
+        cancelSent = true;
+        void cancelDurableRemoteRun(host, accepted.id, token).catch(() => undefined);
+      }
+    };
+    options.signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      const w = await watchDurableRemoteRun(host, accepted.id, {
+        token,
+        timeoutMs: Math.max(600_000, options.config?.timeoutMs ?? 0),
+        signal: options.signal,
+        onSnapshot: (s) => {
+          options.log?.(`[remote] ${s.state} (${s.phase})`);
+          const hint = (s as any).runtimeHint;
+          if (hint && options.runtimeHintCb)
+            void options.runtimeHintCb(hint, (hint as any).modelSelection);
+        },
+      });
+      if (w.snapshot.state === "completed" && w.snapshot.result) {
+        const raw = [
+          ...(((w.snapshot as any).artifacts ?? []) as unknown[]),
+          ...(((w.snapshot.result as any).artifacts ?? []) as unknown[]),
+        ];
+        const descriptors = raw.filter((x): x is RemoteArtifactDescriptor =>
+          Boolean(x && typeof x === "object" && "artifactId" in x && "runId" in x),
         );
-      };
-
-      const req = http.request(
-        {
-          hostname,
-          port,
-          path: "/runs",
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Content-Length": body.length,
-            ...(token ? { authorization: `Bearer ${token}` } : {}),
-          },
-        },
-        (res) => {
-          if (res.statusCode !== 200) {
-            collectError(res)
-              .then((message) => fail(new Error(message)))
-              .catch(fail);
-            return;
-          }
-          // 200 means the service took the request; from here on a dropped
-          // connection is a run that may exist rather than one that never began.
-          runAccepted = true;
-          res.setEncoding("utf8");
-          let buffer = "";
-          res.on("data", (chunk: string) => {
-            buffer += chunk;
-            let newlineIndex = buffer.indexOf("\n");
-            while (newlineIndex !== -1) {
-              const line = buffer.slice(0, newlineIndex).trim();
-              buffer = buffer.slice(newlineIndex + 1);
-              if (line.length > 0) {
-                const transferPromise = handleEvent({
-                  line,
-                  options,
-                  hostname,
-                  port,
-                  token,
-                  onResult: (result) => {
-                    resolved = result;
-                  },
-                  onArtifact: (artifact) => {
-                    transferredFiles.push(artifact);
-                  },
-                  onArtifactFailure: (message) => {
-                    transferFailures.push(message);
-                  },
-                  enqueueArtifactTransfer: (transfer) => {
-                    const queued = artifactTransferQueue.then(transfer);
-                    artifactTransferQueue = queued.catch(() => undefined);
-                    return queued;
-                  },
-                  onError: fail,
-                });
-                if (transferPromise) {
-                  transferPromises.push(transferPromise);
-                }
-              }
-              newlineIndex = buffer.indexOf("\n");
-            }
-          });
-          res.on("end", () => {
-            void (async () => {
-              await Promise.allSettled(transferPromises);
-              if (settled) return;
-              if (!resolved) {
-                fail(new Error("Remote browser run completed without a result."));
-                return;
-              }
-              settled = true;
-              resolve(mergeTransferredArtifacts(resolved, transferredFiles, transferFailures));
-            })().catch(fail);
-          });
-          res.on("error", failTransport);
-        },
-      );
-      req.on("error", failTransport);
-
-      // Destroying the request closes the socket, which is how the service learns
-      // to abort: its own disconnect handler fires and releases the slot and the
-      // browser tab.
-      const onCallerAbort = () => {
-        req.destroy();
-        fail(new Error("Browser run cancelled: the caller aborted."));
-      };
-      callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
-      req.on("close", () => callerSignal?.removeEventListener("abort", onCallerAbort));
-
-      req.write(body);
-      req.end();
-    });
+        const transferred = await Promise.all(
+          descriptors.map((descriptor) =>
+            transferRemoteArtifact({ host, token, descriptor, sessionId, log: options.log }),
+          ),
+        );
+        return {
+          ...w.snapshot.result,
+          savedFiles: [...(w.snapshot.result.savedFiles ?? []), ...transferred],
+          artifacts: [...(w.snapshot.result.artifacts ?? []), ...transferred],
+        };
+      }
+      throw new Error(w.snapshot.error ?? `remote durable run ended ${w.snapshot.state}`);
+    } finally {
+      options.signal?.removeEventListener("abort", cancel);
+    }
   };
 }
-
-async function serializeAttachments(
-  attachments: BrowserAttachment[],
-): Promise<RemoteAttachmentPayload[]> {
-  const serialized: RemoteAttachmentPayload[] = [];
-  for (const attachment of attachments) {
-    // Read the local file upfront so the remote host never touches the caller's filesystem.
-    const content = await readFile(attachment.path);
-    serialized.push({
-      fileName: path.basename(attachment.path),
-      displayPath: attachment.displayPath,
-      sizeBytes: attachment.sizeBytes,
-      contentBase64: content.toString("base64"),
-    });
-  }
-  return serialized;
+async function serializePayload(
+  o: BrowserRunOptions,
+  captureOnly: boolean,
+): Promise<RemoteRunPayload> {
+  const config = captureOnly
+    ? Object.fromEntries(
+        Object.entries(o.config ?? {}).filter(
+          ([k]) => !["desiredModel", "modelStrategy", "thinkingTime", "researchMode"].includes(k),
+        ),
+      )
+    : (o.config ?? {});
+  return {
+    prompt: captureOnly ? "" : o.prompt,
+    attachments: captureOnly ? [] : await serializeAttachments(o.attachments ?? []),
+    fallbackSubmission:
+      !captureOnly && o.fallbackSubmission
+        ? {
+            prompt: o.fallbackSubmission.prompt,
+            attachments: await serializeAttachments(o.fallbackSubmission.attachments ?? []),
+          }
+        : undefined,
+    browserConfig: config,
+    options: {
+      heartbeatIntervalMs: o.heartbeatIntervalMs,
+      verbose: o.verbose,
+      sessionId: o.sessionId,
+      followUpPrompts: captureOnly ? undefined : o.followUpPrompts,
+    },
+  };
+}
+async function serializeAttachments(a: BrowserAttachment[]): Promise<RemoteAttachmentPayload[]> {
+  return Promise.all(
+    a.map(async (x) => ({
+      fileName: path.basename(x.path),
+      displayPath: x.displayPath,
+      sizeBytes: x.sizeBytes,
+      contentBase64: (await readFile(x.path)).toString("base64"),
+    })),
+  );
 }
 
-function parseHost(input: string): { hostname: string; port: number } {
-  try {
-    return parseHostPort(input);
-  } catch (error) {
-    throw new Error(
-      `Invalid remote host: ${input} (${error instanceof Error ? error.message : String(error)})`,
-    );
-  }
-}
-
-function handleEvent(params: {
-  line: string;
-  options: BrowserRunOptions;
-  hostname: string;
-  port: number;
-  token?: string;
-  onResult: (result: BrowserRunResult) => void;
-  onArtifact: (artifact: SavedBrowserFile) => void;
-  onArtifactFailure: (message: string) => void;
-  enqueueArtifactTransfer: (transfer: () => Promise<void>) => Promise<void>;
-  onError: (error: Error) => void;
-}): Promise<void> | null {
-  let event: RemoteRunEvent;
-  try {
-    event = JSON.parse(params.line) as RemoteRunEvent;
-  } catch (error) {
-    params.onError(
-      new Error(
-        `Failed to parse remote event: ${error instanceof Error ? error.message : String(error)}`,
-      ),
-    );
-    return null;
-  }
-  if (event.type === "log") {
-    params.options.log?.(event.message);
-    return null;
-  }
-  if (event.type === "error") {
-    params.onError(new Error(event.message));
-    return null;
-  }
-  if (event.type === "artifact-progress") {
-    if (params.options.verbose) {
-      params.options.log?.(
-        `[browser] Artifact ${event.artifactId} ${event.phase}${
-          event.receivedBytes !== undefined && event.totalBytes !== undefined
-            ? ` ${event.receivedBytes}/${event.totalBytes} bytes`
-            : ""
-        }`,
-      );
-    }
-    return null;
-  }
-  if (event.type === "artifact-ready") {
-    const displayFilename = sanitizeArtifactFilename(
-      String(event.artifact?.filename ?? ""),
-      "artifact.bin",
-    );
-    const transfer = params.enqueueArtifactTransfer(() =>
-      transferRemoteArtifact({
-        hostname: params.hostname,
-        port: params.port,
-        token: params.token,
-        descriptor: event.artifact,
-        sessionId: params.options.sessionId,
-        log: params.options.log,
-      })
-        .then((artifact) => {
-          params.onArtifact(artifact);
-        })
-        .catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          const fallback = `Oracle captured the browser text response, but bridge artifact transfer failed for ${displayFilename}. Open the ChatGPT browser on the bridge host, download the ZIP/file shown in the current response, and copy it to a cloud-readable path. Reason: ${message}`;
-          params.options.log?.(`[browser] ${fallback}`);
-          params.onArtifactFailure(fallback);
-        }),
-    );
-    return transfer;
-  }
-  if (event.type === "result") {
-    params.onResult(event.result);
-  }
-  return null;
-}
-
-async function transferRemoteArtifact(params: {
-  hostname: string;
-  port: number;
+export async function transferRemoteArtifact(p: {
+  host: string;
   token?: string;
   descriptor: RemoteArtifactDescriptor;
   sessionId?: string;
-  log?: BrowserRunOptions["log"];
+  log?: (message: string) => void;
 }): Promise<SavedBrowserFile> {
-  validateRemoteArtifactDescriptor(params.descriptor);
-  const sessionId = params.sessionId ?? params.descriptor.runId;
-  const artifactsDir = resolveSessionArtifactsDir(sessionId);
-  await mkdir(artifactsDir, { recursive: true });
-  const filename = sanitizeArtifactFilename(
-    params.descriptor.filename,
-    `artifact-${params.descriptor.artifactId}.bin`,
-  );
-  const finalPath = await resolveUniqueArtifactPath(path.join(artifactsDir, filename));
-  const partPath = `${finalPath}.part-${params.descriptor.artifactId}`;
-  const artifactPath = `/runs/${encodeURIComponent(params.descriptor.runId)}/artifacts/${encodeURIComponent(
-    params.descriptor.artifactId,
-  )}`;
-
-  params.log?.(`[browser] Transferring artifact ${filename} from bridge host...`);
-  await downloadArtifactToFile({
-    hostname: params.hostname,
-    port: params.port,
-    path: artifactPath,
-    token: params.token,
-    targetPath: partPath,
-    descriptor: params.descriptor,
-  }).catch(async (error) => {
-    await rm(partPath, { force: true }).catch(() => undefined);
-    throw error;
-  });
-
-  const fileStat = await stat(partPath);
-  if (fileStat.size !== params.descriptor.byteSize) {
-    await rm(partPath, { force: true }).catch(() => undefined);
-    throw new Error(`size mismatch (${fileStat.size} != ${params.descriptor.byteSize})`);
+  const d = p.descriptor;
+  validateArtifactDescriptor(d);
+  const dir = resolveSessionArtifactsDir(p.sessionId ?? d.runId);
+  await mkdir(dir, { recursive: true });
+  const filename = sanitizeArtifactFilename(d.filename, `artifact-${d.artifactId}.bin`);
+  const finalPath = await resolveUniqueArtifactPath(path.join(dir, filename));
+  const part = `${finalPath}.part-${d.artifactId}`;
+  try {
+    await downloadArtifact(p.host, p.token, d, part);
+    const s = await stat(part);
+    if (s.size !== d.byteSize) throw new Error("artifact size mismatch");
+    const sha256 = await computeFileSha256(part);
+    if (sha256 !== d.sha256) throw new Error("artifact sha256 mismatch");
+    const validation = await validateArtifactFile({
+      path: part,
+      filename,
+      mimeType: sanitizeArtifactMimeType(d.mimeType),
+    });
+    if (!validation.ok) throw new Error(`${validation.type} validation failed`);
+    await rename(part, finalPath);
+    p.log?.(`[browser] Transferred artifact ${filename}`);
+    return {
+      kind: "file",
+      path: finalPath,
+      label: filename,
+      filename,
+      mimeType: sanitizeArtifactMimeType(d.mimeType),
+      sizeBytes: s.size,
+      sourceUrl: "bridge-artifact",
+      finalUrl: "bridge-artifact",
+      url: "bridge-artifact",
+      sha256,
+      validation,
+      transfer: { status: "completed", bytes: s.size },
+      origin: { mode: "bridge" },
+    };
+  } catch (e) {
+    await rm(part, { force: true });
+    throw e;
   }
-  const sha256 = await computeFileSha256(partPath);
-  if (sha256 !== params.descriptor.sha256) {
-    await rm(partPath, { force: true }).catch(() => undefined);
-    throw new Error("sha256 mismatch");
-  }
-  const validation = await validateArtifactFile({
-    path: partPath,
-    filename,
-    mimeType: sanitizeArtifactMimeType(params.descriptor.mimeType),
-  });
-  if (!validation.ok) {
-    await rm(partPath, { force: true }).catch(() => undefined);
-    throw new Error(`${validation.type} validation failed: ${validation.error ?? "invalid"}`);
-  }
-
-  await rename(partPath, finalPath);
-  params.log?.(`[browser] Transferred artifact to ${finalPath}`);
-  const publishedFilename = path.basename(finalPath);
-  return {
-    kind: "file",
-    path: finalPath,
-    label: publishedFilename,
-    mimeType: sanitizeArtifactMimeType(params.descriptor.mimeType),
-    sizeBytes: fileStat.size,
-    sourceUrl: "bridge-artifact",
-    sha256,
-    validation,
-    transfer: { status: "completed", bytes: fileStat.size },
-    origin: { mode: "bridge" },
-    url: "bridge-artifact",
-    finalUrl: "bridge-artifact",
-    filename: publishedFilename,
-  };
 }
-
-async function downloadArtifactToFile(params: {
-  hostname: string;
-  port: number;
-  path: string;
-  token?: string;
-  targetPath: string;
-  descriptor: RemoteArtifactDescriptor;
-}): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
+function validateArtifactDescriptor(d: RemoteArtifactDescriptor): void {
+  if (
+    !d ||
+    d.kind !== "file" ||
+    !/^[a-zA-Z0-9_-]{1,128}$/.test(d.runId) ||
+    !/^[a-zA-Z0-9_-]{1,128}$/.test(d.artifactId) ||
+    !Number.isSafeInteger(d.byteSize) ||
+    d.byteSize <= 0 ||
+    d.byteSize > MAX_REMOTE_ARTIFACT_BYTES ||
+    !/^[a-f0-9]{64}$/.test(d.sha256)
+  )
+    throw new Error("invalid bridge artifact descriptor");
+}
+async function downloadArtifact(
+  host: string,
+  token: string | undefined,
+  d: RemoteArtifactDescriptor,
+  target: string,
+): Promise<void> {
+  await new Promise((resolve, reject) => {
+    const { hostname, port } = parseHostPort(host);
     const req = http.request(
       {
-        hostname: params.hostname,
-        port: params.port,
-        path: params.path,
-        method: "GET",
-        headers: params.token ? { authorization: `Bearer ${params.token}` } : undefined,
+        hostname,
+        port,
+        path: `/runs/${encodeURIComponent(d.runId)}/artifacts/${encodeURIComponent(d.artifactId)}`,
+        headers: token ? { authorization: `Bearer ${token}` } : undefined,
+        timeout: DEFAULT_TIMEOUT_MS,
       },
       (res) => {
         if (res.statusCode !== 200) {
-          collectError(res)
-            .then((message) => reject(new Error(message)))
-            .catch(reject);
-          return;
-        }
-        const headerSha = String(res.headers["x-oracle-artifact-sha256"] ?? "");
-        if (headerSha && headerSha !== params.descriptor.sha256) {
           res.resume();
-          reject(new Error("artifact sha256 header mismatch"));
+          reject(new Error(`artifact download HTTP ${res.statusCode}`));
           return;
         }
-        const contentLengthHeader = res.headers["content-length"];
-        const contentLength =
-          typeof contentLengthHeader === "string" ? Number(contentLengthHeader) : undefined;
-        if (
-          contentLength !== undefined &&
-          (!Number.isSafeInteger(contentLength) ||
-            contentLength <= 0 ||
-            contentLength > MAX_REMOTE_ARTIFACT_BYTES ||
-            contentLength !== params.descriptor.byteSize)
-        ) {
-          res.resume();
-          reject(new Error("artifact content-length mismatch"));
-          return;
-        }
-        const output = createWriteStream(params.targetPath, { flags: "wx" });
-        let receivedBytes = 0;
-        const limiter = new Transform({
-          transform(chunk: Buffer, _encoding, callback) {
-            receivedBytes += chunk.length;
-            if (
-              receivedBytes > params.descriptor.byteSize ||
-              receivedBytes > MAX_REMOTE_ARTIFACT_BYTES
-            ) {
-              callback(new Error("artifact exceeded declared size"));
-              return;
-            }
-            callback(null, chunk);
+        const out = createWriteStream(target, { flags: "wx" });
+        let n = 0;
+        const limit = new Transform({
+          transform(chunk: Buffer, _e, cb) {
+            n += chunk.length;
+            cb(
+              n > d.byteSize || n > MAX_REMOTE_ARTIFACT_BYTES
+                ? new Error("artifact exceeds declared size")
+                : null,
+              chunk,
+            );
           },
         });
-        void pipeline(res, limiter, output).then(() => resolve(), reject);
+        void pipeline(res, limit, out).then(resolve, reject);
       },
     );
+    req.on("timeout", () => req.destroy(new Error("request timeout")));
     req.on("error", reject);
     req.end();
   });
 }
-
-function validateRemoteArtifactDescriptor(descriptor: RemoteArtifactDescriptor): void {
+function validateSnapshot(s: DurableRunSnapshot): void {
   if (
-    !descriptor ||
-    typeof descriptor !== "object" ||
-    descriptor.kind !== "file" ||
-    typeof descriptor.runId !== "string" ||
-    !/^[a-zA-Z0-9_-]{1,128}$/.test(descriptor.runId) ||
-    typeof descriptor.artifactId !== "string" ||
-    !/^[a-zA-Z0-9_-]{1,128}$/.test(descriptor.artifactId) ||
-    typeof descriptor.filename !== "string" ||
-    !Number.isSafeInteger(descriptor.byteSize) ||
-    descriptor.byteSize <= 0 ||
-    descriptor.byteSize > MAX_REMOTE_ARTIFACT_BYTES ||
-    typeof descriptor.sha256 !== "string" ||
-    !/^[a-f0-9]{64}$/.test(descriptor.sha256)
-  ) {
-    throw new Error("invalid bridge artifact descriptor");
-  }
+    !s ||
+    typeof s !== "object" ||
+    !/^[a-zA-Z0-9_-]{1,128}$/.test(s.id) ||
+    !(["queued", "running", "completed", "failed", "canceled", "unknown"] as string[]).includes(
+      s.state,
+    ) ||
+    typeof s.phase !== "string" ||
+    !Number.isSafeInteger(s.queuePosition) ||
+    !Number.isSafeInteger(s.roughEtaMs)
+  )
+    throw new Error("malformed durable run response");
 }
-
-function mergeTransferredArtifacts(
-  result: BrowserRunResult,
-  transferredFiles: SavedBrowserFile[],
-  transferFailures: string[],
-): BrowserRunResult {
-  const artifacts = appendArtifacts(result.artifacts, transferredFiles);
-  const savedFiles = appendSavedFiles(result.savedFiles, transferredFiles);
-  const warnings = [
-    ...(result.warnings ?? []),
-    ...transferFailures.map((message) => ({
-      code: "remote-artifact-transfer-failed",
-      severity: "warning" as const,
-      message,
-    })),
-  ];
-  return {
-    ...result,
-    artifacts,
-    savedFiles,
-    warnings: warnings.length > 0 ? warnings : undefined,
-  };
+function safeMessage(e: unknown): string {
+  return (e instanceof Error ? e.message : String(e))
+    .replace(/Bearer\s+[^\s)]+/gi, "Bearer [redacted]")
+    .replace(/(authorization|token|api[_-]?key)\s*[:=]\s*[^,\s]+/gi, "$1=[redacted]");
 }
-
-function appendSavedFiles(
-  existing: SavedBrowserFile[] | undefined,
-  additions: SavedBrowserFile[],
-): SavedBrowserFile[] | undefined {
-  const merged = new Map<string, SavedBrowserFile>();
-  for (const artifact of existing ?? []) {
-    merged.set(artifact.path, artifact);
-  }
-  for (const artifact of additions) {
-    merged.set(artifact.path, artifact);
-  }
-  const values = Array.from(merged.values());
-  return values.length > 0 ? values : undefined;
+function isRetryableTransport(e: unknown): boolean {
+  return /ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|request timeout|ETIMEDOUT|network/i.test(
+    e instanceof Error ? e.message : String(e),
+  );
 }
-
-function collectError(res: http.IncomingMessage): Promise<string> {
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    res.on("data", (chunk: Buffer | string) => {
-      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-    });
-    res.on("end", () => {
-      const raw = Buffer.concat(chunks).toString("utf8");
-      try {
-        const parsed = JSON.parse(raw);
-        resolve(parsed.error ?? `Remote host responded with status ${res.statusCode}`);
-      } catch {
-        resolve(raw || `Remote host responded with status ${res.statusCode}`);
-      }
-    });
-    res.on("error", reject);
+    let settled = false;
+    const t = setTimeout(() => {
+      settled = true;
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      cleanup();
+      reject(new Error("observer aborted"));
+    };
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
-
-async function runDurableRemoteExecutor(params: {
+async function requestDurableJson(p: {
   host: string;
   token?: string;
-  payload: RemoteRunPayload;
-  options: BrowserRunOptions;
-  required: RemoteCapabilityRequirement[];
-}): Promise<BrowserRunResult> {
-  const key = params.options.sessionId ? `session:${params.options.sessionId}` : `run:${randomUUID()}`;
-  const accepted = await submitDurableRemoteRun({ host: params.host, token: params.token, idempotencyKey: key, payload: params.payload });
-  let cancelled = false;
-  const onAbort = () => { cancelled = true; void cancelDurableRemoteRun(params.host, accepted.id, params.token).catch(() => undefined); };
-  params.options.signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    for (;;) {
-      if (cancelled) throw new Error("Browser run cancelled: the caller aborted.");
-      const current = await getDurableRemoteRun(params.host, accepted.id, params.token);
-      if (current.state === "completed" && current.result) return current.result;
-      if (current.state === "failed" || current.state === "unknown" || current.state === "canceled") throw new Error(current.error ?? `Remote durable run ended ${current.state}.`);
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-  } finally { params.options.signal?.removeEventListener("abort", onAbort); }
+  method: string;
+  path: string;
+  idempotencyKey?: string;
+  payload?: unknown;
+  timeoutMs?: number;
+}): Promise<any> {
+  const { hostname, port } = parseHostPort(p.host);
+  const body = p.payload === undefined ? undefined : Buffer.from(JSON.stringify(p.payload));
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname,
+        port,
+        path: p.path,
+        method: p.method,
+        timeout: p.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+        headers: {
+          accept: "application/json",
+          ...(body ? { "content-type": "application/json", "content-length": body.length } : {}),
+          ...(p.idempotencyKey ? { "idempotency-key": p.idempotencyKey } : {}),
+          ...(p.token ? { authorization: `Bearer ${p.token}` } : {}),
+        },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        let bytes = 0;
+        res.on("data", (c) => {
+          bytes += Buffer.byteLength(c);
+          if (bytes > 8 * 1024 * 1024) {
+            req.destroy(new Error("remote response exceeds size limit"));
+            return;
+          }
+          chunks.push(Buffer.from(c));
+        });
+        res.on("end", () => {
+          let v: unknown;
+          try {
+            v = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+          } catch {
+            reject(new Error(`malformed remote response (HTTP ${res.statusCode})`));
+            return;
+          }
+          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300)
+            reject(
+              new Error(
+                `remote request failed HTTP ${res.statusCode}: ${safeMessage((v as any)?.error ?? "request failed")}`,
+              ),
+            );
+          else resolve(v);
+        });
+      },
+    );
+    req.on("timeout", () => req.destroy(new Error("request timeout")));
+    req.on("error", (e) => reject(new Error(safeMessage(e))));
+    if (body) req.write(body);
+    req.end();
+  });
 }
