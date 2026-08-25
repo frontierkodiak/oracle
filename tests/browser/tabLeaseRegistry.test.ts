@@ -10,10 +10,10 @@ import {
 
 describe("tabLeaseRegistry", () => {
   test("normalizes the concurrent tab limit", () => {
-    expect(normalizeMaxConcurrentTabs(undefined)).toBe(3);
+    expect(normalizeMaxConcurrentTabs(undefined)).toBe(4);
     expect(normalizeMaxConcurrentTabs("4")).toBe(4);
-    expect(normalizeMaxConcurrentTabs(0)).toBe(3);
-    expect(normalizeMaxConcurrentTabs("nope")).toBe(3);
+    expect(normalizeMaxConcurrentTabs(0)).toBe(4);
+    expect(normalizeMaxConcurrentTabs("nope")).toBe(4);
   });
 
   test("queues when the max concurrent tab limit is reached", async () => {
