@@ -1443,11 +1443,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       }
       await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
       await raceWithDisconnect(ensureLoggedIn(Runtime, logger));
-      await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+      if (!captureOnly) {
+        await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+      }
       if (isResumingConversation) {
         await raceWithDisconnect(
           waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
             requirePriorTurns: true,
+            requirePromptReady: !captureOnly,
             expectedConversationUrl: config.resumeConversationUrl as string,
           }),
         );
@@ -1476,19 +1479,27 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           navigateToChatGPT(Page, Runtime, config.resumeConversationUrl as string, logger),
         );
         await raceWithDisconnect(ensureNotBlocked(Runtime, config.headless, logger));
-        await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+        if (!captureOnly) {
+          await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+        }
       } else if (config.url !== baseUrl) {
-        await raceWithDisconnect(
-          navigateToPromptReadyWithFallback(Page, Runtime, {
-            url: config.url,
-            fallbackUrl: baseUrl,
-            timeoutMs: config.inputTimeoutMs,
-            headless: config.headless,
-            logger,
-          }),
-        );
+        if (captureOnly) {
+          await raceWithDisconnect(navigateToChatGPT(Page, Runtime, config.url, logger));
+        } else {
+          await raceWithDisconnect(
+            navigateToPromptReadyWithFallback(Page, Runtime, {
+              url: config.url,
+              fallbackUrl: baseUrl,
+              timeoutMs: config.inputTimeoutMs,
+              headless: config.headless,
+              logger,
+            }),
+          );
+        }
       } else {
-        await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+        if (!captureOnly) {
+          await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
+        }
       }
       if (isResumingConversation) {
         // A resumed thread loads its prior history after navigation; ChatGPT can reset the
@@ -1499,6 +1510,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         await raceWithDisconnect(
           waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
             requirePriorTurns: true,
+            requirePromptReady: !captureOnly,
             expectedConversationUrl: config.resumeConversationUrl as string,
           }),
         );
@@ -3332,6 +3344,7 @@ async function runRemoteBrowserMode(
     if (config.resumeConversationUrl) {
       await waitForResumedConversationHydration(Runtime, config.inputTimeoutMs, logger, {
         requirePriorTurns: true,
+        requirePromptReady: !config.captureOnly,
         expectedConversationUrl: config.resumeConversationUrl,
       });
     }
