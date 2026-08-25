@@ -3,6 +3,7 @@ import { createWriteStream } from "node:fs";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat } from "node:fs/promises";
 import type { BrowserRunOptions } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
@@ -110,7 +111,7 @@ export function createRemoteBrowserExecutor({
   ): Promise<BrowserRunResult> {
     if (options.signal?.aborted)
       throw new Error("Remote browser run cancelled before the request was sent.");
-    const required = [...(requiredCapabilities ?? [])];
+    const required = [{ id: "oracle.remote.durable-queue", version: 1 }, ...(requiredCapabilities ?? [])];
     if (options.config?.captureOnly === true) {
       required.push({ id: CAPTURE_ONLY_FEATURE_ID, version: 1 });
     }
@@ -148,6 +149,11 @@ export function createRemoteBrowserExecutor({
     const body = Buffer.from(JSON.stringify(payload));
     if (options.signal?.aborted) throw new Error("Remote browser run aborted before submission.");
     const { hostname, port } = parseHost(host);
+
+    // Durable runs are the sole admission path. Keep the old streaming code
+    // below for source compatibility with pre-queue hosts; current health
+    // requires the durable capability before this branch is reached.
+    return await runDurableRemoteExecutor({ host, token, payload, options, required });
 
     // `BrowserRunOptions.signal` has to mean the same thing on both sides of the
     // bridge. Observed only locally, it would look like cancellation while the
@@ -612,4 +618,27 @@ function collectError(res: http.IncomingMessage): Promise<string> {
     });
     res.on("error", reject);
   });
+}
+
+async function runDurableRemoteExecutor(params: {
+  host: string;
+  token?: string;
+  payload: RemoteRunPayload;
+  options: BrowserRunOptions;
+  required: RemoteCapabilityRequirement[];
+}): Promise<BrowserRunResult> {
+  const key = params.options.sessionId ? `session:${params.options.sessionId}` : `run:${randomUUID()}`;
+  const accepted = await submitDurableRemoteRun({ host: params.host, token: params.token, idempotencyKey: key, payload: params.payload });
+  let cancelled = false;
+  const onAbort = () => { cancelled = true; void cancelDurableRemoteRun(params.host, accepted.id, params.token).catch(() => undefined); };
+  params.options.signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      if (cancelled) throw new Error("Browser run cancelled: the caller aborted.");
+      const current = await getDurableRemoteRun(params.host, accepted.id, params.token);
+      if (current.state === "completed" && current.result) return current.result;
+      if (current.state === "failed" || current.state === "unknown" || current.state === "canceled") throw new Error(current.error ?? `Remote durable run ended ${current.state}.`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  } finally { params.options.signal?.removeEventListener("abort", onAbort); }
 }

@@ -254,20 +254,31 @@ export async function createRemoteServer(
   const artifactRegistry = new Map<string, RegisteredRemoteArtifact>();
   const durableQueue = await DurableQueueStore.open({ capacity: effectiveConcurrency, backlog: options.maxQueuedRuns ?? 8 });
   let durableWorkers = 0;
+  const durableControllers = new Map<string, AbortController>();
   const pumpDurableQueue = async (): Promise<void> => {
     while (durableWorkers < effectiveConcurrency) {
       const next = durableQueue.claimNext(); if (!next) return;
       durableWorkers += 1;
+      const controller = new AbortController();
+      durableControllers.set(next.id, controller);
       void (async () => {
         const started = Date.now(); const id = next.id;
         try {
           const payload = await durableQueue.request(id); if (!payload) throw new Error("durable request missing");
-          const result = await runBrowser({ prompt: payload.prompt, attachments: [], config: payload.browserConfig as any, sessionId: String(payload.options?.sessionId ?? id), followUpPrompts: payload.options?.followUpPrompts as string[] | undefined });
+          const runDir = durableQueue.runDirectory(id);
+          const materialize = async (items: any[] | undefined, folder: string) => {
+            const destination = path.join(runDir, folder); await mkdir(destination, { recursive: true, mode: 0o700 });
+            return await Promise.all((items ?? []).map(async (item, index) => { const name = sanitizeName(item.fileName ?? `attachment-${index + 1}`); const target = path.join(destination, name); await writeFile(target, Buffer.from(String(item.contentBase64 ?? ""), "base64"), { mode: 0o600 }); return { path: target, displayPath: item.displayPath, sizeBytes: item.sizeBytes }; }));
+          };
+          const attachments = await materialize(payload.attachments as any[] | undefined, "attachments");
+          const fallback = payload.fallbackSubmission as any;
+          const fallbackSubmission = fallback ? { prompt: fallback.prompt, attachments: await materialize(fallback.attachments as any[] | undefined, "fallback-attachments") } : undefined;
+          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: payload.browserConfig as any, signal: controller.signal, sessionId: String(payload.options?.sessionId ?? id), followUpPrompts: payload.options?.followUpPrompts as string[] | undefined });
           durableQueue.transition(id, "completed", "terminal", { result, elapsedMs: Date.now() - started });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          durableQueue.transition(id, "failed", "terminal", { error: message, elapsedMs: Date.now() - started });
-        } finally { durableWorkers -= 1; void pumpDurableQueue(); }
+          durableQueue.transition(id, controller.signal.aborted ? "canceled" : "failed", "terminal", { error: message, elapsedMs: Date.now() - started });
+        } finally { durableControllers.delete(id); durableWorkers -= 1; void pumpDurableQueue(); }
       })();
     }
   };
@@ -322,12 +333,12 @@ export async function createRemoteServer(
       if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) { res.writeHead(401, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "unauthorized" })); return; }
       if (req.method === "POST" && req.url === "/v1/runs") {
         const key = req.headers["idempotency-key"]; if (typeof key !== "string" || !key.trim()) { res.writeHead(400); res.end(JSON.stringify({ error: "idempotency_key_required" })); return; }
-        try { const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload; const snapshot = durableQueue.submit(key, payload as any); res.writeHead(202, { "Content-Type": "application/json" }); res.end(JSON.stringify(snapshot)); void pumpDurableQueue(); } catch (error) { const message = error instanceof Error ? error.message : String(error); res.writeHead(message === "queue_full" ? 503 : message.includes("idempotency key conflicts") ? 409 : 400); res.end(JSON.stringify({ error: message })); } return;
+        try { const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload; const snapshot = await durableQueue.submit(key, payload as any); res.writeHead(202, { "Content-Type": "application/json" }); res.end(JSON.stringify(snapshot)); void pumpDurableQueue(); } catch (error) { const message = error instanceof Error ? error.message : String(error); res.writeHead(message === "queue_full" ? 503 : message.includes("idempotency key conflicts") ? 409 : 400); res.end(JSON.stringify({ error: message })); } return;
       }
       if (!v1Match) { res.writeHead(404); res.end(); return; }
       const id = decodeURIComponent(v1Match[1] ?? ""); const action = v1Match[2];
       if (req.method === "GET" && action === "events") { const url = new URL(req.url ?? "", "http://oracle.local"); const after = Number(url.searchParams.get("after") ?? -1); res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify({ events: durableQueue.events(id, Number.isFinite(after) ? after : -1) })); return; }
-      if (req.method === "POST" && action === "cancel") { const snap = durableQueue.cancel(id); if (!snap) { res.writeHead(404); res.end(); return; } res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(snap)); return; }
+      if (req.method === "POST" && action === "cancel") { const snap = durableQueue.cancel(id); if (!snap) { res.writeHead(404); res.end(); return; } durableControllers.get(id)?.abort(); res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(durableQueue.get(id))); return; }
       if (req.method === "GET" && !action) { const snap = durableQueue.get(id); if (!snap) { res.writeHead(404); res.end(); return; } res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(snap)); return; }
       res.writeHead(404); res.end(); return;
     }
@@ -350,6 +361,11 @@ export async function createRemoteServer(
       return;
     }
 
+    if (req.method === "POST" && req.url === "/runs") {
+      res.writeHead(410, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "legacy_run_endpoint_removed", endpoint: "/v1/runs" }));
+      return;
+    }
     if (req.method !== "POST" || req.url !== "/runs") {
       res.statusCode = 404;
       res.end();

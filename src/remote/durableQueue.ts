@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getOracleHomeDir } from "../oracleHome.js";
 
@@ -127,7 +127,7 @@ export class DurableQueueStore {
     return Math.max(DURABLE_ETA_FLOOR_MS, Math.round(rows.reduce((sum, row) => sum + Number(row.elapsed_ms), 0) / rows.length));
   }
 
-  submit(idempotencyKey: string, request: DurableRunRequest): DurableRunSnapshot {
+  async submit(idempotencyKey: string, request: DurableRunRequest): Promise<DurableRunSnapshot> {
     if (!idempotencyKey || idempotencyKey.length > 512) throw new Error("stable Idempotency-Key is required");
     const hash = digest(request);
     const existing = this.db.prepare("SELECT * FROM runs WHERE idempotency_key=?").get(idempotencyKey) as Row | undefined;
@@ -139,17 +139,20 @@ export class DurableQueueStore {
     const active = Number((this.db.prepare("SELECT count(*) AS n FROM runs WHERE state='running'").get() as Row).n);
     if (active >= this.capacity && queued >= this.backlog) throw new Error("queue_full");
     const id = randomUUID(); const t = this.now(); const runDir = path.join(this.root, "runs", id);
+    await privateDirectory(path.join(this.root, "runs"));
+    await privateDirectory(runDir);
+    const requestPath = path.join(runDir, "request.json");
+    const tempPath = `${requestPath}.part-${randomUUID()}`;
+    await writeFile(tempPath, JSON.stringify(request), { mode: 0o600 });
+    await chmod(tempPath, 0o600);
+    await rename(tempPath, requestPath);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       this.db.prepare("INSERT INTO runs (id,idempotency_key,request_hash,request_path,state,phase,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)")
-        .run(id, idempotencyKey, hash, path.join(runDir, "request.json"), "queued", "accepted", t, t);
+        .run(id, idempotencyKey, hash, requestPath, "queued", "accepted", t, t);
       this.db.prepare("INSERT INTO events (run_id,seq,created_at,event) VALUES (?,?,?,?)").run(id, 0, t, JSON.stringify({ type: "accepted" }));
       this.db.exec("COMMIT");
-    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
-    void privateDirectory(runDir).then(async () => {
-      const temp = `${runDir}/request.json.part-${randomUUID()}`;
-      await writeFile(temp, JSON.stringify(request), { mode: 0o600 }); await rename(temp, `${runDir}/request.json`); await chmod(`${runDir}/request.json`, 0o600);
-    });
+    } catch (error) { this.db.exec("ROLLBACK"); await rm(runDir, { recursive: true, force: true }); throw error; }
     return this.snapshot(this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Row);
   }
 
@@ -162,7 +165,21 @@ export class DurableQueueStore {
     this.db.exec("BEGIN IMMEDIATE"); try { this.db.prepare("UPDATE runs SET state=?,phase=?,updated_at=?,result=?,error=?,runtime_hint=?,elapsed_ms=? WHERE id=?").run(state, phase, t, patch.result === undefined ? null : JSON.stringify(patch.result), patch.error ?? null, patch.runtimeHint ? JSON.stringify(patch.runtimeHint) : null, patch.elapsedMs ?? null, id); this.db.prepare("INSERT INTO events (run_id,seq,created_at,event) VALUES (?,?,?,?)").run(id, seq, t, JSON.stringify({ type: "state", state, phase })); this.db.exec("COMMIT"); } catch (error) { this.db.exec("ROLLBACK"); throw error; }
     if ((state === "completed" || state === "failed") && patch.elapsedMs !== undefined) this.db.prepare("INSERT INTO eta_samples VALUES (?,?)").run(patch.elapsedMs, t);
   }
-  claimNext(): DurableRunSnapshot | undefined { const row = this.db.prepare("SELECT * FROM runs WHERE state='queued' ORDER BY created_at,id LIMIT 1").get() as Row | undefined; if (!row) return undefined; this.transition(String(row.id), "running", "dispatching"); return this.get(String(row.id)); }
+  claimNext(): DurableRunSnapshot | undefined {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const active = Number((this.db.prepare("SELECT count(*) AS n FROM runs WHERE state='running'").get() as Row).n);
+      if (active >= this.capacity) { this.db.exec("ROLLBACK"); return undefined; }
+      const row = this.db.prepare("SELECT * FROM runs WHERE state='queued' ORDER BY created_at,id LIMIT 1").get() as Row | undefined;
+      if (!row) { this.db.exec("ROLLBACK"); return undefined; }
+      const t = this.now(); const id = String(row.id);
+      this.db.prepare("UPDATE runs SET state='running',phase='dispatching',updated_at=? WHERE id=? AND state='queued'").run(t, id);
+      const seq = Number((this.db.prepare("SELECT max(seq) AS seq FROM events WHERE run_id=?").get(id) as Row).seq) + 1;
+      this.db.prepare("INSERT INTO events (run_id,seq,created_at,event) VALUES (?,?,?,?)").run(id, seq, t, JSON.stringify({ type: "state", state: "running", phase: "dispatching" }));
+      this.db.exec("COMMIT"); return this.get(id);
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+  }
   status(): { active: number; queued: number; capacity: number; backlog: number; roughEtaMs: number } { const count = (state: string) => Number((this.db.prepare("SELECT count(*) AS n FROM runs WHERE state=?").get(state) as Row).n); return { active: count("running"), queued: count("queued"), capacity: this.capacity, backlog: this.backlog, roughEtaMs: this.eta() }; }
   async request(id: string): Promise<DurableRunRequest | undefined> { const row = this.db.prepare("SELECT request_path FROM runs WHERE id=?").get(id) as Row | undefined; if (!row) return undefined; const info = await lstat(String(row.request_path)); if (!info.isFile() || info.isSymbolicLink()) throw new Error("unsafe request path"); return JSON.parse(await readFile(String(row.request_path), "utf8")) as DurableRunRequest; }
+  runDirectory(id: string): string { if (!/^[a-zA-Z0-9_-]{1,128}$/.test(id)) throw new Error("invalid run id"); return path.join(this.root, "runs", id); }
 }
