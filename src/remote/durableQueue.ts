@@ -166,7 +166,6 @@ export class DurableQueueStore {
           type: "state",
           state: "unknown",
           phase: "terminal",
-          reason: "restart_interrupted",
         });
         this.db.exec("COMMIT");
       } catch (e) {

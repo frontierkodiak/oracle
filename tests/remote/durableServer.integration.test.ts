@@ -90,7 +90,12 @@ describe("durable remote server admission", () => {
     let calls = 0;
     server = await createRemoteServer(
       { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
-      { runBrowser: async () => { calls += 1; throw new Error("must not run"); } },
+      {
+        runBrowser: async () => {
+          calls += 1;
+          throw new Error("must not run");
+        },
+      },
     );
     const response = await call(server.port, "POST", "/runs", payload("legacy"), "legacy-key");
     expect(response.status).toBe(410);
@@ -103,23 +108,106 @@ describe("durable remote server admission", () => {
     let calls = 0;
     server = await createRemoteServer(
       { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
-      { runBrowser: async () => { calls += 1; throw new Error("must not run"); } },
+      {
+        runBrowser: async () => {
+          calls += 1;
+          throw new Error("must not run");
+        },
+      },
     );
     const malformed = [
       [payload("unknown"), { "x-unknown": true }],
       [{ ...payload("negative"), browserConfig: { timeoutMs: -1 } }, undefined],
       [{ ...payload("nonfinite"), browserConfig: { timeoutMs: null } }, undefined],
-      [{ ...payload("base64"), attachments: [{ fileName: "a", displayPath: "a", sizeBytes: 2, contentBase64: "YQ==" }] }, undefined],
-      [{ ...payload("aggregate"), attachments: Array.from({ length: 129 }, () => ({ fileName: "a", displayPath: "a", sizeBytes: 0, contentBase64: "" })) }, undefined],
+      [
+        {
+          ...payload("base64"),
+          attachments: [{ fileName: "a", displayPath: "a", sizeBytes: 2, contentBase64: "YQ==" }],
+        },
+        undefined,
+      ],
+      [
+        {
+          ...payload("aggregate"),
+          attachments: Array.from({ length: 129 }, () => ({
+            fileName: "a",
+            displayPath: "a",
+            sizeBytes: 0,
+            contentBase64: "",
+          })),
+        },
+        undefined,
+      ],
     ] as const;
     for (const [body, extra] of malformed) {
       const request = extra ? { ...(body as any), ...extra } : body;
       const response = await call(server.port, "POST", "/v1/runs", request, `bad-${Math.random()}`);
       expect(response.status).toBe(400);
     }
-    const oversized = await call(server.port, "POST", "/v1/runs", payload("oversized"), "k".repeat(513));
+    const oversized = await call(
+      server.port,
+      "POST",
+      "/v1/runs",
+      payload("oversized"),
+      "k".repeat(513),
+    );
     expect(oversized.status).toBe(400);
     expect(calls).toBe(0);
     expect(await readdir(path.join(home, "remote-queue", "runs"))).toEqual([]);
+  });
+
+  it("rejects capture-only before admission unless the host explicitly enables it", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-capture-gated-server-"));
+    let calls = 0;
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      {
+        runBrowser: async () => {
+          calls += 1;
+          throw new Error("must not run");
+        },
+      },
+    );
+    const rejected = await call(
+      server.port,
+      "POST",
+      "/v1/runs",
+      { ...payload("capture"), browserConfig: { captureOnly: true } },
+      "capture-disabled",
+    );
+    expect(rejected.status).toBe(400);
+    expect(rejected.json.error).toBe("capture_only_disabled");
+    expect(calls).toBe(0);
+    expect(await readdir(path.join(home, "remote-queue", "runs"))).toEqual([]);
+    const disabledHealth = await call(server.port, "GET", "/health");
+    expect(disabledHealth.json.capabilities.features).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "oracle.browser.capture-only" })]),
+    );
+
+    await server.close();
+    server = await createRemoteServer(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        token: "test",
+        logger: () => {},
+        queueHomeDir: await mkdtemp(path.join(os.tmpdir(), "oracle-capture-enabled-server-")),
+        allowCaptureOnly: true,
+      },
+      {
+        runBrowser: async () => ({
+          answerText: "captured",
+          answerMarkdown: "captured",
+          tookMs: 1,
+          answerTokens: 1,
+          answerChars: 8,
+          promptSubmitted: false,
+        }),
+      },
+    );
+    const health = await call(server.port, "GET", "/health");
+    expect(health.json.capabilities.features).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: "oracle.browser.capture-only" })]),
+    );
   });
 });
