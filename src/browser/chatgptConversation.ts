@@ -462,11 +462,18 @@ function buildFetchDocumentExpression(conversationId: string): string {
     ${buildAuthAndFetchSource(conversationId)}
     const result = await fetchConversationText();
     if (!result.ok) return result;
+    if (result.text.length > ${MAX_DOCUMENT_CHARS}) {
+      return { ok: false, reason: 'http-error', detail: 'document exceeds character capture ceiling' };
+    }
+    const bytes = new TextEncoder().encode(result.text).byteLength;
+    if (bytes > ${MAX_DOCUMENT_BYTES}) {
+      return { ok: false, reason: 'http-error', detail: 'document exceeds byte capture ceiling' };
+    }
     // Stashed rather than returned whole: a conversation document can be several
     // megabytes, and one oversized evaluate response is a worse failure mode than
     // a handful of bounded ones.
     globalThis[${JSON.stringify(STASH_KEY)}] = result.text;
-    return { ok: true, length: result.text.length };
+    return { ok: true, length: result.text.length, bytes };
   })()`;
 }
 
@@ -497,8 +504,12 @@ function buildDigestSource(sourceExpression: string, stashKey?: string): string 
     if (result.text.length > ${MAX_DOCUMENT_CHARS}) {
       return { ok: false, reason: 'http-error', detail: 'document exceeds capture ceiling' };
     }
-    ${stashKey ? `globalThis[${JSON.stringify(stashKey)}] = result.text;` : ""}
     const encoder = new TextEncoder();
+    const documentBytes = encoder.encode(result.text).byteLength;
+    if (documentBytes > ${MAX_DOCUMENT_BYTES}) {
+      return { ok: false, reason: 'http-error', detail: 'document exceeds byte capture ceiling' };
+    }
+    ${stashKey ? `globalThis[${JSON.stringify(stashKey)}] = result.text;` : ""}
     const digestDecimal = async (value) => {
       const bytes = encoder.encode(value);
       const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
@@ -596,7 +607,7 @@ export async function captureProviderNativeConversation(params: {
     return { status: "unavailable", failure: { reason: "no-conversation-id" } };
   }
 
-  let head: ({ ok: true; length: number } | InPageFailure) | null;
+  let head: ({ ok: true; length: number; bytes: number } | InPageFailure) | null;
   try {
     head = await evaluateInPage(Runtime, buildFetchDocumentExpression(conversationId), true);
   } catch (error) {
@@ -624,10 +635,18 @@ export async function captureProviderNativeConversation(params: {
       },
     };
   }
+  if (!Number.isSafeInteger(head.bytes) || head.bytes < 0 || head.bytes > MAX_DOCUMENT_BYTES) {
+    await evaluateInPage(Runtime, buildReleaseExpression(), false).catch(() => null);
+    return {
+      status: "unavailable",
+      failure: {
+        reason: "http-error",
+        detail: `document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
+      },
+    };
+  }
 
   let rawText = "";
-  let rawByteCount = 0;
-  let rawOverflow = false;
   try {
     while (rawText.length < head.length) {
       const chunk = await evaluateInPage<string>(
@@ -638,27 +657,12 @@ export async function captureProviderNativeConversation(params: {
       if (chunk === null || chunk === "") {
         break;
       }
-      const chunkBytes = Buffer.byteLength(chunk, "utf8");
-      if (rawByteCount > MAX_DOCUMENT_BYTES - chunkBytes) {
-        rawOverflow = true;
-        break;
-      }
       rawText += chunk;
-      rawByteCount += chunkBytes;
     }
   } finally {
     await evaluateInPage(Runtime, buildReleaseExpression(), false).catch(() => null);
   }
 
-  if (rawOverflow) {
-    return {
-      status: "unavailable",
-      failure: {
-        reason: "http-error",
-        detail: `document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
-      },
-    };
-  }
   if (rawText.length !== head.length) {
     return {
       status: "unavailable",
@@ -670,6 +674,15 @@ export async function captureProviderNativeConversation(params: {
   }
 
   const rawBuffer = Buffer.from(rawText, "utf8");
+  if (rawBuffer.byteLength !== head.bytes) {
+    return {
+      status: "unavailable",
+      failure: {
+        reason: "evaluate-failed",
+        detail: `document byte count changed while draining (${rawBuffer.byteLength} of ${head.bytes})`,
+      },
+    };
+  }
   const capture: ProviderNativeCapture = {
     conversationId,
     rawText,
@@ -709,58 +722,57 @@ export async function captureProviderNativeConversation(params: {
       perTurn: evidence.perTurn,
       fetchedAt: evidence.fetchedAt,
     };
-    let independentText = "";
-    let independentByteCount = 0;
-    let independentOverflow = false;
-    try {
-      while (independentText.length < evidence.documentChars) {
-        const chunk = await evaluateInPage<string>(
-          Runtime,
-          buildDrainExpression(independentText.length, INDEPENDENT_STASH_KEY),
-          false,
-        );
-        if (chunk === null || chunk === "") break;
-        const chunkBytes = Buffer.byteLength(chunk, "utf8");
-        if (independentByteCount > MAX_DOCUMENT_BYTES - chunkBytes) {
-          independentOverflow = true;
-          break;
-        }
-        independentText += chunk;
-        independentByteCount += chunkBytes;
-      }
-    } catch (error) {
-      capture.evidenceFailure = {
-        reason: "evaluate-failed",
-        detail: error instanceof Error ? error.message : String(error),
-      };
-    } finally {
-      await evaluateInPage(Runtime, buildReleaseExpression(INDEPENDENT_STASH_KEY), false).catch(
-        () => null,
-      );
-    }
-    if (!capture.evidenceFailure && independentOverflow) {
+    const independentByteCountValid =
+      Number.isSafeInteger(evidence.documentBytes) &&
+      evidence.documentBytes >= 0 &&
+      evidence.documentBytes <= MAX_DOCUMENT_BYTES;
+    if (!independentByteCountValid) {
       capture.evidenceFailure = {
         reason: "http-error",
         detail: `independent document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
       };
-    }
-    if (!capture.evidenceFailure) {
-      const independentBytes = Buffer.from(independentText, "utf8");
-      const independentSha256 = createHash("sha256").update(independentBytes).digest("hex");
-      if (
-        independentText.length !== evidence.documentChars ||
-        independentByteCount !== evidence.documentBytes ||
-        independentBytes.byteLength !== evidence.documentBytes ||
-        independentSha256 !== Buffer.from(evidence.documentSha256Decimal).toString("hex")
-      ) {
+      await evaluateInPage(Runtime, buildReleaseExpression(INDEPENDENT_STASH_KEY), false).catch(
+        () => null,
+      );
+    } else {
+      let independentText = "";
+      try {
+        while (independentText.length < evidence.documentChars) {
+          const chunk = await evaluateInPage<string>(
+            Runtime,
+            buildDrainExpression(independentText.length, INDEPENDENT_STASH_KEY),
+            false,
+          );
+          if (chunk === null || chunk === "") break;
+          independentText += chunk;
+        }
+      } catch (error) {
         capture.evidenceFailure = {
           reason: "evaluate-failed",
-          detail: "independent document changed or was truncated while draining",
+          detail: error instanceof Error ? error.message : String(error),
         };
-      } else {
-        capture.independentRawText = independentText;
-        capture.independentSha256 = independentSha256;
-        capture.independentBytes = independentBytes.byteLength;
+      } finally {
+        await evaluateInPage(Runtime, buildReleaseExpression(INDEPENDENT_STASH_KEY), false).catch(
+          () => null,
+        );
+      }
+      if (!capture.evidenceFailure) {
+        const independentBytes = Buffer.from(independentText, "utf8");
+        const independentSha256 = createHash("sha256").update(independentBytes).digest("hex");
+        if (
+          independentText.length !== evidence.documentChars ||
+          independentBytes.byteLength !== evidence.documentBytes ||
+          independentSha256 !== Buffer.from(evidence.documentSha256Decimal).toString("hex")
+        ) {
+          capture.evidenceFailure = {
+            reason: "evaluate-failed",
+            detail: "independent document changed or was truncated while draining",
+          };
+        } else {
+          capture.independentRawText = independentText;
+          capture.independentSha256 = independentSha256;
+          capture.independentBytes = independentBytes.byteLength;
+        }
       }
     }
     const evidenceHex = Buffer.from(evidence.documentSha256Decimal).toString("hex");

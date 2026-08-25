@@ -93,7 +93,11 @@ describe("provider capture failure handling", () => {
     const rawText = JSON.stringify({ conversation_id: "abc-123", mapping: {} });
     const digest = createHash("sha256").update(rawText).digest("hex");
     const values: unknown[] = [
-      { result: { value: { ok: true, length: rawText.length } } },
+      {
+        result: {
+          value: { ok: true, length: rawText.length, bytes: Buffer.byteLength(rawText) },
+        },
+      },
       { result: { value: rawText } },
       { result: { value: true } },
       {
@@ -129,11 +133,72 @@ describe("provider capture failure handling", () => {
     });
   });
 
+  it("reassembles a surrogate pair split across an A/B drain chunk boundary", async () => {
+    const document = `${"a".repeat(499_999)}😀`;
+    const bytes = Buffer.byteLength(document, "utf8");
+    const digest = createHash("sha256").update(document).digest("hex");
+    let cursor = 0;
+    const outcome = await captureProviderNativeConversation({
+      Runtime: {
+        evaluate: async () => {
+          cursor += 1;
+          switch (cursor) {
+            case 1:
+              return { result: { value: { ok: true, length: document.length, bytes } } };
+            case 2:
+              return { result: { value: document.slice(0, 500_000) } };
+            case 3:
+              return { result: { value: document.slice(500_000) } };
+            case 4:
+              return { result: { value: true } };
+            case 5:
+              return {
+                result: {
+                  value: {
+                    ok: true,
+                    documentSha256Decimal: [...Buffer.from(digest, "hex")],
+                    documentBytes: bytes,
+                    documentChars: document.length,
+                    perTurn: [],
+                    fetchedAt: "2026-01-01T00:00:00.000Z",
+                  },
+                },
+              };
+            case 6:
+              return { result: { value: document.slice(0, 500_000) } };
+            case 7:
+              return { result: { value: document.slice(500_000) } };
+            case 8:
+              return { result: { value: true } };
+            default:
+              throw new Error(`unexpected evaluation ${cursor}`);
+          }
+        },
+      } as never,
+      conversationId: "abc-123",
+    });
+    expect(outcome).toMatchObject({
+      status: "captured",
+      capture: {
+        rawText: document,
+        independentRawText: document,
+        independentBytes: bytes,
+      },
+    });
+    expect(
+      (outcome as { capture?: { evidenceFailure?: unknown } }).capture?.evidenceFailure,
+    ).toBeUndefined();
+  });
+
   it("rejects a non-ASCII authoritative document when UTF-8 bytes exceed the ledger ceiling", async () => {
     const rawText = "é".repeat(MAX_DOCUMENT_BYTES / 2 + 1);
     let cursor = 0;
     const values: unknown[] = [
-      { result: { value: { ok: true, length: rawText.length } } },
+      {
+        result: {
+          value: { ok: true, length: rawText.length, bytes: Buffer.byteLength(rawText) },
+        },
+      },
       { result: { value: rawText } },
       { result: { value: true } },
     ];
@@ -152,26 +217,26 @@ describe("provider capture failure handling", () => {
 
   it("rejects a non-ASCII independent document when UTF-8 bytes exceed the ledger ceiling", async () => {
     const rawText = "small authoritative document";
-    const independentText = "é".repeat(MAX_DOCUMENT_BYTES / 2 + 1);
-    const independentDigest = createHash("sha256").update(independentText).digest("hex");
+    const independentText = "😀".repeat(Math.floor(MAX_DOCUMENT_BYTES / 4) + 1);
+    expect(Buffer.byteLength(independentText, "utf8")).toBeGreaterThan(MAX_DOCUMENT_BYTES);
     let cursor = 0;
     const values: unknown[] = [
-      { result: { value: { ok: true, length: rawText.length } } },
+      {
+        result: {
+          value: { ok: true, length: rawText.length, bytes: Buffer.byteLength(rawText) },
+        },
+      },
       { result: { value: rawText } },
       { result: { value: true } },
       {
         result: {
           value: {
-            ok: true,
-            documentSha256Decimal: [...Buffer.from(independentDigest, "hex")],
-            documentBytes: Buffer.byteLength(independentText),
-            documentChars: independentText.length,
-            perTurn: [],
-            fetchedAt: "2026-01-01T00:00:00.000Z",
+            ok: false,
+            reason: "http-error",
+            detail: "document exceeds byte capture ceiling",
           },
         },
       },
-      { result: { value: independentText } },
       { result: { value: true } },
     ];
     const outcome = await captureProviderNativeConversation({
@@ -183,7 +248,7 @@ describe("provider capture failure handling", () => {
       capture: {
         evidenceFailure: {
           reason: "http-error",
-          detail: `independent document exceeds the ${MAX_DOCUMENT_BYTES}-byte capture ceiling`,
+          detail: "document exceeds byte capture ceiling",
         },
       },
     });
