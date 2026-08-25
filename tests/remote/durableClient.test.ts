@@ -9,6 +9,7 @@ import {
   getDurableRemoteQueueStatus,
   readDurableReceipt,
   receiptPath,
+  getDurableRemoteRunEvents,
   watchDurableRemoteRun,
   writeDurableReceipt,
 } from "../../src/remote/client.js";
@@ -201,6 +202,64 @@ describe("durable remote client receipts", () => {
       expect(result.answerText).toBe("ok");
       expect(calls).toContain("POST /v1/runs");
       expect(calls.some((x) => x.includes("/v1/runs/r1/events"))).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("fails a missing capability before POSTing a run", async () => {
+    let posts = 0;
+    const server = http.createServer((req, res) => {
+      if (req.url === "/health") {
+        res.end(
+          JSON.stringify({
+            ok: true,
+            version: "1",
+            runtime: { name: "node", version: "25.1.0", major: 25, minimumMajor: 24 },
+            capabilities: {
+              schemaVersion: 1,
+              features: [{ id: "oracle.remote.durable-queue", version: 1 }],
+            },
+          }),
+        );
+        return;
+      }
+      if (req.method === "POST") posts++;
+      res.statusCode = 404;
+      res.end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+    try {
+      await expect(
+        createRemoteBrowserExecutor({
+          host: `127.0.0.1:${port}`,
+          requiredCapabilities: [{ id: "missing", version: 1 }],
+        })({ prompt: "x", sessionId: `missing-${Date.now()}` }),
+      ).rejects.toThrow(/required capability/);
+      expect(posts).toBe(0);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("rejects unknown and nonmonotonic event records", async () => {
+    const server = http.createServer((_req, res) => {
+      res.end(
+        JSON.stringify({
+          events: [
+            { seq: 0, event: { type: "accepted", extra: true } },
+            { seq: 0, event: { type: "accepted" } },
+          ],
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as any).port;
+    try {
+      await expect(getDurableRemoteRunEvents(`127.0.0.1:${port}`, "r")).rejects.toThrow(
+        /malformed or nonmonotonic/,
+      );
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }

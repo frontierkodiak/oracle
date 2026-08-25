@@ -242,9 +242,10 @@ function isKnownRemoteEvent(value: unknown): boolean {
     );
   if (e.type === "cancellation") return keys(["type", "outcome"]) && typeof e.outcome === "string";
   if (e.type === "result")
-    return keys(["type", "result"]) && Boolean(e.result && typeof e.result === "object");
+    return keys(["type", "result"]) && isValidResult(e.result as BrowserRunResult);
   if (e.type === "artifact-ready")
     return (
+      keys(["type", "runId", "artifact"]) &&
       typeof e.runId === "string" &&
       (() => {
         try {
@@ -593,6 +594,23 @@ export async function transferRemoteArtifact(p: {
 function validateArtifactDescriptor(d: RemoteArtifactDescriptor): void {
   if (
     !d ||
+    typeof d !== "object" ||
+    Array.isArray(d) ||
+    Object.keys(d).some(
+      (key) =>
+        ![
+          "artifactId",
+          "runId",
+          "kind",
+          "filename",
+          "mimeType",
+          "byteSize",
+          "sha256",
+          "validation",
+          "sourceUrlKind",
+          "transferStatus",
+        ].includes(key),
+    ) ||
     d.kind !== "file" ||
     !/^[a-zA-Z0-9_-]{1,128}$/.test(d.runId) ||
     !/^[a-zA-Z0-9_-]{1,128}$/.test(d.artifactId) ||
@@ -604,7 +622,8 @@ function validateArtifactDescriptor(d: RemoteArtifactDescriptor): void {
     d.filename.length === 0 ||
     d.filename.length > 255 ||
     !["sandbox", "chatgpt-file-endpoint", "browser-download"].includes(d.sourceUrlKind) ||
-    !["ready", "streaming", "completed", "failed", "skipped"].includes(d.transferStatus)
+    !["ready", "streaming", "completed", "failed", "skipped"].includes(d.transferStatus) ||
+    (d.mimeType !== undefined && typeof d.mimeType !== "string")
   )
     throw new Error("invalid bridge artifact descriptor");
 }
@@ -614,7 +633,7 @@ async function downloadArtifact(
   d: RemoteArtifactDescriptor,
   target: string,
 ): Promise<void> {
-  await new Promise((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     const { hostname, port } = parseHostPort(host);
     const req = http.request(
       {
@@ -630,26 +649,41 @@ async function downloadArtifact(
           reject(new Error(`artifact download HTTP ${res.statusCode}`));
           return;
         }
-        const out = createWriteStream(target, {
-          flags: (fsConstants.O_WRONLY |
-            fsConstants.O_CREAT |
-            fsConstants.O_EXCL |
-            fsConstants.O_NOFOLLOW) as unknown as string,
-          mode: 0o600,
-        });
-        let n = 0;
-        const limit = new Transform({
-          transform(chunk: Buffer, _e, cb) {
-            n += chunk.length;
-            cb(
-              n > d.byteSize || n > MAX_REMOTE_ARTIFACT_BYTES
-                ? new Error("artifact exceeds declared size")
-                : null,
-              chunk,
+        void open(
+          target,
+          fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+          0o600,
+        ).then(
+          (handle) => {
+            const out = createWriteStream(target, { fd: handle.fd, autoClose: false });
+            let n = 0;
+            const limit = new Transform({
+              transform(chunk: Buffer, _e, cb) {
+                n += chunk.length;
+                cb(
+                  n > d.byteSize || n > MAX_REMOTE_ARTIFACT_BYTES
+                    ? new Error("artifact exceeds declared size")
+                    : null,
+                  chunk,
+                );
+              },
+            });
+            void pipeline(res, limit, out).then(
+              async () => {
+                await handle.close();
+                resolve();
+              },
+              async (error) => {
+                await handle.close().catch(() => undefined);
+                reject(error);
+              },
             );
           },
-        });
-        void pipeline(res, limit, out).then(resolve, reject);
+          (error) => {
+            res.resume();
+            reject(error);
+          },
+        );
       },
     );
     req.on("timeout", () => req.destroy(new Error("request timeout")));
@@ -732,6 +766,8 @@ function validateSnapshot(s: DurableRunSnapshot): void {
     s.cancellation !== undefined &&
     (!s.cancellation ||
       typeof s.cancellation !== "object" ||
+      Array.isArray(s.cancellation) ||
+      Object.keys(s.cancellation).some((key) => !["requestedAt", "outcome"].includes(key)) ||
       (s.cancellation.requestedAt !== undefined && !isIsoTimestamp(s.cancellation.requestedAt)) ||
       (s.cancellation.outcome !== undefined && typeof s.cancellation.outcome !== "string"))
   )
@@ -751,7 +787,28 @@ function validateSnapshot(s: DurableRunSnapshot): void {
     throw new Error("malformed durable artifact descriptors");
 }
 function isValidResult(result: BrowserRunResult): boolean {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  const allowed = [
+    "answerText",
+    "answerMarkdown",
+    "answerHtml",
+    "tookMs",
+    "answerTokens",
+    "answerChars",
+    "browserTransport",
+    "conversationId",
+    "promptSubmitted",
+    "warnings",
+    "archive",
+    "modelSelection",
+    "thinkingSelection",
+    "tabUrl",
+    "savedFiles",
+    "savedImages",
+    "artifacts",
+  ];
   return (
+    Object.keys(result).every((key) => allowed.includes(key)) &&
     typeof result.answerText === "string" &&
     typeof result.answerMarkdown === "string" &&
     [result.tookMs, result.answerTokens, result.answerChars].every(
@@ -819,7 +876,6 @@ function isDefinitePreSubmit(e: unknown): boolean {
 }
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
-    let connected = false;
     let settled = false;
     const t = setTimeout(() => {
       settled = true;
@@ -894,11 +950,13 @@ async function requestDurableJson(p: {
         });
       },
     );
-    req.on("socket", (socket) =>
-      socket.once("connect", () => {
-        connected = true;
-      }),
-    );
+    req.on("socket", (socket) => {
+      // Reused agents can hand us an already-connected socket; in that case
+      // no future `connect` event is emitted and transport errors must be
+      // classified as post-submit.
+      if (!socket.connecting || socket.readyState === "open") connected = true;
+      else socket.once("connect", () => (connected = true));
+    });
     req.on("timeout", () =>
       req.destroy(
         new RemoteTransportError("request timeout", connected ? "post-submit" : "pre-submit"),
