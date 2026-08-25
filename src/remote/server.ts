@@ -23,6 +23,7 @@ import {
 import {
   persistBrowserRunArtifacts,
   resolveDurableArtifact,
+  sanitizeDurableBrowserResult,
 } from "./durableArtifacts.js";
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
@@ -277,7 +278,10 @@ export async function createRemoteServer(
                 artifactError instanceof Error ? artifactError.message : String(artifactError),
             };
             durableQueue.transition(id, "completed", "terminal", {
-              result: { ...result, warnings: [...(result.warnings ?? []), warning] },
+              result: sanitizeDurableBrowserResult({
+                ...result,
+                warnings: [...(result.warnings ?? []), warning],
+              }),
               elapsedMs: Date.now() - started,
               etaQualifying: false,
             });
@@ -289,12 +293,12 @@ export async function createRemoteServer(
           const durableResult =
             payload.browserConfig.captureOnly === true
               ? {
-                  ...result,
+                  ...durable.result,
                   promptSubmitted: false,
                   modelSelection: undefined,
                   thinkingSelection: undefined,
                 }
-              : result;
+              : durable.result;
           const modelEvidence = durableResult.modelSelection as any;
           const thinkingEvidence = result.thinkingSelection as any;
           const model = String(modelEvidence?.resolvedLabel ?? modelEvidence?.requestedModel ?? "");

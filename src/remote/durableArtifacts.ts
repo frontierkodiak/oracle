@@ -67,7 +67,7 @@ export async function persistBrowserRunArtifacts(params: {
       version: 1,
       runId,
       artifacts: descriptors,
-      result: sanitizeResult(params.result),
+      result: sanitizeDurableBrowserResult(params.result),
     };
     await atomicWriteJson(path.join(runRoot, MANIFEST), manifest);
     return {
@@ -75,7 +75,7 @@ export async function persistBrowserRunArtifacts(params: {
       runRoot,
       manifestPath: path.join(runRoot, MANIFEST),
       descriptors,
-      result: sanitizeResult(params.result),
+      result: sanitizeDurableBrowserResult(params.result),
     };
   } catch (error) {
     await rm(artifactsRoot, { recursive: true, force: true }).catch(() => undefined);
@@ -410,7 +410,7 @@ function sourceKind(source?: string): RemoteArtifactDescriptor["sourceUrlKind"] 
   if (source === "browser-download") return "browser-download";
   return "chatgpt-file-endpoint";
 }
-function sanitizeResult(result: BrowserRunResult): BrowserRunResult {
+export function sanitizeDurableBrowserResult(result: BrowserRunResult): BrowserRunResult {
   return {
     answerText: result.answerText,
     answerMarkdown: result.answerMarkdown,
