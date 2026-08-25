@@ -158,14 +158,15 @@ describe("remote browser service", () => {
         major: Number(process.versions.node.split(".")[0]),
         minimumMajor: 24,
       });
-      expect(healthOk.json?.capabilities).toMatchObject({
+      const healthCapabilities = healthOk.json?.capabilities as any;
+      expect(healthCapabilities).toMatchObject({
         schemaVersion: 1,
         features: expect.arrayContaining([
           expect.objectContaining({ id: "oracle.remote.artifact-transfer", version: 1 }),
           expect.objectContaining({ id: "oracle.remote.durable-queue", version: 1 }),
         ]),
       });
-      expect(healthOk.json?.capabilities.features).not.toEqual(
+      expect(healthCapabilities.features).not.toEqual(
         expect.arrayContaining([
           expect.objectContaining({ id: "oracle.browser.capture-only", version: 1 }),
         ]),

@@ -561,4 +561,49 @@ describe("durable remote client receipts", () => {
       setOracleHomeDirOverrideForTest(null);
     }
   });
+
+  it("serializes only conversation-owned browser config on ordinary remote runs", async () => {
+    let wire: any;
+    const { server, host } = await listen(async (req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      if (req.method === "POST" && req.url === "/v1/runs") {
+        wire = await body(req);
+        return void res.end(JSON.stringify(runSnapshot("config-wire")));
+      }
+      if (req.url?.startsWith("/v1/runs/config-wire/events"))
+        return void res.end(JSON.stringify({ events: [] }));
+      if (req.url === "/v1/runs/config-wire")
+        return void res.end(JSON.stringify(runSnapshot("config-wire")));
+      res.statusCode = 404;
+      res.end();
+    });
+    try {
+      await createRemoteBrowserExecutor({ host })({
+        prompt: "ordinary",
+        sessionId: "config-wire",
+        config: {
+          url: "https://chatgpt.com/",
+          desiredModel: "GPT-5.6 Sol",
+          thinkingTime: "pro",
+          chromeProfile: "Default",
+          chromePath: "/Applications/Google Chrome.app",
+          inlineCookies: [{ name: "secret", value: "never-send" }],
+          remoteChrome: { host: "127.0.0.1", port: 9222 },
+          browserTabRef: "current",
+          maxConcurrentTabs: 99,
+          allowCookieErrors: true,
+        } as any,
+      });
+      expect(wire.browserConfig).toEqual({
+        url: "https://chatgpt.com/",
+        desiredModel: "GPT-5.6 Sol",
+        thinkingTime: "pro",
+      });
+      expect(JSON.stringify(wire)).not.toContain("never-send");
+      expect(JSON.stringify(wire)).not.toContain("Google Chrome.app");
+    } finally {
+      await close(server);
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
 });

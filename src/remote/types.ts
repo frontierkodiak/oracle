@@ -9,6 +9,46 @@ export const ARTIFACT_TRANSFER_FEATURE_ID = "oracle.remote.artifact-transfer";
 export const CAPTURE_ONLY_FEATURE_ID = "oracle.browser.capture-only";
 export const DURABLE_QUEUE_FEATURE_ID = "oracle.remote.durable-queue";
 
+/** Browser settings a remote caller may place on the transport wire. */
+export const CLIENT_BROWSER_CONFIG_FIELDS = [
+  "chatgptUrl",
+  "url",
+  "desiredModel",
+  "modelStrategy",
+  "thinkingTime",
+  "researchMode",
+  "archiveConversations",
+  "resumeConversationUrl",
+  "captureProviderNative",
+  "captureOnly",
+  "timeoutMs",
+  "inputTimeoutMs",
+  "attachmentTimeoutMs",
+  "assistantRecheckDelayMs",
+  "assistantRecheckTimeoutMs",
+  "autoReattachDelayMs",
+  "autoReattachIntervalMs",
+  "autoReattachTimeoutMs",
+  "keepBrowser",
+  "debug",
+] as const satisfies readonly (keyof BrowserSessionConfig)[];
+
+/**
+ * Whitelist rather than blacklist: profile paths, cookies, debugger targets,
+ * executable paths, tab selectors, and host concurrency remain host-owned.
+ */
+export function pickClientBrowserConfig(
+  requested: BrowserSessionConfig | undefined | null,
+): BrowserSessionConfig {
+  const accepted: BrowserSessionConfig = {};
+  if (!requested) return accepted;
+  for (const field of CLIENT_BROWSER_CONFIG_FIELDS) {
+    const value = requested[field];
+    if (value !== undefined) (accepted as Record<string, unknown>)[field] = value;
+  }
+  return accepted;
+}
+
 export interface RemoteCapabilityFeature {
   id: string;
   version: number;

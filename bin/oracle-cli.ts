@@ -83,7 +83,7 @@ import {
   submitDurableRemoteRunWithReceipt,
   watchDurableRemoteRun,
 } from "../src/remote/client.js";
-import type { RemoteRunPayload } from "../src/remote/types.js";
+import { pickClientBrowserConfig, type RemoteRunPayload } from "../src/remote/types.js";
 import { resolveConfiguredMaxFileSizeBytes } from "../src/cli/fileSize.js";
 import {
   isAzureOpenAICandidateModel,
@@ -1064,13 +1064,7 @@ const remoteSubmit = addRemoteConnectionOptions(
     .option("--browser-timeout <duration>", "Browser timeout (for example 10m).")
     .option("--browser-input-timeout <duration>", "Composer input timeout.")
     .option("--browser-attachment-timeout <duration>", "Attachment timeout.")
-    .option("--browser-manual-login", "Use the persistent manual-login browser profile.")
-    .option("--browser-manual-login-profile-dir <path>", "Manual-login profile directory.")
-    .option("--browser-cookie-sync", "Copy cookies from the host Chrome profile.")
-    .option("--browser-no-cookie-sync", "Disable cookie synchronization.")
-    .option("--browser-headless", "Run browser headlessly.")
     .option("--browser-keep-browser", "Keep the remote browser open after completion.")
-    .option("--browser-tab <ref>", "Browser tab reference to reuse.")
     .option("--browser-model-strategy <strategy>", "Model selection: select, current, or ignore.")
     .option("--browser-thinking-time <level>", "Thinking intensity.")
     .option("--browser-research <mode>", "Research mode: off or deep.")
@@ -1089,13 +1083,7 @@ remoteSubmit.action(async function (this: Command) {
     browserTimeout: options.browserTimeout as string | undefined,
     browserInputTimeout: options.browserInputTimeout as string | undefined,
     browserAttachmentTimeout: options.browserAttachmentTimeout as string | undefined,
-    browserManualLogin: options.browserManualLogin as boolean | undefined,
-    browserManualLoginProfileDir: options.browserManualLoginProfileDir as string | undefined,
-    browserCookieSync: options.browserCookieSync as boolean | undefined,
-    browserNoCookieSync: options.browserNoCookieSync as boolean | undefined,
-    browserHeadless: options.browserHeadless as boolean | undefined,
     browserKeepBrowser: options.browserKeepBrowser as boolean | undefined,
-    browserTab: options.browserTab as string | undefined,
     browserModelStrategy: options.browserModelStrategy as
       | "select"
       | "current"
@@ -1108,7 +1096,7 @@ remoteSubmit.action(async function (this: Command) {
   const payload: RemoteRunPayload = {
     prompt,
     attachments: [],
-    browserConfig,
+    browserConfig: pickClientBrowserConfig(browserConfig),
     options: { sessionId, verbose: options.verbose as boolean | undefined },
   };
   const submitted = await submitDurableRemoteRunWithReceipt({ host, token, sessionId, payload });

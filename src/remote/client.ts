@@ -25,6 +25,7 @@ import {
   CAPTURE_ONLY_FEATURE_ID,
   DURABLE_QUEUE_FEATURE_ID,
   MAX_REMOTE_ARTIFACT_BYTES,
+  pickClientBrowserConfig,
   type DurableRunSnapshot,
   type RemoteArtifactDescriptor,
   type RemoteAttachmentPayload,
@@ -574,13 +575,14 @@ async function serializePayload(
   o: BrowserRunOptions,
   captureOnly: boolean,
 ): Promise<RemoteRunPayload> {
+  const allowedConfig = pickClientBrowserConfig(o.config);
   const config = captureOnly
     ? Object.fromEntries(
-        Object.entries(o.config ?? {}).filter(
+        Object.entries(allowedConfig).filter(
           ([k]) => !["desiredModel", "modelStrategy", "thinkingTime", "researchMode"].includes(k),
         ),
       )
-    : (o.config ?? {});
+    : allowedConfig;
   return {
     prompt: captureOnly ? "" : o.prompt,
     attachments: captureOnly ? [] : await serializeAttachments(o.attachments ?? []),

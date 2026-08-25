@@ -9,11 +9,14 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdir, writeFile, stat } from "node:fs/promises";
 import chalk from "chalk";
 import type { BrowserLogger, CookieParam } from "../browser/types.js";
-import type { BrowserSessionConfig } from "../sessionManager.js";
 import { runBrowserMode } from "../browserMode.js";
 import { normalizeMaxConcurrentTabs } from "../browser/tabLeaseRegistry.js";
 import { loadUserConfig } from "../config.js";
-import type { RemoteRunPayload } from "./types.js";
+import {
+  CLIENT_BROWSER_CONFIG_FIELDS,
+  pickClientBrowserConfig,
+  type RemoteRunPayload,
+} from "./types.js";
 import {
   DurableQueueStore,
   DURABLE_QUEUE_CAPABILITY_ID,
@@ -918,50 +921,9 @@ function formatDurableFailure(error: unknown): {
   };
 }
 
-/**
- * Fields a remote caller may set: they describe the conversation and its time
- * budgets. Everything else on BrowserSessionConfig — executable paths, profile
- * directories, debugger endpoints, tab selection, window mode, cookie policy,
- * and the shared-profile concurrency limits — is the host's to decide.
- */
-const CLIENT_BROWSER_CONFIG_FIELDS = [
-  "chatgptUrl",
-  "url",
-  "desiredModel",
-  "modelStrategy",
-  "thinkingTime",
-  "researchMode",
-  "archiveConversations",
-  "resumeConversationUrl",
-  "captureProviderNative",
-  "captureOnly",
-  "timeoutMs",
-  "inputTimeoutMs",
-  "attachmentTimeoutMs",
-  "assistantRecheckDelayMs",
-  "assistantRecheckTimeoutMs",
-  "autoReattachDelayMs",
-  "autoReattachIntervalMs",
-  "autoReattachTimeoutMs",
-  "keepBrowser",
-  "debug",
-] as const satisfies readonly (keyof BrowserSessionConfig)[];
-
-export function pickClientBrowserConfig(
-  requested: BrowserSessionConfig | undefined | null,
-): BrowserSessionConfig {
-  const accepted: BrowserSessionConfig = {};
-  if (!requested) {
-    return accepted;
-  }
-  for (const field of CLIENT_BROWSER_CONFIG_FIELDS) {
-    const value = requested[field];
-    if (value !== undefined) {
-      (accepted as Record<string, unknown>)[field] = value;
-    }
-  }
-  return accepted;
-}
+// Preserve the existing public import while keeping the wire allowlist shared
+// by both serializer and validator.
+export { pickClientBrowserConfig } from "./types.js";
 
 function sanitizeName(raw: string): string {
   return raw.replace(/[^a-zA-Z0-9._-]/g, "_");
