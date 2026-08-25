@@ -124,6 +124,16 @@ describe("copied-profile launch flags", () => {
 });
 
 describe("hidden-window launch flags", () => {
+  test("builds the platform-specific window mode deterministically", async () => {
+    const { buildChromeWindowModeFlags } = await import("../../src/browser/chromeLifecycle.js");
+
+    expect(buildChromeWindowModeFlags(false, true, "darwin")).toEqual([
+      "--window-position=-32000,-32000",
+    ]);
+    expect(buildChromeWindowModeFlags(false, true, "linux")).toEqual([]);
+    expect(buildChromeWindowModeFlags(true, true, "darwin")).toEqual(["--headless=new"]);
+  });
+
   test("keeps macOS Chrome rendered in an off-screen window", async () => {
     const { buildChromeFlagsForTest } = await import("../../src/browser/chromeLifecycle.js");
     const flags = buildChromeFlagsForTest(false, undefined, true);
@@ -180,6 +190,27 @@ describe("hidden-window launch flags", () => {
     } else {
       expect(browser.setWindowBounds).not.toHaveBeenCalled();
     }
+  });
+
+  test("brings a running Chrome window on-screen for first login", async () => {
+    const { positionChromeWindowOnscreen } = await import("../../src/browser/chromeLifecycle.js");
+    const browser = {
+      getWindowForTarget: vi.fn().mockResolvedValue({ windowId: 9 }),
+      setWindowBounds: vi.fn().mockResolvedValue(undefined),
+    };
+    const logger = vi.fn();
+
+    const positioned = await positionChromeWindowOnscreen(
+      { Browser: browser } as never,
+      logger as never,
+    );
+
+    expect(positioned).toBe(true);
+    expect(browser.setWindowBounds).toHaveBeenCalledWith({
+      windowId: 9,
+      bounds: { left: 80, top: 80, windowState: "normal" },
+    });
+    expect(logger).toHaveBeenCalledWith("Chrome window positioned on-screen");
   });
 });
 

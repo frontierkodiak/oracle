@@ -21,7 +21,9 @@ const durable = {
 const envelope = (overrides: Record<string, unknown> = {}) => ({
   ok: true,
   version: "0.18.0",
+  installSha: "a".repeat(40),
   runtime: { name: "node", version: "25.1.0", major: 25, minimumMajor: 24 },
+  browser: { windowMode: "hidden" },
   capabilities: { schemaVersion: 1, features: [artifact, durable] },
   ...overrides,
 });
@@ -53,6 +55,8 @@ describe("remote runtime and health handshake", () => {
       },
     });
     expect(parsed?.runtime).toEqual(getOracleRuntimeIdentity("25.1.0"));
+    expect(parsed?.installSha).toBe("a".repeat(40));
+    expect(parsed?.browser).toEqual({ windowMode: "hidden" });
     expect(parsed?.manifest.features).toHaveLength(2);
     expect(parsed?.manifest.features[1]).toEqual({
       id: "vendor.future",
@@ -66,12 +70,22 @@ describe("remote runtime and health handshake", () => {
     });
   });
 
+  test("accepts older health envelopes without install or browser metadata", () => {
+    const parsed = parseHealthEnvelope(envelope({ installSha: undefined, browser: undefined }));
+
+    expect(parsed?.installSha).toBeUndefined();
+    expect(parsed?.browser).toBeUndefined();
+  });
+
   test.each([
     { ok: false },
     { version: "" },
     { runtime: undefined },
     { runtime: { name: "node", version: "24.0.0", major: 25, minimumMajor: 24 } },
     { runtime: { name: "node", version: "24.0.0", major: 24, minimumMajor: 23 } },
+    { installSha: "not-a-sha" },
+    { browser: "hidden" },
+    { browser: { windowMode: "headless" } },
     {
       capabilities: {
         schemaVersion: 1,

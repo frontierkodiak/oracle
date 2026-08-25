@@ -17,6 +17,7 @@ import {
   launchChrome,
   registerTerminationHooks,
   positionChromeWindowOffscreen,
+  positionChromeWindowOnscreen,
   connectToRemoteChrome,
   connectWithNewTab,
   closeTab,
@@ -1344,7 +1345,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       abortPromise
         ? Promise.race([promise, disconnectPromise, abortPromise])
         : Promise.race([promise, disconnectPromise]);
-    const { Network, Page, Runtime, Input, DOM, Target } = client;
+    const windowClient = client;
+    const { Network, Page, Runtime, Input, DOM, Target } = windowClient;
 
     const domainEnablers = [Network.enable({}), Page.enable(), Runtime.enable()];
     if (DOM && typeof DOM.enable === "function") {
@@ -1475,6 +1477,14 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           timeoutMs: config.timeoutMs,
           profileDir: userDataDir,
           keepBrowser: effectiveKeepBrowser,
+          onLoginRequired:
+            !config.headless && config.hideWindow && process.platform === "darwin"
+              ? async () => await positionChromeWindowOnscreen(windowClient, logger)
+              : undefined,
+          onLoginAuthenticated:
+            !config.headless && config.hideWindow && process.platform === "darwin"
+              ? async () => await positionChromeWindowOffscreen(windowClient, logger)
+              : undefined,
         }),
       );
 
@@ -2831,6 +2841,8 @@ async function waitForLogin({
   timeoutMs,
   profileDir,
   keepBrowser,
+  onLoginRequired,
+  onLoginAuthenticated,
 }: {
   runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
@@ -2839,6 +2851,8 @@ async function waitForLogin({
   timeoutMs: number;
   profileDir?: string;
   keepBrowser?: boolean;
+  onLoginRequired?: () => Promise<boolean>;
+  onLoginAuthenticated?: () => Promise<void>;
 }): Promise<void> {
   if (!manualLogin) {
     await ensureLoggedIn(runtime, logger, { appliedCookies });
@@ -2847,9 +2861,14 @@ async function waitForLogin({
   const waitMs = resolveManualLoginWaitMs(timeoutMs, Boolean(keepBrowser));
   const deadline = Date.now() + waitMs;
   let lastNotice = 0;
+  let loginWindowRevealed = false;
   while (Date.now() < deadline) {
     try {
       await ensureLoggedIn(runtime, logger, { appliedCookies });
+      if (loginWindowRevealed) {
+        logger("Manual login detected; returning the shared Chrome window off-screen.");
+        await onLoginAuthenticated?.();
+      }
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2857,6 +2876,12 @@ async function waitForLogin({
       const sessionMissing = message?.toLowerCase().includes("session not detected");
       if (!loginDetected && !sessionMissing) {
         throw error;
+      }
+      if (!loginWindowRevealed && onLoginRequired) {
+        logger(
+          "Manual login required: bringing the shared Chrome window on-screen now. Sign in to ChatGPT there; Oracle will move it off-screen again after authentication.",
+        );
+        loginWindowRevealed = await onLoginRequired();
       }
       const now = Date.now();
       if (now - lastNotice > 5000) {

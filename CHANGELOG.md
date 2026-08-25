@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Serve: honor `browser.hideWindow` for the shared manual-login Chrome, add explicit `--browser-hide-window` / `--browser-show-window` overrides and health metadata, and reveal a hidden window whenever interactive login is required.
+
 ## 0.18.0 — 2026-08-14
 
 ### Added

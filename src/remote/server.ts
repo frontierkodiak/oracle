@@ -50,6 +50,12 @@ import { CHATGPT_URL } from "../browser/constants.js";
 import { getCliVersion } from "../version.js";
 import { asOracleUserError } from "../oracle/errors.js";
 import {
+  buildChromeWindowModeFlags,
+  connectToChrome,
+  positionChromeWindowOffscreen,
+  positionChromeWindowOnscreen,
+} from "../browser/chromeLifecycle.js";
+import {
   cleanupStaleProfileState,
   readDevToolsPort,
   verifyDevToolsReachable,
@@ -67,6 +73,8 @@ export interface RemoteServerOptions {
   logger?: (message: string) => void;
   manualLoginDefault?: boolean;
   manualLoginProfileDir?: string;
+  /** Explicit serve-level override after config precedence is resolved. */
+  browserHideWindow?: boolean;
   cookieSyncDefault?: boolean;
   /** Conversations that may be active at once on the shared browser profile. */
   maxConcurrentRuns?: number;
@@ -104,6 +112,28 @@ interface RemoteServerInstance {
 }
 
 const ARTIFACT_PROTOCOL_VERSION = 1;
+type BrowserWindowMode = "hidden" | "visible";
+
+export function resolveServeBrowserHideWindow(
+  explicitOverride: boolean | undefined,
+  configuredHideWindow: boolean | undefined,
+): boolean {
+  return explicitOverride ?? configuredHideWindow ?? false;
+}
+
+export function resolveServeBrowserWindowMode(
+  hideWindow: boolean,
+  platform: NodeJS.Platform = process.platform,
+): BrowserWindowMode {
+  return hideWindow && platform === "darwin" ? "hidden" : "visible";
+}
+
+export function shouldApplyExistingServeBrowserWindowMode(
+  explicitOverride: boolean | undefined,
+  effectiveMode: BrowserWindowMode,
+): boolean {
+  return effectiveMode === "hidden" || explicitOverride === false;
+}
 
 class MaintenanceCaptureViolationError extends Error {
   constructor(
@@ -166,10 +196,13 @@ export async function createRemoteServer(
   options: RemoteServerOptions = {},
   deps: RemoteServerDeps = {},
 ): Promise<RemoteServerInstance> {
+  const serviceIdentity = await authenticatedServiceIdentity();
   const runtime = {
     ...getOracleRuntimeIdentity(),
-    ...(await authenticatedServiceIdentity()),
+    ...serviceIdentity,
   };
+  const installSha = serviceIdentity.sourceCommit ?? null;
+  const browserWindowMode = resolveServeBrowserWindowMode(options.browserHideWindow === true);
   const runBrowser = deps.runBrowser ?? runBrowserMode;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
@@ -290,6 +323,7 @@ export async function createRemoteServer(
             inlineCookies: null,
             inlineCookiesSource: null,
             cookieSync: options.cookieSyncDefault === true,
+            hideWindow: browserWindowMode === "hidden",
             ...(options.manualLoginDefault
               ? {
                   manualLogin: true,
@@ -677,6 +711,7 @@ export async function createRemoteServer(
         JSON.stringify({
           ok: true,
           version: getCliVersion(),
+          installSha,
           uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
           capabilities: artifactCapabilities(options.allowCaptureOnly === true, queueStatus),
           // So a caller can decide whether to send work now or later, instead of
@@ -686,6 +721,7 @@ export async function createRemoteServer(
           maxConcurrentRuns: queueStatus.capacity,
           runtime,
           process: { pid: process.pid },
+          browser: { windowMode: browserWindowMode },
           queue: queueStatus,
           admission: durableQueue.admission(),
         }),
@@ -872,6 +908,13 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
   // This must precede cookie extraction, profile setup, Chrome launch, and
   // listener creation. Unsupported runtimes must leave the host untouched.
   getOracleRuntimeIdentity();
+  const configuredHideWindow = (await loadUserConfig({ includeProject: false }).catch(() => null))
+    ?.config.browser?.hideWindow;
+  const hideWindow = resolveServeBrowserHideWindow(options.browserHideWindow, configuredHideWindow);
+  const browserWindowMode = resolveServeBrowserWindowMode(hideWindow);
+  if (hideWindow && browserWindowMode === "visible") {
+    console.log("browser.hideWindow is only supported on macOS; Chrome will remain visible.");
+  }
   const manualProfileDir =
     options.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
   const preferManualLogin =
@@ -919,6 +962,11 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
           console.log(
             "Detected an existing automation Chrome session; will reuse it for manual login.",
           );
+          if (
+            shouldApplyExistingServeBrowserWindowMode(options.browserHideWindow, browserWindowMode)
+          ) {
+            await applyManualLoginChromeWindowMode(existingPort, browserWindowMode, console.log);
+          }
         } else {
           console.log(
             `Found stale DevToolsActivePort (port ${existingPort}, ${reachable.error}); launching a fresh manual-login Chrome.`,
@@ -926,10 +974,20 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
           await cleanupStaleProfileState(manualProfileDir, console.log, {
             lockRemovalMode: "never",
           });
-          void launchManualLoginChrome(manualProfileDir, CHATGPT_URL, console.log);
+          void launchManualLoginChrome(
+            manualProfileDir,
+            CHATGPT_URL,
+            console.log,
+            browserWindowMode === "hidden",
+          );
         }
       } else {
-        void launchManualLoginChrome(manualProfileDir, CHATGPT_URL, console.log);
+        void launchManualLoginChrome(
+          manualProfileDir,
+          CHATGPT_URL,
+          console.log,
+          browserWindowMode === "hidden",
+        );
       }
     } else if (opened) {
       console.log(
@@ -953,6 +1011,7 @@ export async function serveRemote(options: RemoteServerOptions = {}): Promise<vo
 
   const server = await createRemoteServer({
     ...options,
+    browserHideWindow: browserWindowMode === "hidden",
     manualLoginDefault: preferManualLogin,
     manualLoginProfileDir: manualProfileDir,
   });
@@ -1693,10 +1752,50 @@ function canSpawn(cmd: string): boolean {
   }
 }
 
+async function applyManualLoginChromeWindowMode(
+  port: number,
+  mode: BrowserWindowMode,
+  logger: (msg: string) => void,
+): Promise<void> {
+  const browserLogger = logger as BrowserLogger;
+  try {
+    const client = await connectToChrome(port, browserLogger);
+    try {
+      if (mode === "hidden") {
+        await positionChromeWindowOffscreen(client, browserLogger);
+      } else {
+        await positionChromeWindowOnscreen(client, browserLogger);
+      }
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`Unable to apply ${mode} mode to the existing manual-login Chrome: ${message}`);
+  }
+}
+
+export function buildManualLoginChromeFlags(
+  profileDir: string,
+  debugPort: number,
+  hideWindow: boolean,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  return [
+    "--no-first-run",
+    "--no-default-browser-check",
+    `--user-data-dir=${profileDir}`,
+    "--remote-allow-origins=*",
+    `--remote-debugging-port=${debugPort}`,
+    ...buildChromeWindowModeFlags(false, hideWindow, platform),
+  ];
+}
+
 async function launchManualLoginChrome(
   profileDir: string,
   url: string,
   logger: (msg: string) => void,
+  hideWindow = false,
 ): Promise<void> {
   const timeoutMs = 7000;
   let finished = false;
@@ -1719,13 +1818,7 @@ async function launchManualLoginChrome(
       port: debugPort,
       userDataDir: profileDir,
       startingUrl: url,
-      chromeFlags: [
-        "--no-first-run",
-        "--no-default-browser-check",
-        `--user-data-dir=${profileDir}`,
-        "--remote-allow-origins=*",
-        `--remote-debugging-port=${debugPort}`, // ensure DevToolsActivePort is written even on Windows
-      ],
+      chromeFlags: buildManualLoginChromeFlags(profileDir, debugPort, hideWindow),
     });
 
     const chosenPort = chrome?.port ?? debugPort ?? null;

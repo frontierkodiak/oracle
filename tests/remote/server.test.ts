@@ -6,10 +6,14 @@ import os from "node:os";
 import path from "node:path";
 import { mkdir, mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/promises";
 import {
+  buildManualLoginChromeFlags,
   createRemoteServer,
   pickClientBrowserConfig,
   qualifiesForProEtaSample,
+  resolveServeBrowserHideWindow,
+  resolveServeBrowserWindowMode,
   serveRemote,
+  shouldApplyExistingServeBrowserWindowMode,
 } from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
 import type { BrowserRunOptions, BrowserRunResult } from "../../src/browserMode.js";
@@ -69,6 +73,39 @@ test("qualifies verified GPT-5.6 Sol runs by Pro effort rather than model-label 
       false,
     ),
   ).toBe(false);
+});
+
+describe("serve browser window mode", () => {
+  test("gives explicit CLI intent precedence over user config", () => {
+    expect(resolveServeBrowserHideWindow(undefined, true)).toBe(true);
+    expect(resolveServeBrowserHideWindow(undefined, false)).toBe(false);
+    expect(resolveServeBrowserHideWindow(false, true)).toBe(false);
+    expect(resolveServeBrowserHideWindow(true, false)).toBe(true);
+    expect(resolveServeBrowserHideWindow(undefined, undefined)).toBe(false);
+  });
+
+  test("reports the effective platform mode", () => {
+    expect(resolveServeBrowserWindowMode(true, "darwin")).toBe("hidden");
+    expect(resolveServeBrowserWindowMode(false, "darwin")).toBe("visible");
+    expect(resolveServeBrowserWindowMode(true, "linux")).toBe("visible");
+  });
+
+  test("repositions reused Chrome only for hidden mode or an explicit show override", () => {
+    expect(shouldApplyExistingServeBrowserWindowMode(undefined, "hidden")).toBe(true);
+    expect(shouldApplyExistingServeBrowserWindowMode(false, "visible")).toBe(true);
+    expect(shouldApplyExistingServeBrowserWindowMode(undefined, "visible")).toBe(false);
+    expect(shouldApplyExistingServeBrowserWindowMode(true, "visible")).toBe(false);
+  });
+
+  test("uses the shared macOS off-screen launch flag for manual-login Chrome", () => {
+    const hidden = buildManualLoginChromeFlags("/tmp/oracle-profile", 9222, true, "darwin");
+    const visible = buildManualLoginChromeFlags("/tmp/oracle-profile", 9222, false, "darwin");
+    const unsupported = buildManualLoginChromeFlags("/tmp/oracle-profile", 9222, true, "linux");
+
+    expect(hidden).toContain("--window-position=-32000,-32000");
+    expect(visible).not.toContain("--window-position=-32000,-32000");
+    expect(unsupported).not.toContain("--window-position=-32000,-32000");
+  });
 });
 
 describe("remote browser service", () => {
@@ -194,6 +231,8 @@ describe("remote browser service", () => {
       expect(healthOk.statusCode).toBe(200);
       expect(healthOk.json?.ok).toBe(true);
       expect(typeof healthOk.json?.version).toBe("string");
+      expect(healthOk.json).toHaveProperty("installSha");
+      expect(healthOk.json?.browser).toEqual({ windowMode: "visible" });
       expect(healthOk.json?.runtime).toMatchObject({
         name: "node",
         version: process.versions.node,
@@ -327,6 +366,7 @@ describe("remote browser service", () => {
           logger: () => {},
           manualLoginDefault: true,
           manualLoginProfileDir,
+          browserHideWindow: true,
         },
         {
           runBrowser: async (options) => {
@@ -335,6 +375,7 @@ describe("remote browser service", () => {
               manualLoginProfileDir,
               keepBrowser: true,
               cookieSync: false,
+              hideWindow: process.platform === "darwin",
             });
             cleanupPolicies.push(options.closeOwnedTabOnComplete);
             return {

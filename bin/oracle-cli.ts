@@ -1011,12 +1011,30 @@ program
     "Copy cookies from this host's live Chrome profile instead of using the dedicated profile.",
     false,
   )
+  .addOption(
+    new Option(
+      "--browser-show-window",
+      "Keep the shared Chrome window on-screen, overriding browser.hideWindow config.",
+    ).default(undefined),
+  )
   .option(
     "--allow-capture-only",
     "Allow capture-only durable requests (opt-in; default false).",
     false,
   )
+  .addHelpText(
+    "after",
+    "\nWindow override inherited from oracle:\n  --browser-hide-window  Keep the shared macOS Chrome window off-screen while preserving headful rendering.\n",
+  )
   .action(async (commandOptions) => {
+    // --browser-hide-window is an existing root option, so Commander records it
+    // on the parent command even when it follows `serve`.
+    const browserHideWindowRequested =
+      program.getOptionValueSource("browserHideWindow") === "cli" &&
+      program.opts().browserHideWindow === true;
+    if (browserHideWindowRequested && commandOptions.browserShowWindow === true) {
+      throw new Error("--browser-hide-window cannot be used with --browser-show-window");
+    }
     const { serveRemote } = await import("../src/remote/server.js");
     await serveRemote({
       host: commandOptions.host,
@@ -1024,6 +1042,12 @@ program
       token: commandOptions.token,
       manualLoginDefault: commandOptions.manualLogin,
       manualLoginProfileDir: commandOptions.manualLoginProfileDir,
+      browserHideWindow:
+        commandOptions.browserShowWindow === true
+          ? false
+          : browserHideWindowRequested
+            ? true
+            : undefined,
       cookieSyncDefault: commandOptions.browserCookieSync,
       allowCaptureOnly: commandOptions.allowCaptureOnly === true,
     });
