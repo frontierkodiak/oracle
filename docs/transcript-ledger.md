@@ -17,10 +17,12 @@ before publication. The independent-fetch descriptor is closed and requires a
 real 32-byte decimal digest, byte count, and timestamp; the materialized
 descriptor binds the authoritative raw bytes. Bounded JSON depth, node count,
 turn count, body size, and artifact size prevent untrusted captures from
-exhausting the process. Publication uses a state-root lock and generation file;
-startup recovery only removes orphans while holding that lock, then fails closed
-if an indexed object is missing or altered. Reopened objects are repaired to
-owner-only permissions.
+exhausting the process. SQLite WAL's `BEGIN IMMEDIATE` is the single
+interprocess publication authority: recovery and object publication hold the
+same write transaction, so startup recovery cannot sweep an in-flight writer's
+objects and a failed transaction leaves only recoverable orphans. Reopened
+objects are repaired to owner-only permissions. Legacy `state/publication.lock`
+files are not consulted.
 
 ## Commands
 

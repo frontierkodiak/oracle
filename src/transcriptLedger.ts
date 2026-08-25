@@ -17,9 +17,6 @@ const MAX_JSON_NODES = 250_000;
 const MAX_GRAPH_NODES = 100_000;
 const MAX_TURNS = 25_000;
 const MAX_TURN_BODY_BYTES = 16 * 1024 * 1024;
-const PUBLICATION_LOCK_WAIT_MS = 10;
-const PUBLICATION_LOCK_READ_BYTES = 4096;
-const PUBLICATION_LOCK_MALFORMED_STALE_MS = 5_000;
 
 export type LedgerObservationStatus = "captured" | "failed" | "challenged" | "auth-unavailable";
 
@@ -256,104 +253,24 @@ async function syncDirectory(target: string): Promise<void> {
   }
 }
 
-type PublicationRelease = () => Promise<void>;
+// SQLite remains the interprocess authority. This small in-process queue keeps
+// two DatabaseSync connections in one Node event loop from synchronously
+// blocking each other while the first publisher is awaiting filesystem I/O.
+const processPublicationTails = new Map<string, Promise<void>>();
 
-async function acquirePublicationLock(root: string): Promise<PublicationRelease> {
-  const state = path.join(root, "state");
-  const lockPath = path.join(state, "publication.lock");
-  await ensurePrivateDirectory(state);
-  const token = randomUUID();
-  for (;;) {
-    try {
-      const handle = await open(
-        lockPath,
-        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-        0o600,
-      );
-      try {
-        await handle.writeFile(JSON.stringify({ pid: process.pid, token, startedAt: Date.now() }));
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-      await chmod(lockPath, 0o600);
-      await syncDirectory(state);
-      return async () => {
-        try {
-          const owner = await readArtifactBytes(lockPath, PUBLICATION_LOCK_READ_BYTES);
-          const parsed = JSON.parse(owner.toString("utf8")) as Record<string, unknown>;
-          if (parsed.token === token) {
-            await rm(lockPath, { force: true });
-            await syncDirectory(state);
-          }
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-      };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      await assertNoSymlinkAncestors(lockPath);
-      let stale = false;
-      try {
-        const ownerBytes = await readArtifactBytes(lockPath, PUBLICATION_LOCK_READ_BYTES);
-        const owner = JSON.parse(ownerBytes.toString("utf8")) as Record<string, unknown>;
-        const pid = owner.pid;
-        if (!Number.isSafeInteger(pid) || typeof owner.token !== "string") stale = true;
-        else {
-          try {
-            process.kill(pid as number, 0);
-          } catch (probeError) {
-            stale = (probeError as NodeJS.ErrnoException).code !== "EPERM";
-          }
-        }
-      } catch (ownerError) {
-        if ((ownerError as NodeJS.ErrnoException).code === "ENOENT") continue;
-        try {
-          const lockStat = await lstat(lockPath);
-          stale = Date.now() - lockStat.mtimeMs > PUBLICATION_LOCK_MALFORMED_STALE_MS;
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code === "ENOENT") continue;
-          throw ownerError;
-        }
-      }
-      if (stale) {
-        await rm(lockPath, { force: true });
-        await syncDirectory(state);
-        continue;
-      }
-      await new Promise((resolve) => setTimeout(resolve, PUBLICATION_LOCK_WAIT_MS));
-    }
-  }
-}
-
-async function bumpPublicationGeneration(root: string): Promise<void> {
-  const state = path.join(root, "state");
-  const generationPath = path.join(state, "generation");
-  let generation = 0;
-  try {
-    const bytes = await readArtifactBytes(generationPath, 128);
-    const value = Number(bytes.toString("utf8").trim());
-    if (!Number.isSafeInteger(value) || value < 0)
-      throw new Error("ledger publication generation is invalid");
-    generation = value;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  const temp = path.join(state, `.generation.${randomUUID()}.tmp`);
-  const handle = await open(
-    temp,
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    await handle.writeFile(`${generation + 1}\n`);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await chmod(temp, 0o600);
-  await rename(temp, generationPath);
-  await syncDirectory(state);
+async function acquireProcessPublicationTurn(root: string): Promise<() => void> {
+  const previous = processPublicationTails.get(root) ?? Promise.resolve();
+  let releaseTurn!: () => void;
+  const turn = new Promise<void>((resolve) => {
+    releaseTurn = resolve;
+  });
+  const tail = previous.then(() => turn);
+  processPublicationTails.set(root, tail);
+  await previous;
+  return () => {
+    releaseTurn();
+    if (processPublicationTails.get(root) === tail) processPublicationTails.delete(root);
+  };
 }
 
 async function ensurePrivateFile(target: string): Promise<void> {
@@ -368,7 +285,6 @@ async function ensurePrivateFile(target: string): Promise<void> {
 async function ensureRoot(root: string): Promise<void> {
   await ensurePrivateDirectory(root);
   await ensurePrivateDirectory(path.join(root, "objects", "sha256"));
-  await ensurePrivateDirectory(path.join(root, "state"));
   const index = path.join(root, "index.sqlite");
   try {
     await ensurePrivateFile(index);
@@ -827,7 +743,9 @@ function conversationKey(provider: string, profileId: string, conversationId: st
 
 function createDb(indexPath: string): DatabaseSync {
   const db = new DatabaseSync(indexPath);
-  db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+  db.exec(
+    "PRAGMA busy_timeout=30000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;",
+  );
   db.exec(`
     CREATE TABLE IF NOT EXISTS ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS objects (sha256 TEXT PRIMARY KEY, kind TEXT NOT NULL, bytes INTEGER NOT NULL, path TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -881,20 +799,29 @@ export class TranscriptLedger {
     const root = resolveTranscriptLedgerRoot(options.root);
     await ensureRoot(root);
     const ledger = new TranscriptLedger(root);
-    ledger.db = createDb(path.join(root, "index.sqlite"));
+    const releaseTurn = await acquireProcessPublicationTurn(root);
     try {
+      ledger.db = createDb(path.join(root, "index.sqlite"));
       await ensurePrivateFile(path.join(root, "index.sqlite-wal")).catch((error) => {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       });
-      const releasePublication = await acquirePublicationLock(root);
+      ledger.database.exec("BEGIN IMMEDIATE");
       try {
         await recoverObjectStore(root, ledger.database);
-      } finally {
-        await releasePublication();
+        ledger.database.exec("COMMIT");
+      } catch (error) {
+        try {
+          ledger.database.exec("ROLLBACK");
+        } catch {
+          /* recovery transaction may already be gone after an interrupted open */
+        }
+        throw error;
       }
     } catch (error) {
       ledger.close();
       throw error;
+    } finally {
+      releaseTurn();
     }
     return ledger;
   }
@@ -952,16 +879,17 @@ export class TranscriptLedger {
     const capturedAt = input.capturedAt ?? now();
     const revisionId = hashText(`${key}\u0000${normalizedSequenceSha256}`);
     const observationId = randomUUID();
-    const releasePublication = await acquirePublicationLock(this.root);
+    const releaseTurn = await acquireProcessPublicationTurn(this.root);
     let rawObject: { path: string; created: boolean } | undefined;
     let evidenceObject: { path: string; created: boolean } | undefined;
     const db = this.database;
     let committed = false;
+    let transactionStarted = false;
     try {
+      db.exec("BEGIN IMMEDIATE");
+      transactionStarted = true;
       rawObject = await writeObject(this.root, rawBytes, rawSha256);
       evidenceObject = await writeObject(this.root, evidenceBytes, evidenceSha256);
-      await bumpPublicationGeneration(this.root);
-      db.exec("BEGIN IMMEDIATE");
       db.prepare(`INSERT INTO conversations(conversation_key,provider,profile_id,conversation_id,canonical_url,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)
         ON CONFLICT(conversation_key) DO UPDATE SET canonical_url=COALESCE(excluded.canonical_url,conversations.canonical_url), state='captured', updated_at=excluded.updated_at`).run(
         key,
@@ -1057,10 +985,12 @@ export class TranscriptLedger {
         normalizedSequenceSha256,
       };
     } catch (error) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {
-        /* transaction may already be gone after a crash */
+      if (transactionStarted) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {
+          /* transaction may already be gone after a crash */
+        }
       }
       throw error;
     } finally {
@@ -1068,7 +998,7 @@ export class TranscriptLedger {
         for (const object of [rawObject, evidenceObject])
           if (object?.created) await rm(object.path, { force: true }).catch(() => undefined);
       }
-      await releasePublication();
+      releaseTurn();
     }
   }
 

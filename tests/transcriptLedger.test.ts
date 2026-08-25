@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { chmod, mkdir, readFile, symlink, writeFile, lstat } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, symlink, writeFile, lstat } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
+import { spawn } from "node:child_process";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import os from "node:os";
 import { mkdtemp } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -267,14 +270,18 @@ describe("TranscriptLedger", () => {
     expect(await lstat(path.join(objectDir, digest)).catch(() => null)).toBeNull();
     reopened.close();
 
+    const legacyState = path.join(root, "state");
+    await mkdir(legacyState, { mode: 0o700 });
+    const legacyLock = path.join(legacyState, "publication.lock");
     await writeFile(
-      path.join(root, "state", "publication.lock"),
+      legacyLock,
       JSON.stringify({ pid: Number.MAX_SAFE_INTEGER, token: "crashed", startedAt: 0 }),
       { mode: 0o600 },
     );
     const recoveredAfterCrash = await TranscriptLedger.open({ root });
-    expect(await lstat(path.join(root, "state", "publication.lock")).catch(() => null)).toBeNull();
+    expect(await lstat(legacyLock)).toBeTruthy();
     recoveredAfterCrash.close();
+    await rm(legacyLock);
 
     const files = await fixture(dir, "deep");
     const raw = JSON.parse(await readFile(files.rawPath, "utf8")) as Record<string, any>;
@@ -499,6 +506,54 @@ describe("TranscriptLedger", () => {
     ).toEqual(second.rawBytes);
     firstLedger.close();
     secondLedger.close();
+  });
+
+  it("uses SQLite as the publication barrier for an independent opener", async () => {
+    const dir = await tempRoot();
+    const root = path.join(dir, "ledger");
+    const initial = await TranscriptLedger.open({ root });
+    initial.close();
+    const orphan = Buffer.from("published while the SQLite writer is open");
+    const digest = createHash("sha256").update(orphan).digest("hex");
+    const objectDir = path.join(root, "objects", "sha256", digest.slice(0, 2));
+    const relativeObjectPath = path.relative(root, path.join(objectDir, digest));
+    await mkdir(objectDir, { recursive: true, mode: 0o700 });
+    await writeFile(path.join(objectDir, digest), orphan, { mode: 0o600 });
+    const writer = new DatabaseSync(path.join(root, "index.sqlite"));
+    writer.exec("BEGIN IMMEDIATE");
+    writer
+      .prepare("INSERT INTO objects(sha256,kind,bytes,path,created_at) VALUES(?,?,?,?,?)")
+      .run(
+        digest,
+        "raw-provider-json",
+        orphan.byteLength,
+        relativeObjectPath,
+        new Date().toISOString(),
+      );
+    const moduleUrl = pathToFileURL(path.join(process.cwd(), "src/transcriptLedger.ts")).href;
+    const childScript = `import { TranscriptLedger } from ${JSON.stringify(moduleUrl)}; const ledger = await TranscriptLedger.open({ root: ${JSON.stringify(root)} }); console.log("opened"); ledger.close();`;
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", "--input-type=module", "-e", childScript],
+      {
+        cwd: process.cwd(),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    let childOutput = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      childOutput += chunk.toString("utf8");
+    });
+    const childExit = new Promise<number | null>((resolve) => {
+      child.once("exit", (code) => resolve(code));
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(childOutput).not.toContain("opened");
+    writer.exec("COMMIT");
+    writer.close();
+    expect(await childExit).toBe(0);
+    expect(childOutput).toContain("opened");
+    expect(await readFile(path.join(objectDir, digest))).toEqual(orphan);
   });
 
   it("repairs reopened object permissions and rejects a symlinked artifact ancestor", async () => {
