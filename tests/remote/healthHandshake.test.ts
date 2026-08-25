@@ -13,11 +13,16 @@ const artifact = {
   version: 1,
   limits: { maxBytes: 1024 * 1024 * 1024 },
 };
+const durable = {
+  id: "oracle.remote.durable-queue",
+  version: 1,
+  limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+};
 const envelope = (overrides: Record<string, unknown> = {}) => ({
   ok: true,
   version: "0.18.0",
   runtime: { name: "node", version: "25.1.0", major: 25, minimumMajor: 24 },
-  capabilities: { schemaVersion: 1, features: [artifact] },
+  capabilities: { schemaVersion: 1, features: [artifact, durable] },
   ...overrides,
 });
 
@@ -112,13 +117,59 @@ describe("remote executor health preflight", () => {
         res.end(response.raw ?? JSON.stringify(response.body ?? envelope()));
         return;
       }
-      if (req.method === "POST" && req.url === "/runs") {
+      if (req.method === "POST" && (req.url === "/runs" || req.url === "/v1/runs")) {
         runRequests += 1;
         req.resume();
-        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        const now = new Date().toISOString();
+        res.writeHead(req.url === "/v1/runs" ? 202 : 200, { "Content-Type": "application/json" });
         res.end(
-          `${JSON.stringify({ type: "result", result: { answerText: "ok", answerMarkdown: "ok", tookMs: 1, answerTokens: 1, answerChars: 2 } })}\n`,
+          req.url === "/v1/runs"
+            ? JSON.stringify({
+                id: "11111111-1111-4111-8111-111111111111",
+                state: "completed",
+                phase: "terminal",
+                queuePosition: 0,
+                roughEtaMs: 0,
+                requestHash: "a".repeat(64),
+                createdAt: now,
+                updatedAt: now,
+                result: {
+                  answerText: "ok",
+                  answerMarkdown: "ok",
+                  tookMs: 1,
+                  answerTokens: 1,
+                  answerChars: 2,
+                },
+              })
+            : "",
         );
+        return;
+      }
+      if (req.method === "GET" && req.url?.startsWith("/v1/runs/")) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        if (req.url.includes("/events")) res.end(JSON.stringify({ events: [] }));
+        else {
+          const now = new Date().toISOString();
+          res.end(
+            JSON.stringify({
+              id: "11111111-1111-4111-8111-111111111111",
+              state: "completed",
+              phase: "terminal",
+              queuePosition: 0,
+              roughEtaMs: 0,
+              requestHash: "a".repeat(64),
+              createdAt: now,
+              updatedAt: now,
+              result: {
+                answerText: "ok",
+                answerMarkdown: "ok",
+                tookMs: 1,
+                answerTokens: 1,
+                answerChars: 2,
+              },
+            }),
+          );
+        }
         return;
       }
       res.writeHead(404);

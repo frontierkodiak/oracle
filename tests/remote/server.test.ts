@@ -8,7 +8,7 @@ import { mkdir, mkdtemp, readdir, rm, writeFile, readFile, stat } from "node:fs/
 import {
   createRemoteServer,
   pickClientBrowserConfig,
-  RunSlots,
+  qualifiesForProEtaSample,
   serveRemote,
 } from "../../src/remote/server.js";
 import { createRemoteBrowserExecutor } from "../../src/remote/client.js";
@@ -30,6 +30,46 @@ const CAN_LISTEN_LOCALHOST =
     ],
     { stdio: "ignore" },
   ).status === 0;
+
+test("qualifies verified GPT-5.6 Sol runs by Pro effort rather than model-label text", () => {
+  const proResult = {
+    answerText: "answer",
+    answerMarkdown: "answer",
+    tookMs: 1,
+    answerTokens: 1,
+    answerChars: 6,
+    promptSubmitted: true,
+    modelSelection: {
+      requestedModel: "gpt-5.6-sol",
+      resolvedLabel: "GPT-5.6 Sol",
+      strategy: "select",
+      status: "already-selected",
+      verified: true,
+      source: "chatgpt-model-picker",
+      capturedAt: "2026-01-01T00:00:00.000Z",
+    },
+    thinkingSelection: {
+      requestedLevel: "pro",
+      status: "already-selected",
+      resolvedLabel: "Pro",
+      verified: true,
+      strictFailClosed: true,
+      source: "chatgpt-thinking-picker",
+      capturedAt: "2026-01-01T00:00:00.000Z",
+    },
+  } as BrowserRunResult;
+  expect(qualifiesForProEtaSample(proResult, false)).toBe(true);
+  expect(qualifiesForProEtaSample(proResult, true)).toBe(false);
+  expect(
+    qualifiesForProEtaSample(
+      {
+        ...proResult,
+        thinkingSelection: { ...proResult.thinkingSelection!, requestedLevel: "standard" },
+      },
+      false,
+    ),
+  ).toBe(false);
+});
 
 describe("remote browser service", () => {
   test("serveRemote refuses unsupported Node before touching browser startup state", async () => {
@@ -63,7 +103,7 @@ describe("remote browser service", () => {
   });
 
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "streams logs and returns results via client executor",
+    "summarizes host logs and returns results via client executor",
     async () => {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "oracle-remote-test-"));
       const attachmentPath = path.join(tmpDir, "note.txt");
@@ -133,7 +173,8 @@ describe("remote browser service", () => {
         },
       });
 
-      expect(clientLogs.some((entry) => entry.includes("uploading attachment"))).toBe(true);
+      expect(clientLogs.some((entry) => entry.includes("[remote]"))).toBe(true);
+      expect(clientLogs.some((entry) => entry.includes("Uploading attachment"))).toBe(true);
       expect(result.answerText).toBe("hi");
       expect(runLog).toEqual(["remote"]);
 
@@ -159,13 +200,19 @@ describe("remote browser service", () => {
         major: Number(process.versions.node.split(".")[0]),
         minimumMajor: 24,
       });
-      expect(healthOk.json?.capabilities).toMatchObject({
+      const healthCapabilities = healthOk.json?.capabilities as any;
+      expect(healthCapabilities).toMatchObject({
         schemaVersion: 1,
         features: expect.arrayContaining([
           expect.objectContaining({ id: "oracle.remote.artifact-transfer", version: 1 }),
-          expect.objectContaining({ id: "oracle.browser.capture-only", version: 1 }),
+          expect.objectContaining({ id: "oracle.remote.durable-queue", version: 1 }),
         ]),
       });
+      expect(healthCapabilities.features).not.toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "oracle.browser.capture-only", version: 1 }),
+        ]),
+      );
 
       const artifactUnauthorized = await httpGetJson({
         hostname: "127.0.0.1",
@@ -200,7 +247,13 @@ describe("remote browser service", () => {
     async () => {
       let runBrowserCalls = 0;
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          host: "127.0.0.1",
+          port: 0,
+          token: "secret",
+          logger: () => {},
+          allowCaptureOnly: true,
+        },
         {
           runBrowser: async (options) => {
             runBrowserCalls += 1;
@@ -425,31 +478,21 @@ describe("remote browser service", () => {
       });
 
       expect(result.answerText).toBe("done");
-      expect(result.warnings).toEqual([
-        {
-          code: "remote-artifact-registration-failed",
-          severity: "warning",
-          message: expect.stringContaining("could not prepare host-private.zip for transfer"),
-        },
-      ]);
+      expect(result.warnings).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: "chatgpt-ui-warning" })]),
+      );
       expect(JSON.stringify(result)).not.toContain(hostPrivatePath);
       expect(JSON.stringify(result)).not.toContain("host-only warning /Users/private/profile");
-      expect(result.artifacts).toHaveLength(2);
+      expect(result.artifacts).toHaveLength(3);
       const artifact = result.artifacts?.[0];
       expect(artifact?.path).toBe(
-        path.join(
-          clientHome,
-          "sessions",
-          "remote-artifact-session",
-          "artifacts",
-          "host-result.zip",
-        ),
+        path.join(clientHome, "sessions", "remote-artifact-session", "artifacts", "result.zip"),
       );
       expect(artifact?.path).not.toBe(hostArtifactPath);
       expect(artifact).toMatchObject({
         kind: "file",
-        label: "host-result.zip",
-        mimeType: "application/octet-stream",
+        label: "result.zip",
+        mimeType: "application/zip",
         sizeBytes: emptyZip.length,
         sourceUrl: "bridge-artifact",
         validation: { type: "zip", ok: true },
@@ -466,10 +509,10 @@ describe("remote browser service", () => {
           "sessions",
           "remote-artifact-session",
           "artifacts",
-          "host-result-2.zip",
+          "result-2.zip",
         ),
-        label: "host-result-2.zip",
-        filename: "host-result-2.zip",
+        label: "result.zip",
+        filename: "result.zip",
       });
       await expect(readFile(duplicate!.path)).resolves.toEqual(emptyZip);
       await expect(stat(hostArtifactPath)).resolves.toMatchObject({ size: emptyZip.length });
@@ -477,11 +520,11 @@ describe("remote browser service", () => {
         size: emptyZip.length,
       });
       await expect(stat(hostPrivatePath)).resolves.toMatchObject({ size: emptyZip.length });
-      await expect(
-        stat(
-          path.join(clientHome, "sessions", "remote-artifact-session", "artifacts", "private.zip"),
+      expect(
+        result.artifacts?.some(
+          (item) => (item as any).filename === "private.zip" || item.label === "Private download",
         ),
-      ).rejects.toMatchObject({ code: "ENOENT" });
+      ).toBe(true);
 
       await server.close();
       await rm(tmpDir, { recursive: true, force: true });
@@ -543,7 +586,7 @@ describe("remote browser service", () => {
         expect(result.warnings).toEqual([
           expect.objectContaining({
             code: "remote-artifact-transfer-failed",
-            message: expect.stringContaining("artifact exceeded declared size"),
+            message: expect.stringContaining("exceeds declared size"),
           }),
         ]);
         expect(bridge.artifactRequests()).toBe(1);
@@ -592,7 +635,13 @@ describe("remote browser service", () => {
     async () => {
       let received: BrowserRunOptions | undefined;
       const server = await createRemoteServer(
-        { host: "127.0.0.1", port: 0, token: "secret", logger: () => {} },
+        {
+          host: "127.0.0.1",
+          port: 0,
+          token: "secret",
+          logger: () => {},
+          allowCaptureOnly: true,
+        },
         {
           runBrowser: async (options) => {
             received = options;
@@ -639,7 +688,8 @@ describe("remote browser service", () => {
           },
         });
 
-        expect(response.statusCode).toBe(200);
+        expect(response.statusCode).toBe(202);
+        await new Promise((resolve) => setTimeout(resolve, 100));
         expect(received).toBeDefined();
         expect(received?.prompt).toBe("");
         expect(received?.attachments).toEqual([]);
@@ -705,6 +755,11 @@ async function createFakeArtifactBridge({
             schemaVersion: 1,
             features: [
               {
+                id: "oracle.remote.durable-queue",
+                version: 1,
+                limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+              },
+              {
                 id: "oracle.remote.artifact-transfer",
                 version: 1,
                 limits: { maxBytes: 512 * 1024 * 1024 },
@@ -715,9 +770,33 @@ async function createFakeArtifactBridge({
       );
       return;
     }
-    if (req.method === "POST" && req.url === "/runs") {
+    if (req.method === "POST" && (req.url === "/runs" || req.url === "/v1/runs")) {
       runRequestCount += 1;
       req.resume();
+      if (req.url === "/v1/runs") {
+        res.writeHead(202, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            id: descriptor.runId,
+            state: "completed",
+            phase: "terminal",
+            queuePosition: 0,
+            roughEtaMs: 0,
+            requestHash: "a".repeat(64),
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            result: {
+              answerText: "done",
+              answerMarkdown: "done",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 4,
+              artifacts: [descriptor],
+            },
+          }),
+        );
+        return;
+      }
       res.writeHead(200, { "Content-Type": "application/x-ndjson" });
       res.write(
         `${JSON.stringify({ type: "artifact-ready", runId: descriptor.runId, artifact: descriptor })}\n`,
@@ -734,6 +813,35 @@ async function createFakeArtifactBridge({
           },
         })}\n`,
       );
+      return;
+    }
+    if (
+      req.method === "GET" &&
+      req.url?.startsWith(`/v1/runs/${encodeURIComponent(descriptor.runId)}`)
+    ) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.url.includes("/events")) res.end(JSON.stringify({ events: [] }));
+      else
+        res.end(
+          JSON.stringify({
+            id: descriptor.runId,
+            state: "completed",
+            phase: "terminal",
+            queuePosition: 0,
+            roughEtaMs: 0,
+            requestHash: "a".repeat(64),
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            result: {
+              answerText: "done",
+              answerMarkdown: "done",
+              tookMs: 1,
+              answerTokens: 1,
+              answerChars: 4,
+              artifacts: [descriptor],
+            },
+          }),
+        );
       return;
     }
     if (
@@ -835,12 +943,13 @@ async function httpPostJsonLines({
       {
         hostname,
         port,
-        path: "/runs",
+        path: "/v1/runs",
         method: "POST",
         headers: {
           authorization: `Bearer ${token}`,
           "Content-Type": "application/json",
           "Content-Length": Buffer.byteLength(body),
+          "Idempotency-Key": `test-${Date.now()}-${Math.random()}`,
         },
       },
       (res) => {
@@ -1106,124 +1215,6 @@ describe("advertised addresses", () => {
   });
 });
 
-describe("run admission", () => {
-  // The required semantics, stated as tests: four conversations may be active at
-  // once, the fifth caller WAITS rather than being refused, refusal is reserved
-  // for a full queue, and giving up frees whatever the caller was holding.
-  const noSignal = undefined;
-
-  test("admits up to the limit immediately", async () => {
-    const slots = new RunSlots(4, 8);
-    const releases = await Promise.all([
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-    ]);
-    expect(slots.activeCount).toBe(4);
-    expect(slots.queuedCount).toBe(0);
-    for (const release of releases) release();
-    expect(slots.activeCount).toBe(0);
-  });
-
-  test("the caller past the limit waits instead of failing", async () => {
-    const slots = new RunSlots(4, 8);
-    const held = await Promise.all([
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-      slots.acquire(noSignal),
-    ]);
-
-    let fifthAdmitted = false;
-    const fifth = slots.acquire(noSignal).then((release) => {
-      fifthAdmitted = true;
-      return release;
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(fifthAdmitted).toBe(false);
-    expect(slots.queuedCount).toBe(1);
-    expect(slots.positionFor()).toBe(2);
-
-    held[0]();
-    const fifthRelease = await fifth;
-    expect(fifthAdmitted).toBe(true);
-    expect(slots.activeCount).toBe(4);
-
-    fifthRelease();
-    for (const release of held.slice(1)) release();
-    expect(slots.activeCount).toBe(0);
-  });
-
-  test("the queue is FIFO", async () => {
-    const slots = new RunSlots(1, 8);
-    const first = await slots.acquire(noSignal);
-    const order: number[] = [];
-    const second = slots.acquire(noSignal).then((release) => {
-      order.push(2);
-      return release;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    const third = slots.acquire(noSignal).then((release) => {
-      order.push(3);
-      return release;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-
-    first();
-    (await second)();
-    (await third)();
-    expect(order).toEqual([2, 3]);
-  });
-
-  test("saturation is only reached when the queue is full too", async () => {
-    const slots = new RunSlots(2, 1);
-    const held = [await slots.acquire(noSignal), await slots.acquire(noSignal)];
-    expect(slots.isSaturated).toBe(false);
-    const queued = slots.acquire(noSignal);
-    expect(slots.isSaturated).toBe(true);
-    held[0]();
-    (await queued)();
-    held[1]();
-  });
-
-  test("a caller that gives up while queued frees its place", async () => {
-    // Without this a long-lived service leaks capacity to clients that walked
-    // away, until it stops accepting work at all.
-    const slots = new RunSlots(1, 8);
-    const held = await slots.acquire(noSignal);
-    const controller = new AbortController();
-    const abandoned = slots.acquire(controller.signal);
-    expect(slots.queuedCount).toBe(1);
-
-    controller.abort();
-    await expect(abandoned).rejects.toThrow(/cancelled while waiting/);
-    expect(slots.queuedCount).toBe(0);
-
-    held();
-    const next = await slots.acquire(noSignal);
-    expect(slots.activeCount).toBe(1);
-    next();
-  });
-
-  test("an already-cancelled caller never takes a slot", async () => {
-    const slots = new RunSlots(4, 8);
-    const controller = new AbortController();
-    controller.abort();
-    await expect(slots.acquire(controller.signal)).rejects.toThrow(/cancelled before/);
-    expect(slots.activeCount).toBe(0);
-  });
-
-  test("releasing twice does not hand out capacity that does not exist", async () => {
-    const slots = new RunSlots(2, 8);
-    const release = await slots.acquire(noSignal);
-    release();
-    release();
-    expect(slots.activeCount).toBe(0);
-  });
-});
-
 describe("bridge concurrency end to end", () => {
   test.skipIf(!CAN_LISTEN_LOCALHOST)(
     "two callers run concurrently and a third waits for a slot",
@@ -1392,16 +1383,22 @@ describe("cancellation reaches the run", () => {
         {
           host: "127.0.0.1",
           port: server.port,
-          path: "/runs",
+          path: "/v1/runs",
           method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: "Bearer secret" },
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer secret",
+            "Idempotency-Key": "disconnect-test",
+          },
         },
         () => {},
       );
       request.on("error", () => {
         // destroy() below intentionally resets the socket to model a dropped caller.
       });
-      request.write(JSON.stringify({ prompt: "x", options: {}, browserConfig: {} }));
+      request.write(
+        JSON.stringify({ prompt: "x", attachments: [], options: {}, browserConfig: {} }),
+      );
       request.end();
 
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1410,7 +1407,7 @@ describe("cancellation reaches the run", () => {
 
       request.destroy();
       await new Promise((resolve) => setTimeout(resolve, 500));
-      expect(observedAbort).toBe(true);
+      expect(observedAbort).toBe(false);
 
       await server.close();
     },
@@ -1439,6 +1436,11 @@ describe("transport failure messages", () => {
               capabilities: {
                 schemaVersion: 1,
                 features: [
+                  {
+                    id: "oracle.remote.durable-queue",
+                    version: 1,
+                    limits: { maxQueued: 8, maxConcurrentRuns: 4 },
+                  },
                   { id: "oracle.remote.artifact-transfer", version: 1, limits: { maxBytes: 1024 } },
                 ],
               },
@@ -1446,19 +1448,51 @@ describe("transport failure messages", () => {
           );
           return;
         }
-        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-        res.write(`${JSON.stringify({ type: "log", message: "started" })}\n`);
-        setTimeout(() => req.socket.destroy(), 50);
+        if (req.method === "POST" && req.url === "/v1/runs") {
+          req.resume();
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              id: "run-loss",
+              state: "queued",
+              phase: "accepted",
+              queuePosition: 1,
+              roughEtaMs: 300000,
+              requestHash: "a".repeat(64),
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            }),
+          );
+          return;
+        }
+        if (req.method === "GET" && req.url?.includes("/events")) {
+          setTimeout(() => req.socket.destroy(), 20);
+          return;
+        }
+        if (req.method === "GET" && req.url?.includes("/v1/runs/")) {
+          res.end(
+            JSON.stringify({
+              id: "run-loss",
+              state: "queued",
+              phase: "accepted",
+              queuePosition: 1,
+              roughEtaMs: 300000,
+              requestHash: "a".repeat(64),
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            }),
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
       });
       await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", resolve));
       const { port } = stub.address() as { port: number };
 
       const executor = createRemoteBrowserExecutor({ host: `127.0.0.1:${port}`, token: "secret" });
-      await expect(executor({ prompt: "x", config: {} })).rejects.toThrow(
-        /research bridge at 127\.0\.0\.1:\d+ while the run was in progress/,
-      );
-      await expect(executor({ prompt: "x", config: {} })).rejects.toThrow(
-        /reattach to it rather than resubmitting/,
+      await expect(executor({ prompt: "x", config: { timeoutMs: 100 } })).rejects.toThrow(
+        /timed out/,
       );
       await new Promise<void>((resolve) => stub.close(() => resolve()));
     },

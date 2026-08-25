@@ -242,8 +242,14 @@ describe("promptComposer", () => {
     expect(promptComposer.sendButtonTimeoutMs(["oracle-attach-verify.txt"], 120_000)).toBe(120_000);
   });
 
-  test("marks prompt submitted before commit verification finishes", async () => {
-    const onPromptSubmitted = vi.fn();
+  test("durably marks the submit attempt before dispatch and marks submission before verification", async () => {
+    const lifecycle: string[] = [];
+    const onPromptSubmitAttempt = vi.fn(async () => {
+      lifecycle.push("attempt");
+    });
+    const onPromptSubmitted = vi.fn(async () => {
+      lifecycle.push("submitted");
+    });
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("document.readyState")) {
@@ -286,13 +292,55 @@ describe("promptComposer", () => {
         runtime: runtime as never,
         input: input as never,
         baselineTurns: 0,
+        onPromptSubmitAttempt,
         onPromptSubmitted,
       },
       "hello",
       logger as never,
     );
 
+    expect(onPromptSubmitAttempt).toHaveBeenCalledTimes(1);
     expect(onPromptSubmitted).toHaveBeenCalledTimes(1);
+    expect(lifecycle).toEqual(["attempt", "submitted"]);
+  });
+
+  test("does not click or press Enter when the durable submit-attempt marker fails", async () => {
+    const expressions: string[] = [];
+    const runtime = {
+      evaluate: vi.fn(async ({ expression }: { expression: string }) => {
+        expressions.push(expression);
+        if (expression.includes("document.readyState"))
+          return { result: { value: { ready: true, composer: true, fileInput: false } } };
+        if (expression.includes("focused: true")) return { result: { value: { focused: true } } };
+        if (expression.includes("editorText"))
+          return {
+            result: { value: { editorText: "hello", fallbackValue: "", activeValue: "hello" } },
+          };
+        return { result: { value: null } };
+      }),
+    };
+    const input = { insertText: vi.fn(), dispatchKeyEvent: vi.fn() };
+    const logger = Object.assign(vi.fn(), { verbose: false });
+
+    await expect(
+      submitPrompt(
+        {
+          runtime: runtime as never,
+          input: input as never,
+          baselineTurns: 0,
+          onPromptSubmitAttempt: async () => {
+            throw new Error("durable phase write failed");
+          },
+        },
+        "hello",
+        logger as never,
+      ),
+    ).rejects.toThrow("durable phase write failed");
+
+    expect(expressions.some((expression) => expression.includes("button.scrollIntoView"))).toBe(
+      false,
+    );
+    expect(input.dispatchKeyEvent).not.toHaveBeenCalled();
   });
 
   test("waits for a delayed trusted click without issuing a second send", async () => {
