@@ -1289,39 +1289,66 @@ function normalizeRemotePayload(payload: RemoteRunPayload): void {
 }
 
 function validateRemotePayload(payload: unknown): asserts payload is RemoteRunPayload {
-  if (!payload || typeof payload !== "object") throw new Error("invalid_request");
-  const p = payload as any;
-  if (
-    typeof p.prompt !== "string" ||
-    p.prompt.length > 20_000_000 ||
-    !Array.isArray(p.attachments) ||
-    !p.browserConfig ||
-    typeof p.browserConfig !== "object" ||
-    !p.options ||
-    typeof p.options !== "object"
-  )
+  const isRecord = (value: unknown): value is Record<string, unknown> =>
+    !!value && typeof value === "object" && !Array.isArray(value);
+  const exact = (value: Record<string, unknown>, allowed: readonly string[]) =>
+    Object.keys(value).every((key) => allowed.includes(key));
+  const p = payload as Record<string, unknown>;
+  if (!isRecord(payload) || !exact(p, ["prompt", "attachments", "fallbackSubmission", "browserConfig", "options"]))
     throw new Error("invalid_request");
-  for (const a of p.attachments)
-    if (
-      !a ||
-      typeof a.fileName !== "string" ||
-      typeof a.contentBase64 !== "string" ||
-      !/^[A-Za-z0-9+/]*={0,2}$/.test(a.contentBase64)
-    )
-      throw new Error("invalid_request");
+  if (typeof p.prompt !== "string" || p.prompt.length > 20_000_000 || !Array.isArray(p.attachments))
+    throw new Error("invalid_request");
+
+  const validateAttachments = (value: unknown): void => {
+    if (!Array.isArray(value) || value.length > 128) throw new Error("invalid_request");
+    let total = 0;
+    for (const item of value) {
+      if (!isRecord(item) || !exact(item, ["fileName", "displayPath", "sizeBytes", "contentBase64"]))
+        throw new Error("invalid_request");
+      if (
+        typeof item.fileName !== "string" || item.fileName.length === 0 || item.fileName.length > 255 ||
+        typeof item.displayPath !== "string" || item.displayPath.length > 2048 ||
+        typeof item.contentBase64 !== "string" || item.contentBase64.length > MAX_REMOTE_ARTIFACT_BYTES * 2
+      ) throw new Error("invalid_request");
+      const encoded = item.contentBase64;
+      if (encoded.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded))
+        throw new Error("invalid_request");
+      const bytes = Buffer.from(encoded, "base64").byteLength;
+      if (bytes > MAX_REMOTE_ARTIFACT_BYTES || total > MAX_REMOTE_ARTIFACT_BYTES - bytes)
+        throw new Error("invalid_request");
+      if (item.sizeBytes !== undefined &&
+        (!Number.isSafeInteger(item.sizeBytes) || (item.sizeBytes as number) < 0 || item.sizeBytes !== bytes))
+        throw new Error("invalid_request");
+      total += bytes;
+    }
+  };
+  validateAttachments(p.attachments);
   if (p.fallbackSubmission !== undefined) {
     const f = p.fallbackSubmission;
-    if (!f || typeof f.prompt !== "string" || !Array.isArray(f.attachments))
+    if (!isRecord(f) || !exact(f, ["prompt", "attachments"]) || typeof f.prompt !== "string" || f.prompt.length > 20_000_000)
       throw new Error("invalid_request");
-    for (const a of f.attachments)
-      if (
-        !a ||
-        typeof a.fileName !== "string" ||
-        typeof a.contentBase64 !== "string" ||
-        !/^[A-Za-z0-9+/]*={0,2}$/.test(a.contentBase64)
-      )
-        throw new Error("invalid_request");
+    validateAttachments(f.attachments);
   }
+  if (!isRecord(p.browserConfig) || !exact(p.browserConfig, CLIENT_BROWSER_CONFIG_FIELDS))
+    throw new Error("invalid_request");
+  const configTypes: Record<string, "string" | "boolean" | "number"> = {
+    chatgptUrl: "string", url: "string", desiredModel: "string", modelStrategy: "string",
+    thinkingTime: "string", researchMode: "string", archiveConversations: "string",
+    resumeConversationUrl: "string", captureProviderNative: "boolean", captureOnly: "boolean",
+    timeoutMs: "number", inputTimeoutMs: "number", attachmentTimeoutMs: "number",
+    assistantRecheckDelayMs: "number", assistantRecheckTimeoutMs: "number", autoReattachDelayMs: "number",
+    autoReattachIntervalMs: "number", autoReattachTimeoutMs: "number", keepBrowser: "boolean", debug: "boolean",
+  };
+  for (const [key, type] of Object.entries(configTypes)) {
+    if (p.browserConfig[key] !== undefined && typeof p.browserConfig[key] !== type) throw new Error("invalid_request");
+    if (type === "number" && p.browserConfig[key] !== undefined && !Number.isFinite(p.browserConfig[key] as number)) throw new Error("invalid_request");
+  }
+  if (!isRecord(p.options) || !exact(p.options, ["heartbeatIntervalMs", "verbose", "sessionId", "followUpPrompts"]))
+    throw new Error("invalid_request");
+  if (p.options.heartbeatIntervalMs !== undefined && (!Number.isFinite(p.options.heartbeatIntervalMs as number) || typeof p.options.heartbeatIntervalMs !== "number")) throw new Error("invalid_request");
+  if (p.options.verbose !== undefined && typeof p.options.verbose !== "boolean") throw new Error("invalid_request");
+  if (p.options.sessionId !== undefined && (typeof p.options.sessionId !== "string" || p.options.sessionId.length > 128)) throw new Error("invalid_request");
+  if (p.options.followUpPrompts !== undefined && (!Array.isArray(p.options.followUpPrompts) || p.options.followUpPrompts.length > 32 || p.options.followUpPrompts.some((x) => typeof x !== "string" || x.length > 20_000_000))) throw new Error("invalid_request");
 }
 
 function formatDurableFailure(error: unknown): {
