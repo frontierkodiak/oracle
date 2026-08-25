@@ -1120,9 +1120,12 @@ transcriptCommand
 
 transcriptCommand
   .command("ingest")
-  .description("Atomically ingest an existing paired provider-native raw/evidence artifact.")
+  .description(
+    "Atomically ingest an existing provider-native raw/evidence/independent artifact set.",
+  )
   .requiredOption("--raw <path>", "Provider-native raw JSON artifact.")
   .requiredOption("--evidence <path>", "Paired provider-native evidence JSON artifact.")
+  .requiredOption("--independent <path>", "Independent provider-native JSON artifact.")
   .option("--conversation <url-or-id>", "Conversation URL or id when raw JSON omits it.")
   .option("--profile <id>", "Opaque provider-profile id.")
   .option("--root <path>", "Private transcript ledger root.")
@@ -1139,6 +1142,7 @@ transcriptCommand
         canonicalUrl: target?.canonicalUrl,
         rawPath: options.raw as string,
         evidencePath: options.evidence as string,
+        independentPath: options.independent as string,
       });
       console.log(JSON.stringify(result));
     } finally {

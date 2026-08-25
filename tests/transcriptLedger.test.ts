@@ -48,6 +48,7 @@ async function fixture(dir: string, suffix: string, body = "hello") {
   };
   const rawPath = path.join(dir, `${suffix}-raw.json`);
   const evidencePath = path.join(dir, `${suffix}-evidence.json`);
+  const independentPath = path.join(dir, `${suffix}-independent.json`);
   const rawBytes = Buffer.from(JSON.stringify(raw));
   const digest = (value: string) => createHash("sha256").update(value).digest("hex");
   const decimal = (value: string) => [...Buffer.from(value, "hex")];
@@ -58,8 +59,14 @@ async function fixture(dir: string, suffix: string, body = "hello") {
       sha256: createHash("sha256").update(rawBytes).digest("hex"),
       bytes: rawBytes.byteLength,
     },
+    independent_document: {
+      sha256: createHash("sha256").update(rawBytes).digest("hex"),
+      bytes: rawBytes.byteLength,
+    },
     independent_fetch: {
-      document_sha256_decimal_bytes: Array.from({ length: 32 }, (_, index) => index).join(" "),
+      document_sha256_decimal_bytes: decimal(
+        createHash("sha256").update(rawBytes).digest("hex"),
+      ).join(" "),
       document_bytes: rawBytes.byteLength,
       fetched_at: "2026-01-01T00:00:00.000Z",
     },
@@ -86,7 +93,8 @@ async function fixture(dir: string, suffix: string, body = "hello") {
   };
   await writeFile(rawPath, rawBytes);
   await writeFile(evidencePath, JSON.stringify(evidence));
-  return { rawPath, evidencePath, rawBytes };
+  await writeFile(independentPath, rawBytes);
+  return { rawPath, evidencePath, independentPath, rawBytes };
 }
 
 async function tempRoot() {
@@ -103,10 +111,12 @@ describe("TranscriptLedger", () => {
       profileId: "profile-a",
       rawPath: files.rawPath,
       evidencePath: files.evidencePath,
+      independentPath: files.independentPath,
     });
     ledger.close();
     const digest = createHash("sha256").update(files.rawBytes).digest("hex");
     expect(result.rawSha256).toBe(digest);
+    expect(result.independentSha256).toBe(digest);
     expect(
       await readFile(path.join(dir, "ledger", "objects", "sha256", digest.slice(0, 2), digest)),
     ).toEqual(files.rawBytes);
@@ -123,12 +133,14 @@ describe("TranscriptLedger", () => {
       profileId: "profile-a",
       rawPath: first.rawPath,
       evidencePath: first.evidencePath,
+      independentPath: first.independentPath,
     });
     const b = await ledger.ingestPair({
       provider: "chatgpt",
       profileId: "profile-a",
       rawPath: second.rawPath,
       evidencePath: second.evidencePath,
+      independentPath: second.independentPath,
     });
     expect(a.normalizedSequenceSha256).toBe(b.normalizedSequenceSha256);
     expect(b.deduplicated).toBe(true);
@@ -147,12 +159,14 @@ describe("TranscriptLedger", () => {
       profileId: "profile-a",
       rawPath: one.rawPath,
       evidencePath: one.evidencePath,
+      independentPath: one.independentPath,
     });
     const b = await ledger.ingestPair({
       provider: "chatgpt",
       profileId: "profile-a",
       rawPath: two.rawPath,
       evidencePath: two.evidencePath,
+      independentPath: two.independentPath,
     });
     expect(a.revisionId).not.toBe(b.revisionId);
     expect(ledger.list()[0]?.revisionCount).toBe(2);
@@ -196,6 +210,7 @@ describe("TranscriptLedger", () => {
         profileId: "profile-a",
         rawPath: files.rawPath,
         evidencePath: files.evidencePath,
+        independentPath: files.independentPath,
       }),
     ).rejects.toThrow();
     expect(ledger.list()).toEqual([]);
@@ -236,6 +251,7 @@ describe("TranscriptLedger", () => {
         profileId: "profile-a",
         rawPath: files.rawPath,
         evidencePath: files.evidencePath,
+        independentPath: files.independentPath,
       }),
     ).rejects.toThrow(/parent is invalid|parent\/child mismatch/);
     ledger.close();
@@ -251,6 +267,7 @@ describe("TranscriptLedger", () => {
         profileId: "profile-a",
         rawPath: second.rawPath,
         evidencePath: second.evidencePath,
+        independentPath: second.independentPath,
       }),
     ).rejects.toThrow(/body hash mismatch/);
     secondLedger.close();
@@ -296,6 +313,7 @@ describe("TranscriptLedger", () => {
         profileId: "profile-a",
         rawPath: files.rawPath,
         evidencePath: files.evidencePath,
+        independentPath: files.independentPath,
       }),
     ).rejects.toThrow(/depth bounds/);
     deepLedger.close();
@@ -373,6 +391,7 @@ describe("TranscriptLedger", () => {
         profileId: "p",
         rawPath: files.rawPath,
         evidencePath: files.evidencePath,
+        independentPath: files.independentPath,
       }),
     ).rejects.toThrow(/unsupported shape/);
     evidence.independent_fetch = {
@@ -387,8 +406,30 @@ describe("TranscriptLedger", () => {
         profileId: "p",
         rawPath: files.rawPath,
         evidencePath: files.evidencePath,
+        independentPath: files.independentPath,
       }),
     ).rejects.toThrow(/exactly 32 decimal bytes/);
+    const forged = JSON.parse(await readFile(files.independentPath, "utf8")) as Record<string, any>;
+    forged.mapping.a2.message.content.parts = ["forged independent body"];
+    const forgedBytes = Buffer.from(JSON.stringify(forged));
+    const forgedSha256 = createHash("sha256").update(forgedBytes).digest("hex");
+    evidence.independent_document = { sha256: forgedSha256, bytes: forgedBytes.byteLength };
+    evidence.independent_fetch = {
+      document_sha256_decimal_bytes: [...Buffer.from(forgedSha256, "hex")].join(" "),
+      document_bytes: forgedBytes.byteLength,
+      fetched_at: "2026-01-01T00:00:00.000Z",
+    };
+    await writeFile(files.independentPath, forgedBytes);
+    await writeFile(files.evidencePath, JSON.stringify(evidence));
+    await expect(
+      ledger.ingestPair({
+        provider: "chatgpt",
+        profileId: "p",
+        rawPath: files.rawPath,
+        evidencePath: files.evidencePath,
+        independentPath: files.independentPath,
+      }),
+    ).rejects.toThrow(/does not correspond|selected branch differs/);
     ledger.close();
 
     const raw = JSON.parse(await readFile(files.rawPath, "utf8")) as Record<string, any>;
@@ -401,6 +442,7 @@ describe("TranscriptLedger", () => {
         profileId: "p",
         rawPath: files.rawPath,
         evidencePath: files.evidencePath,
+        independentPath: files.independentPath,
       }),
     ).rejects.toThrow(/exactly one root/);
     forestLedger.close();
@@ -419,6 +461,7 @@ describe("TranscriptLedger", () => {
     const rawBytes = Buffer.from(source.raw, "utf8");
     const rawPath = path.join(dir, "raw.json");
     const evidencePath = path.join(dir, "evidence.json");
+    const independentPath = path.join(dir, "independent.json");
     const decimal = (hex: string) => [...Buffer.from(hex, "hex")].join(" ");
     const evidence = {
       schema: "oracle.provider-native-capture-evidence/v1",
@@ -427,10 +470,12 @@ describe("TranscriptLedger", () => {
         sha256: createHash("sha256").update(rawBytes).digest("hex"),
         bytes: rawBytes.byteLength,
       },
+      independent_document: {
+        sha256: createHash("sha256").update(rawBytes).digest("hex"),
+        bytes: rawBytes.byteLength,
+      },
       independent_fetch: {
-        document_sha256_decimal_bytes: Array.from({ length: 32 }, (_, index) => 255 - index).join(
-          " ",
-        ),
+        document_sha256_decimal_bytes: decimal(createHash("sha256").update(rawBytes).digest("hex")),
         document_bytes: rawBytes.byteLength,
         fetched_at: "2026-01-01T00:00:00.000Z",
       },
@@ -445,6 +490,7 @@ describe("TranscriptLedger", () => {
       })),
     };
     await writeFile(rawPath, rawBytes, { mode: 0o600 });
+    await writeFile(independentPath, rawBytes, { mode: 0o600 });
     await writeFile(evidencePath, JSON.stringify(evidence), { mode: 0o600 });
     const ledger = await TranscriptLedger.open({ root: path.join(dir, "ledger") });
     const result = await ledger.ingestPair({
@@ -452,6 +498,7 @@ describe("TranscriptLedger", () => {
       profileId: "fixture-profile",
       rawPath,
       evidencePath,
+      independentPath,
     });
     expect(
       ledger.getRevisionTurns(result.revisionId).map((turn) => [turn.contentType, turn.bodyBytes]),
@@ -469,6 +516,7 @@ describe("TranscriptLedger", () => {
         profileId: "fixture-profile",
         rawPath,
         evidencePath,
+        independentPath,
       }),
     ).rejects.toThrow(/body hash mismatch/);
     ledger.close();
@@ -487,12 +535,14 @@ describe("TranscriptLedger", () => {
         profileId: "p",
         rawPath: first.rawPath,
         evidencePath: first.evidencePath,
+        independentPath: first.independentPath,
       }),
       secondLedger.ingestPair({
         provider: "chatgpt",
         profileId: "p",
         rawPath: second.rawPath,
         evidencePath: second.evidencePath,
+        independentPath: second.independentPath,
       }),
     ]);
     expect(a.revisionId).not.toBe(b.revisionId);
@@ -508,12 +558,68 @@ describe("TranscriptLedger", () => {
     secondLedger.close();
   });
 
-  it("uses SQLite as the publication barrier for an independent opener", async () => {
+  it("releases a queued turn when that ledger is closed and permits a fresh opener", async () => {
     const dir = await tempRoot();
+    const second = await fixture(dir, "queued-second", "second");
+    const root = path.join(dir, "ledger");
+    const firstLedger = await TranscriptLedger.open({ root });
+    const secondLedger = await TranscriptLedger.open({ root });
+    const releaseBlock = await (
+      firstLedger as unknown as {
+        acquirePublicationTurnForOperation: () => Promise<() => void>;
+      }
+    ).acquirePublicationTurnForOperation();
+    const secondPromise = secondLedger.ingestPair({
+      provider: "chatgpt",
+      profileId: "p",
+      rawPath: second.rawPath,
+      evidencePath: second.evidencePath,
+      independentPath: second.independentPath,
+    });
+    for (
+      let attempt = 0;
+      attempt < 100 && (secondLedger as any).waitingOperations === 0;
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect((secondLedger as any).waitingOperations).toBe(1);
+    secondLedger.close();
+    releaseBlock();
+    await expect(secondPromise).rejects.toThrow(/closed/);
+    firstLedger.close();
+    const fresh = await TranscriptLedger.open({ root });
+    expect(fresh.list()).toEqual([]);
+    fresh.close();
+  });
+
+  it("defers active close until publication and crash-orphan recovery are complete", async () => {
+    const dir = await tempRoot();
+    const files = await fixture(dir, "active-close", "active");
+    const root = path.join(dir, "ledger");
+    const ledger = await TranscriptLedger.open({ root });
+    const ingest = ledger.ingestPair({
+      provider: "chatgpt",
+      profileId: "p",
+      rawPath: files.rawPath,
+      evidencePath: files.evidencePath,
+      independentPath: files.independentPath,
+    });
+    ledger.close();
+    await expect(ingest).resolves.toBeTruthy();
+    expect(() => ledger.list()).toThrow(/closed/);
+    const fresh = await TranscriptLedger.open({ root });
+    expect(fresh.list()[0]?.observationCount).toBe(1);
+    fresh.close();
+  });
+
+  it("uses SQLite as the publication barrier across rollback and same-hash commit", async () => {
+    const dir = await tempRoot();
+    const files = await fixture(dir, "sqlite-barrier", "barrier");
     const root = path.join(dir, "ledger");
     const initial = await TranscriptLedger.open({ root });
     initial.close();
-    const orphan = Buffer.from("published while the SQLite writer is open");
+    const orphan = files.rawBytes;
     const digest = createHash("sha256").update(orphan).digest("hex");
     const objectDir = path.join(root, "objects", "sha256", digest.slice(0, 2));
     const relativeObjectPath = path.relative(root, path.join(objectDir, digest));
@@ -531,7 +637,7 @@ describe("TranscriptLedger", () => {
         new Date().toISOString(),
       );
     const moduleUrl = pathToFileURL(path.join(process.cwd(), "src/transcriptLedger.ts")).href;
-    const childScript = `import { TranscriptLedger } from ${JSON.stringify(moduleUrl)}; const ledger = await TranscriptLedger.open({ root: ${JSON.stringify(root)} }); console.log("opened"); ledger.close();`;
+    const childScript = `import { TranscriptLedger } from ${JSON.stringify(moduleUrl)}; const ledger = await TranscriptLedger.open({ root: ${JSON.stringify(root)} }); await ledger.ingestPair({ provider: "chatgpt", profileId: "p", rawPath: ${JSON.stringify(files.rawPath)}, evidencePath: ${JSON.stringify(files.evidencePath)}, independentPath: ${JSON.stringify(files.independentPath)} }); console.log("committed"); ledger.close();`;
     const child = spawn(
       process.execPath,
       ["--import", "tsx", "--input-type=module", "-e", childScript],
@@ -548,11 +654,11 @@ describe("TranscriptLedger", () => {
       child.once("exit", (code) => resolve(code));
     });
     await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(childOutput).not.toContain("opened");
-    writer.exec("COMMIT");
+    expect(childOutput).not.toContain("committed");
+    writer.exec("ROLLBACK");
     writer.close();
     expect(await childExit).toBe(0);
-    expect(childOutput).toContain("opened");
+    expect(childOutput).toContain("committed");
     expect(await readFile(path.join(objectDir, digest))).toEqual(orphan);
   });
 
@@ -566,6 +672,7 @@ describe("TranscriptLedger", () => {
       profileId: "p",
       rawPath: files.rawPath,
       evidencePath: files.evidencePath,
+      independentPath: files.independentPath,
     });
     const object = path.join(
       root,
@@ -590,6 +697,7 @@ describe("TranscriptLedger", () => {
           profileId: "p",
           rawPath: path.join(dir, "input-link", path.basename(files.rawPath)),
           evidencePath: files.evidencePath,
+          independentPath: files.independentPath,
         }),
       ),
     ).rejects.toThrow(/symlinks/);

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -86,6 +87,46 @@ describe("provider conversation normalization", () => {
 });
 
 describe("provider capture failure handling", () => {
+  it("retains the independently fetched document as a separately drained artifact", async () => {
+    const rawText = JSON.stringify({ conversation_id: "abc-123", mapping: {} });
+    const digest = createHash("sha256").update(rawText).digest("hex");
+    const values: unknown[] = [
+      { result: { value: { ok: true, length: rawText.length } } },
+      { result: { value: rawText } },
+      { result: { value: true } },
+      {
+        result: {
+          value: {
+            ok: true,
+            documentSha256Decimal: [...Buffer.from(digest, "hex")],
+            documentBytes: Buffer.byteLength(rawText),
+            documentChars: rawText.length,
+            perTurn: [],
+            fetchedAt: "2026-01-01T00:00:00.000Z",
+          },
+        },
+      },
+      { result: { value: rawText } },
+      { result: { value: true } },
+    ];
+    let cursor = 0;
+    const outcome = await captureProviderNativeConversation({
+      Runtime: {
+        evaluate: async () => values[cursor++],
+      } as never,
+      conversationId: "abc-123",
+    });
+    expect(outcome).toMatchObject({
+      status: "captured",
+      capture: {
+        rawText,
+        independentRawText: rawText,
+        independentSha256: digest,
+        independentBytes: Buffer.byteLength(rawText),
+      },
+    });
+  });
+
   it("treats a conversation with no id as a normal unavailable result, not an error", async () => {
     const outcome = await captureProviderNativeConversation({
       Runtime: {

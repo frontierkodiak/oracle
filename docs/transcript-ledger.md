@@ -9,13 +9,18 @@ The default root is `$ORACLE_HOME_DIR/transcript-ledger` (normally
 `~/.oracle/transcript-ledger`). Set `ORACLE_TRANSCRIPT_LEDGER_DIR` or pass
 `--root` to choose another private root. The root, its owned directories, the
 SQLite index, and object files are owner-only. Symlinked ledger descendants are
-rejected. The index uses SQLite WAL mode. Raw provider JSON and evidence JSON
-are immutable, content-addressed objects; the raw bytes are authoritative.
+rejected. The index uses SQLite WAL mode. Raw provider JSON (fetch A), the
+independently fetched provider JSON (fetch B), and evidence JSON are immutable,
+content-addressed objects; fetch A remains authoritative while evidence and B
+provide an independently computed check.
 Ingest validates the provider mapping graph (including exactly one connected
 root), selected current-node chain, and evidence-to-turn digest correspondence
 before publication. The independent-fetch descriptor is closed and requires a
 real 32-byte decimal digest, byte count, and timestamp; the materialized
-descriptor binds the authoritative raw bytes. Bounded JSON depth, node count,
+descriptor binds the authoritative raw bytes. The B artifact's exact hash and
+size are checked against the bytes actually read; evidence per-turn hashes must
+match B's normalized selected branch and that branch must match A's logical
+turns. Bounded JSON depth, node count,
 turn count, body size, and artifact size prevent untrusted captures from
 exhausting the process. SQLite WAL's `BEGIN IMMEDIATE` is the single
 interprocess publication authority: recovery and object publication hold the
@@ -28,7 +33,7 @@ files are not consulted.
 
 ```sh
 oracle transcript seed https://chatgpt.com/c/<conversation-id> --profile my-profile
-oracle transcript ingest --raw raw.json --evidence evidence.json --profile my-profile
+oracle transcript ingest --raw raw.json --evidence evidence.json --independent independent.json --profile my-profile
 oracle transcript status
 oracle transcript sync <conversation-id> --profile my-profile --profile-dir ~/.oracle/browser-profile
 oracle transcript sync --all --profile-dir ~/.oracle/browser-profile
@@ -45,8 +50,8 @@ not start an internal daemon. `sync <thread>` must name one watched thread;
 rejected. Intervals must be finite and strictly positive.
 
 Each conversation identity is `(provider, opaque provider-profile id,
-provider conversation id)`. Every successful observation retains both raw and
-evidence hashes. A revision is keyed by a deterministic hash of the selected
+provider conversation id)`. Every successful observation retains raw, evidence,
+and independent-B hashes. A revision is keyed by a deterministic hash of the selected
 current-node branch's normalized turn sequence, so volatile provider metadata
 creates a new observation while leaving the logical revision unchanged. Body
 changes create a new immutable revision. Normalized turn rows contain role,
@@ -54,8 +59,13 @@ content type, body hash/length, parent/node identity, and attachment metadata;
 the raw object remains the source of truth.
 
 Automatic best-effort ingest runs after the CLI receives a successful local or
-remote browser result containing the paired provider-native artifacts. Ledger
+remote browser result containing all three provider-native artifacts. Ledger
 failure produces a body-free typed warning and does not fail or discard the
 completed provider result. Remote capture artifacts are ingested on the client
 after the existing authenticated transfer verifies them, so the caller's
 ledger remains the durable local archive.
+
+The static no-follow and containment checks defend the ledger within Carbon's
+full-permission same-user trust boundary. This candidate does not claim to
+prevent a malicious same-user process from replacing an ancestor between
+validation and open; a native `openat` broker would be a separate boundary.

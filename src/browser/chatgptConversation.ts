@@ -23,9 +23,10 @@ import type { BrowserLogger, ChromeClient } from "./types.js";
  *   A. The document is materialized verbatim — the page returns `response.text()`
  *      and those exact bytes are what gets written and hashed. Nothing is parsed
  *      and re-serialized on the way to disk.
- *   B. A second, independent fetch is normalized and hashed *in the page*, and
- *      only the digests come back. A Node-side mistake therefore cannot make B
- *      agree with A by construction, because Node never sees B's body.
+ *   B. A second, independent fetch is normalized and hashed *in the page* before
+ *      its same bytes are drained into a separately retained artifact. A
+ *      Node-side mistake therefore cannot make B agree with A by construction:
+ *      the per-turn evidence is computed before B crosses the boundary.
  *
  * Document-level hashes of A and B are expected to differ: the backend document
  * carries volatile nested metadata that changes between fetches at identical byte
@@ -91,6 +92,10 @@ export interface ProviderNativeCapture {
     fetchedAt: string;
   } | null;
   evidenceFailure?: ProviderNativeCaptureFailure;
+  /** Verbatim bytes of fetch B, retained separately from authoritative A. */
+  independentRawText?: string;
+  independentSha256?: string;
+  independentBytes?: number;
   /** Recorded, never gated: the backend document mutates between fetches. */
   documentHashesMatch: boolean | null;
 }
@@ -100,6 +105,7 @@ export type ProviderNativeCaptureOutcome =
   | { status: "unavailable"; failure: ProviderNativeCaptureFailure };
 
 const STASH_KEY = "__oracleConversationCapture";
+const INDEPENDENT_STASH_KEY = "__oracleConversationCaptureIndependent";
 const DRAIN_CHUNK_CHARS = 500_000;
 /**
  * Ceilings, not guesses about what Chrome will tolerate. A conversation document
@@ -462,23 +468,23 @@ function buildFetchDocumentExpression(conversationId: string): string {
   })()`;
 }
 
-function buildDrainExpression(offset: number): string {
+function buildDrainExpression(offset: number, stashKey = STASH_KEY): string {
   return `(() => {
-    const stash = globalThis[${JSON.stringify(STASH_KEY)}];
+    const stash = globalThis[${JSON.stringify(stashKey)}];
     if (typeof stash !== 'string') return null;
     return stash.slice(${offset}, ${offset + DRAIN_CHUNK_CHARS});
   })()`;
 }
 
-function buildReleaseExpression(): string {
-  return `(() => { delete globalThis[${JSON.stringify(STASH_KEY)}]; return true; })()`;
+function buildReleaseExpression(stashKey = STASH_KEY): string {
+  return `(() => { delete globalThis[${JSON.stringify(stashKey)}]; return true; })()`;
 }
 
 /**
  * Normalize-and-digest, shared by the live evidence path and its test double.
  * `sourceExpression` must evaluate to `{ok:true,text}` or a typed failure.
  */
-function buildDigestSource(sourceExpression: string): string {
+function buildDigestSource(sourceExpression: string, stashKey?: string): string {
   return `
     ${buildNormalizerSource()}
     if (!globalThis.crypto || !globalThis.crypto.subtle || typeof globalThis.crypto.subtle.digest !== 'function') {
@@ -486,6 +492,10 @@ function buildDigestSource(sourceExpression: string): string {
     }
     const result = await (${sourceExpression});
     if (!result.ok) return result;
+    if (result.text.length > ${MAX_DOCUMENT_CHARS}) {
+      return { ok: false, reason: 'http-error', detail: 'document exceeds capture ceiling' };
+    }
+    ${stashKey ? `globalThis[${JSON.stringify(stashKey)}] = result.text;` : ""}
     const encoder = new TextEncoder();
     const digestDecimal = async (value) => {
       const bytes = encoder.encode(value);
@@ -515,6 +525,7 @@ function buildDigestSource(sourceExpression: string): string {
       ok: true,
       documentSha256Decimal: documentDigest.digest,
       documentBytes: documentDigest.bytes,
+      documentChars: result.text.length,
       perTurn,
       fetchedAt: new Date().toISOString(),
     };
@@ -522,13 +533,14 @@ function buildDigestSource(sourceExpression: string): string {
 }
 
 /**
- * Fetch B: independent, normalized and hashed without leaving the page. Only
- * digests cross the boundary, so this cannot be an echo of fetch A.
+ * Fetch B: independent, normalized and hashed without leaving the page. Its
+ * body is stashed only after the digest source has obtained it, then drained in
+ * bounded chunks into a separately retained artifact.
  */
 function buildEvidenceExpression(conversationId: string): string {
   return `(async () => {
     ${buildAuthAndFetchSource(conversationId)}
-    ${buildDigestSource("fetchConversationText()")}
+    ${buildDigestSource("fetchConversationText()", INDEPENDENT_STASH_KEY)}
   })()`;
 }
 
@@ -654,6 +666,7 @@ export async function captureProviderNativeConversation(params: {
             ok: true;
             documentSha256Decimal: number[];
             documentBytes: number;
+            documentChars: number;
             perTurn: ProviderNativeTurnDigest[];
             fetchedAt: string;
           }
@@ -677,6 +690,45 @@ export async function captureProviderNativeConversation(params: {
       perTurn: evidence.perTurn,
       fetchedAt: evidence.fetchedAt,
     };
+    let independentText = "";
+    try {
+      while (independentText.length < evidence.documentChars) {
+        const chunk = await evaluateInPage<string>(
+          Runtime,
+          buildDrainExpression(independentText.length, INDEPENDENT_STASH_KEY),
+          false,
+        );
+        if (chunk === null || chunk === "") break;
+        independentText += chunk;
+      }
+    } catch (error) {
+      capture.evidenceFailure = {
+        reason: "evaluate-failed",
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      await evaluateInPage(Runtime, buildReleaseExpression(INDEPENDENT_STASH_KEY), false).catch(
+        () => null,
+      );
+    }
+    if (!capture.evidenceFailure) {
+      const independentBytes = Buffer.from(independentText, "utf8");
+      const independentSha256 = createHash("sha256").update(independentBytes).digest("hex");
+      if (
+        independentText.length !== evidence.documentChars ||
+        independentBytes.byteLength !== evidence.documentBytes ||
+        independentSha256 !== Buffer.from(evidence.documentSha256Decimal).toString("hex")
+      ) {
+        capture.evidenceFailure = {
+          reason: "evaluate-failed",
+          detail: "independent document changed or was truncated while draining",
+        };
+      } else {
+        capture.independentRawText = independentText;
+        capture.independentSha256 = independentSha256;
+        capture.independentBytes = independentBytes.byteLength;
+      }
+    }
     const evidenceHex = Buffer.from(evidence.documentSha256Decimal).toString("hex");
     capture.documentHashesMatch = evidenceHex === capture.rawSha256;
     if (!capture.documentHashesMatch) {
@@ -688,8 +740,14 @@ export async function captureProviderNativeConversation(params: {
     }
   } else if (evidence) {
     capture.evidenceFailure = toFailure(evidence);
+    await evaluateInPage(Runtime, buildReleaseExpression(INDEPENDENT_STASH_KEY), false).catch(
+      () => null,
+    );
   } else {
     capture.evidenceFailure = { reason: "evaluate-failed" };
+    await evaluateInPage(Runtime, buildReleaseExpression(INDEPENDENT_STASH_KEY), false).catch(
+      () => null,
+    );
   }
 
   return { status: "captured", capture };
@@ -766,10 +824,9 @@ function compareAnswerToProviderTurns(
  * Captures the provider's own conversation document and writes it beside the
  * run's other artifacts, along with the independently-derived digests.
  *
- * Two files rather than one, because they answer different questions and a
- * downstream verifier must be able to tell them apart: the raw document is the
- * material, the evidence file is the independent observation of it. Merging them
- * would make the evidence self-certifying.
+ * Three files rather than one: authoritative raw A, independently fetched raw B,
+ * and the evidence file. A downstream verifier can therefore recompute B's
+ * document and per-turn hashes without trusting a self-certifying claim.
  *
  * Never throws. A run whose capture failed is still a run whose answer is
  * perfectly good — it simply is not proof-grade, and says so.
@@ -863,6 +920,25 @@ export async function finalizeProviderNativeCapture(params: {
     });
 
     if (capture.evidence) {
+      let independentArtifact: SessionArtifact | undefined;
+      if (capture.independentRawText !== undefined) {
+        const independentBytes = Buffer.from(capture.independentRawText, "utf8");
+        const independentPath = await resolveUniqueArtifactPath(
+          path.join(dir, `conversation-${capture.conversationId}-independent.json`),
+        );
+        await writeFile(independentPath, independentBytes);
+        independentArtifact = {
+          kind: "file",
+          path: independentPath,
+          label: "provider-native-conversation-independent",
+          mimeType: "application/json",
+          sizeBytes: capture.independentBytes ?? independentBytes.byteLength,
+          sha256:
+            capture.independentSha256 ??
+            createHash("sha256").update(independentBytes).digest("hex"),
+        };
+        artifacts.push(independentArtifact);
+      }
       const evidenceDocument = {
         schema: "oracle.provider-native-capture-evidence/v1",
         conversation_id: capture.conversationId,
@@ -874,6 +950,14 @@ export async function finalizeProviderNativeCapture(params: {
         materialized_document: {
           sha256: capture.rawSha256,
           bytes: capture.rawBytes,
+        },
+        independent_document: {
+          sha256:
+            capture.independentSha256 ??
+            capture.evidence.documentSha256Decimal
+              .map((value) => value.toString(16).padStart(2, "0"))
+              .join(""),
+          bytes: capture.independentBytes ?? capture.evidence.documentBytes,
         },
         // The independent second fetch, kept separate on purpose. Its per-turn
         // digests are the evidence; its document hash is only a volatility

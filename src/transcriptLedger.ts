@@ -31,6 +31,7 @@ export interface IngestPairInput {
   canonicalUrl?: string;
   rawPath: string;
   evidencePath: string;
+  independentPath: string;
   capturedAt?: string;
   captureMethod?: string;
 }
@@ -53,6 +54,7 @@ export interface LedgerIngestResult {
   deduplicated: boolean;
   rawSha256: string;
   evidenceSha256: string;
+  independentSha256: string;
   normalizedSequenceSha256: string;
   warning?: LedgerWarning;
 }
@@ -86,7 +88,7 @@ export class LedgerArtifactPairError extends Error {
   readonly code = "transcript-ledger-artifact-pair-incomplete" as const;
 
   constructor() {
-    super("provider-native raw/evidence artifact pair is incomplete");
+    super("provider-native raw/evidence/independent artifact set is incomplete");
     this.name = "LedgerArtifactPairError";
   }
 }
@@ -631,8 +633,12 @@ function validateEvidence(
   evidence: Record<string, unknown>,
   parsed: ReturnType<typeof parseConversation>,
   turns: NormalizedTurn[],
+  independentParsed: ReturnType<typeof parseConversation>,
+  independentTurns: NormalizedTurn[],
   rawSha256: string,
   rawBytes: number,
+  independentSha256: string,
+  independentBytes: number,
 ): void {
   if (evidence.schema !== "oracle.provider-native-capture-evidence/v1") {
     throw new Error("unsupported provider evidence schema");
@@ -667,6 +673,37 @@ function validateEvidence(
   if (materializedRecord.sha256 !== rawSha256 || materializedRecord.bytes !== rawBytes) {
     throw new Error("evidence does not describe the supplied raw bytes");
   }
+  if (independentParsed.id !== parsed.id) {
+    throw new Error("independent document conversation id does not match raw document");
+  }
+  const independentDocument = evidence.independent_document;
+  if (
+    !independentDocument ||
+    typeof independentDocument !== "object" ||
+    Array.isArray(independentDocument)
+  ) {
+    throw new Error("evidence has no independent document descriptor");
+  }
+  const independentDocumentRecord = independentDocument as Record<string, unknown>;
+  if (
+    Object.keys(independentDocumentRecord).some((key) => !["sha256", "bytes"].includes(key)) ||
+    !Object.hasOwn(independentDocumentRecord, "sha256") ||
+    !Object.hasOwn(independentDocumentRecord, "bytes") ||
+    typeof independentDocumentRecord.sha256 !== "string" ||
+    !/^[a-f0-9]{64}$/.test(independentDocumentRecord.sha256) ||
+    typeof independentDocumentRecord.bytes !== "number" ||
+    !Number.isSafeInteger(independentDocumentRecord.bytes) ||
+    independentDocumentRecord.bytes <= 0 ||
+    independentDocumentRecord.bytes > MAX_RAW_BYTES
+  ) {
+    throw new Error("evidence independent document descriptor has an unsupported shape");
+  }
+  if (
+    independentDocumentRecord.sha256 !== independentSha256 ||
+    independentDocumentRecord.bytes !== independentBytes
+  ) {
+    throw new Error("evidence does not describe the supplied independent document");
+  }
   const independent = evidence.independent_fetch;
   if (!independent || typeof independent !== "object" || Array.isArray(independent)) {
     throw new Error("evidence has no independent fetch descriptor");
@@ -679,7 +716,7 @@ function validateEvidence(
   ) {
     throw new Error("evidence independent fetch descriptor has an unsupported shape");
   }
-  decimalDigest(
+  const independentDigest = decimalDigest(
     independentRecord.document_sha256_decimal_bytes,
     "independent fetch document digest",
   );
@@ -692,6 +729,12 @@ function validateEvidence(
     throw new Error("independent fetch document byte count is invalid");
   }
   if (
+    independentRecord.document_bytes !== independentBytes ||
+    Buffer.from(independentDigest).toString("hex") !== independentSha256
+  ) {
+    throw new Error("independent fetch descriptor does not describe the supplied document");
+  }
+  if (
     typeof independentRecord.fetched_at !== "string" ||
     !Number.isFinite(Date.parse(independentRecord.fetched_at))
   ) {
@@ -699,7 +742,7 @@ function validateEvidence(
   }
   const perTurn = evidence.per_turn;
   if (!Array.isArray(perTurn)) throw new Error("evidence has no per-turn digest array");
-  const expected = turns.filter((turn) => turn.role !== "system");
+  const expected = independentTurns.filter((turn) => turn.role !== "system");
   if (perTurn.length !== expected.length)
     throw new Error("evidence turn count does not match selected branch");
   for (let index = 0; index < expected.length; index += 1) {
@@ -733,6 +776,20 @@ function validateEvidence(
       throw new Error(`evidence turn ${index} attachment metadata mismatch`);
     }
   }
+  const authoritative = turns.filter((turn) => turn.role !== "system");
+  if (
+    authoritative.length !== expected.length ||
+    authoritative.some(
+      (turn, index) =>
+        turn.role !== expected[index].role ||
+        turn.contentType !== expected[index].contentType ||
+        turn.bodySha256 !== expected[index].bodySha256 ||
+        turn.bodyBytes !== expected[index].bodyBytes ||
+        stableJson(turn.attachments) !== stableJson(expected[index].attachments),
+    )
+  ) {
+    throw new Error("independent document selected branch differs from authoritative raw");
+  }
 }
 
 function conversationKey(provider: string, profileId: string, conversationId: string): string {
@@ -757,7 +814,7 @@ function createDb(indexPath: string): DatabaseSync {
     );
     CREATE TABLE IF NOT EXISTS revisions (
       revision_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL REFERENCES conversations(conversation_key),
-      normalized_sequence_sha256 TEXT NOT NULL, raw_sha256 TEXT NOT NULL, evidence_sha256 TEXT NOT NULL,
+      normalized_sequence_sha256 TEXT NOT NULL, raw_sha256 TEXT NOT NULL, evidence_sha256 TEXT NOT NULL, independent_sha256 TEXT NOT NULL,
       current_node_id TEXT, turn_count INTEGER NOT NULL, normalization_version TEXT NOT NULL,
       captured_at TEXT NOT NULL, UNIQUE(conversation_key, normalized_sequence_sha256)
     );
@@ -768,7 +825,7 @@ function createDb(indexPath: string): DatabaseSync {
     );
     CREATE TABLE IF NOT EXISTS observations (
       observation_id TEXT PRIMARY KEY, conversation_key TEXT NOT NULL REFERENCES conversations(conversation_key),
-      captured_at TEXT NOT NULL, status TEXT NOT NULL, raw_sha256 TEXT, evidence_sha256 TEXT,
+      captured_at TEXT NOT NULL, status TEXT NOT NULL, raw_sha256 TEXT, evidence_sha256 TEXT, independent_sha256 TEXT,
       normalized_sequence_sha256 TEXT, revision_id TEXT, source_url TEXT, capture_method TEXT,
       error_code TEXT, error_message TEXT
     );
@@ -781,6 +838,14 @@ function createDb(indexPath: string): DatabaseSync {
     CREATE INDEX IF NOT EXISTS observations_by_conversation ON observations(conversation_key, captured_at);
     CREATE INDEX IF NOT EXISTS revisions_by_conversation ON revisions(conversation_key, captured_at);
   `);
+  const ensureColumn = (table: string, column: string, definition: string) => {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+    if (!columns.some((entry) => entry.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  };
+  ensureColumn("revisions", "independent_sha256", "TEXT");
+  ensureColumn("observations", "independent_sha256", "TEXT");
   db.prepare("INSERT OR IGNORE INTO ledger_meta(key,value) VALUES('schema', ?)").run(
     TRANSCRIPT_LEDGER_SCHEMA,
   );
@@ -790,9 +855,41 @@ function createDb(indexPath: string): DatabaseSync {
 export class TranscriptLedger {
   readonly root: string;
   private db?: DatabaseSync;
+  private activeOperations = 0;
+  private closeRequested = false;
+  private waitingOperations = 0;
+  private queuedCloseRequested = false;
+  private activePublicationOperations = 0;
 
   private constructor(root: string) {
     this.root = root;
+  }
+
+  private beginOperation(): void {
+    if (this.closeRequested || !this.db) throw new Error("transcript ledger is closed");
+    this.activeOperations += 1;
+  }
+
+  private endOperation(): void {
+    this.activeOperations -= 1;
+    if (this.activeOperations === 0 && this.closeRequested) {
+      this.db?.close();
+      this.db = undefined;
+    }
+  }
+
+  private async acquirePublicationTurnForOperation(): Promise<() => void> {
+    this.waitingOperations += 1;
+    try {
+      const release = await acquireProcessPublicationTurn(this.root);
+      if (this.queuedCloseRequested) {
+        release();
+        throw new Error("transcript ledger is closed");
+      }
+      return release;
+    } finally {
+      this.waitingOperations -= 1;
+    }
   }
 
   static async open(options: TranscriptLedgerOptions = {}): Promise<TranscriptLedger> {
@@ -827,8 +924,12 @@ export class TranscriptLedger {
   }
 
   close(): void {
-    this.db?.close();
-    this.db = undefined;
+    this.closeRequested = true;
+    if (this.waitingOperations > 0) this.queuedCloseRequested = true;
+    if (this.activeOperations === 0) {
+      this.db?.close();
+      this.db = undefined;
+    }
   }
 
   private get database(): DatabaseSync {
@@ -837,10 +938,28 @@ export class TranscriptLedger {
   }
 
   async ingestPair(input: IngestPairInput): Promise<LedgerIngestResult> {
+    this.beginOperation();
+    let releaseTurn: (() => void) | undefined;
+    try {
+      return await this.ingestPairActive(input, (release) => {
+        releaseTurn = release;
+      });
+    } finally {
+      releaseTurn?.();
+      this.endOperation();
+    }
+  }
+
+  private async ingestPairActive(
+    input: IngestPairInput,
+    setReleaseTurn: (release: () => void) => void,
+  ): Promise<LedgerIngestResult> {
     const rawBytes = await readArtifactBytes(input.rawPath, MAX_RAW_BYTES);
     const evidenceBytes = await readArtifactBytes(input.evidencePath, MAX_EVIDENCE_BYTES);
+    const independentBytes = await readArtifactBytes(input.independentPath, MAX_RAW_BYTES);
     let raw: Record<string, unknown>;
     let evidence: Record<string, unknown>;
+    let independent: Record<string, unknown>;
     try {
       raw = JSON.parse(rawBytes.toString("utf8")) as Record<string, unknown>;
       assertJsonBounds(raw, "provider raw document");
@@ -858,10 +977,31 @@ export class TranscriptLedger {
         `provider evidence document is invalid: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+    try {
+      independent = JSON.parse(independentBytes.toString("utf8")) as Record<string, unknown>;
+      assertJsonBounds(independent, "independent provider document");
+    } catch (error) {
+      throw new Error(
+        `independent provider document is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     const rawSha256 = hashBytes(rawBytes);
     const evidenceSha256 = hashBytes(evidenceBytes);
+    const independentSha256 = hashBytes(independentBytes);
     const turns = selectedTurns(parsed, rawBytes.toString("utf8"));
-    validateEvidence(evidence, parsed, turns, rawSha256, rawBytes.byteLength);
+    const independentParsed = parseConversation(independent, input.conversationId);
+    const independentTurns = selectedTurns(independentParsed, independentBytes.toString("utf8"));
+    validateEvidence(
+      evidence,
+      parsed,
+      turns,
+      independentParsed,
+      independentTurns,
+      rawSha256,
+      rawBytes.byteLength,
+      independentSha256,
+      independentBytes.byteLength,
+    );
     const sequence = turns.map(
       ({ ordinal, nodeId, parentId, role, contentType, bodySha256, bodyBytes, attachments }) => ({
         ordinal,
@@ -879,17 +1019,23 @@ export class TranscriptLedger {
     const capturedAt = input.capturedAt ?? now();
     const revisionId = hashText(`${key}\u0000${normalizedSequenceSha256}`);
     const observationId = randomUUID();
-    const releaseTurn = await acquireProcessPublicationTurn(this.root);
+    const acquiredReleaseTurn = await this.acquirePublicationTurnForOperation();
+    this.activePublicationOperations += 1;
+    setReleaseTurn(() => {
+      this.activePublicationOperations -= 1;
+      acquiredReleaseTurn();
+    });
     let rawObject: { path: string; created: boolean } | undefined;
     let evidenceObject: { path: string; created: boolean } | undefined;
+    let independentObject: { path: string; created: boolean } | undefined;
     const db = this.database;
-    let committed = false;
     let transactionStarted = false;
     try {
       db.exec("BEGIN IMMEDIATE");
       transactionStarted = true;
       rawObject = await writeObject(this.root, rawBytes, rawSha256);
       evidenceObject = await writeObject(this.root, evidenceBytes, evidenceSha256);
+      independentObject = await writeObject(this.root, independentBytes, independentSha256);
       db.prepare(`INSERT INTO conversations(conversation_key,provider,profile_id,conversation_id,canonical_url,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)
         ON CONFLICT(conversation_key) DO UPDATE SET canonical_url=COALESCE(excluded.canonical_url,conversations.canonical_url), state='captured', updated_at=excluded.updated_at`).run(
         key,
@@ -913,6 +1059,15 @@ export class TranscriptLedger {
       db.prepare(
         "INSERT OR IGNORE INTO objects(sha256,kind,bytes,path,created_at) VALUES(?,?,?,?,?)",
       ).run(
+        independentSha256,
+        "independent-provider-json",
+        independentBytes.byteLength,
+        path.relative(this.root, independentObject.path),
+        capturedAt,
+      );
+      db.prepare(
+        "INSERT OR IGNORE INTO objects(sha256,kind,bytes,path,created_at) VALUES(?,?,?,?,?)",
+      ).run(
         evidenceSha256,
         "provider-evidence-json",
         evidenceBytes.byteLength,
@@ -928,13 +1083,14 @@ export class TranscriptLedger {
       const effectiveRevisionId = existing?.revision_id ?? revisionId;
       if (!existing) {
         db.prepare(
-          "INSERT INTO revisions(revision_id,conversation_key,normalized_sequence_sha256,raw_sha256,evidence_sha256,current_node_id,turn_count,normalization_version,captured_at) VALUES(?,?,?,?,?,?,?,?,?)",
+          "INSERT INTO revisions(revision_id,conversation_key,normalized_sequence_sha256,raw_sha256,evidence_sha256,independent_sha256,current_node_id,turn_count,normalization_version,captured_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
         ).run(
           effectiveRevisionId,
           key,
           normalizedSequenceSha256,
           rawSha256,
           evidenceSha256,
+          independentSha256,
           parsed.currentNode,
           turns.length,
           TRANSCRIPT_LEDGER_NORMALIZATION,
@@ -960,7 +1116,7 @@ export class TranscriptLedger {
         "UPDATE conversations SET latest_revision_id=?,state='captured',updated_at=? WHERE conversation_key=?",
       ).run(effectiveRevisionId, capturedAt, key);
       db.prepare(
-        "INSERT INTO observations(observation_id,conversation_key,captured_at,status,raw_sha256,evidence_sha256,normalized_sequence_sha256,revision_id,source_url,capture_method) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO observations(observation_id,conversation_key,captured_at,status,raw_sha256,evidence_sha256,independent_sha256,normalized_sequence_sha256,revision_id,source_url,capture_method) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
       ).run(
         observationId,
         key,
@@ -968,13 +1124,13 @@ export class TranscriptLedger {
         "captured",
         rawSha256,
         evidenceSha256,
+        independentSha256,
         normalizedSequenceSha256,
         effectiveRevisionId,
         input.canonicalUrl ?? parsed.url,
         input.captureMethod ?? "provider-native",
       );
       db.exec("COMMIT");
-      committed = true;
       return {
         conversationKey: key,
         observationId,
@@ -982,6 +1138,7 @@ export class TranscriptLedger {
         deduplicated,
         rawSha256,
         evidenceSha256,
+        independentSha256,
         normalizedSequenceSha256,
       };
     } catch (error) {
@@ -993,12 +1150,6 @@ export class TranscriptLedger {
         }
       }
       throw error;
-    } finally {
-      if (!committed) {
-        for (const object of [rawObject, evidenceObject])
-          if (object?.created) await rm(object.path, { force: true }).catch(() => undefined);
-      }
-      releaseTurn();
     }
   }
 
@@ -1187,7 +1338,7 @@ export function ledgerWarning(_error: unknown): LedgerWarning {
       code: "transcript-ledger-artifact-pair-incomplete",
       severity: "warning",
       message:
-        "Provider-native capture returned an incomplete raw/evidence pair; the completed provider result was retained.",
+        "Provider-native capture returned an incomplete raw/evidence/independent artifact set; the completed provider result was retained.",
     };
   }
   return {
@@ -1253,11 +1404,14 @@ export async function ingestProviderNativeArtifacts(params: {
   const evidence = params.artifacts?.find(
     (artifact) => artifact.label === "provider-native-conversation-evidence",
   );
-  if (!raw && !evidence) {
+  const independent = params.artifacts?.find(
+    (artifact) => artifact.label === "provider-native-conversation-independent",
+  );
+  if (!raw && !evidence && !independent) {
     if (params.requirePair) throw new LedgerArtifactPairError();
     return undefined;
   }
-  if (!raw || !evidence) throw new LedgerArtifactPairError();
+  if (!raw || !evidence || !independent) throw new LedgerArtifactPairError();
   const ledger = await TranscriptLedger.open();
   try {
     return await ledger.ingestPair({
@@ -1267,6 +1421,7 @@ export async function ingestProviderNativeArtifacts(params: {
       canonicalUrl: params.canonicalUrl,
       rawPath: raw.path,
       evidencePath: evidence.path,
+      independentPath: independent.path,
       capturedAt: params.capturedAt,
     });
   } finally {
