@@ -360,6 +360,39 @@ function isKnownRemoteEvent(value: unknown): boolean {
         (n) => n === undefined || (Number.isSafeInteger(n) && Number(n) >= 0),
       )
     );
+  if (e.type === "maintenance-capture-authorized")
+    return (
+      keys(["type", "grantId", "drainId", "conversationId"]) &&
+      [e.grantId, e.drainId, e.conversationId].every(
+        (value) => typeof value === "string" && value.length > 0,
+      )
+    );
+  if (e.type === "maintenance-capture-verified")
+    return (
+      keys([
+        "type",
+        "grantId",
+        "drainId",
+        "conversationId",
+        "submissionAttempted",
+        "promptSubmitted",
+        "artifactCount",
+        "artifactManifestSha256",
+      ]) &&
+      [e.grantId, e.drainId, e.conversationId].every(
+        (value) => typeof value === "string" && value.length > 0,
+      ) &&
+      e.submissionAttempted === false &&
+      e.promptSubmitted === false &&
+      Number.isSafeInteger(e.artifactCount) &&
+      Number(e.artifactCount) >= 3 &&
+      typeof e.artifactManifestSha256 === "string" &&
+      /^[a-f0-9]{64}$/.test(e.artifactManifestSha256)
+    );
+  if (e.type === "maintenance-capture-violation")
+    return (
+      keys(["type", "code"]) && typeof e.code === "string" && /^[a-z0-9_]{1,128}$/.test(e.code)
+    );
   return false;
 }
 export async function getDurableRemoteQueueStatus(

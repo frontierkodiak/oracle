@@ -5,6 +5,12 @@ export interface OracleRuntimeIdentity {
   version: string;
   major: number;
   minimumMajor: number;
+  /** Resolved executable identity exposed by authenticated service health. */
+  nodeBin?: string;
+  /** Resolved CLI entrypoint exposed by authenticated service health. */
+  oracleCli?: string;
+  /** Immutable-install source commit, when the service runs from a packaged install. */
+  sourceCommit?: string;
 }
 
 export function parseNodeMajor(version: string): number | undefined {

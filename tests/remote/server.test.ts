@@ -194,12 +194,17 @@ describe("remote browser service", () => {
       expect(healthOk.statusCode).toBe(200);
       expect(healthOk.json?.ok).toBe(true);
       expect(typeof healthOk.json?.version).toBe("string");
-      expect(healthOk.json?.runtime).toEqual({
+      expect(healthOk.json?.runtime).toMatchObject({
         name: "node",
         version: process.versions.node,
         major: Number(process.versions.node.split(".")[0]),
         minimumMajor: 24,
       });
+      const healthRuntime = healthOk.json?.runtime as Record<string, unknown> | undefined;
+      const healthProcess = healthOk.json?.process as Record<string, unknown> | undefined;
+      expect(typeof healthRuntime?.nodeBin).toBe("string");
+      expect(typeof healthRuntime?.oracleCli).toBe("string");
+      expect(healthProcess?.pid).toBe(process.pid);
       const healthCapabilities = healthOk.json?.capabilities as any;
       expect(healthCapabilities).toMatchObject({
         schemaVersion: 1,

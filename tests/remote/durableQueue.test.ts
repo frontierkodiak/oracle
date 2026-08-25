@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   readlink,
   rename,
   stat,
@@ -22,6 +23,19 @@ const request = (prompt: string, captureOnly = false) => ({
   prompt,
   browserConfig: { captureOnly, desiredModel: "gpt-5-pro" },
   options: {},
+});
+
+const maintenanceCaptureRequest = (conversationUrl: string, grantId: string) => ({
+  prompt: "",
+  attachments: [],
+  browserConfig: {
+    chatgptUrl: conversationUrl,
+    url: conversationUrl,
+    resumeConversationUrl: conversationUrl,
+    captureOnly: true,
+    captureProviderNative: true,
+  },
+  options: { sessionId: `maintenance-capture-${grantId}` },
 });
 
 describe("DurableQueueStore", () => {
@@ -155,6 +169,170 @@ describe("DurableQueueStore", () => {
     expect(reopened.get(queued.id)?.state).toBe("queued");
     expect(reopened.claimNext()?.id).toBe(queued.id);
     reopened.close();
+  });
+
+  it("acquires the idle fence atomically, preserves exact replay, and survives reopen", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-maintenance-fence-"));
+    const store = await DurableQueueStore.open({ homeDir: home });
+    const existing = await store.submit("existing", request("existing"));
+    expect(() => store.beginDrainIfIdle("drain-busy", "require-idle")).toThrow("bridge_busy");
+    expect(store.admission()).toEqual({ state: "open" });
+    store.cancel(existing.id);
+
+    const drain = store.beginDrainIfIdle("drain-stable", "require-idle");
+    expect(drain).toMatchObject({ state: "draining", activeRuns: 0, queuedRuns: 0 });
+    expect(store.beginDrainIfIdle("drain-stable", "require-idle")).toEqual(drain);
+    await expect(store.submit("new-during-drain", request("blocked"))).rejects.toThrow(
+      "admission_draining",
+    );
+    await expect(store.submit("existing", request("existing"))).resolves.toMatchObject({
+      id: existing.id,
+    });
+    store.close();
+
+    const reopened = await DurableQueueStore.open({ homeDir: home });
+    expect(reopened.admission()).toMatchObject({ state: "draining", drainId: drain.drainId });
+    expect(reopened.getDrain(drain.drainId)).toEqual(drain);
+    expect(reopened.releaseDrain(drain.drainId)).toEqual({
+      schemaVersion: 1,
+      drainId: drain.drainId,
+      state: "open",
+    });
+    reopened.close();
+  });
+
+  it("stores only a capture token digest and binds one key with exact replay", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-capture-grant-"));
+    const store = await DurableQueueStore.open({ homeDir: home });
+    const drain = store.beginDrainIfIdle("drain-capture", "require-idle");
+    const conversationUrl = "https://chatgpt.com/c/accepted-conversation";
+    const grant = store.issueCaptureGrant(
+      drain.drainId,
+      "accepted-conversation",
+      conversationUrl,
+      "issue-capture-key",
+      "operator-secret",
+    );
+    expect(
+      store.issueCaptureGrant(
+        drain.drainId,
+        "accepted-conversation",
+        conversationUrl,
+        "issue-capture-key",
+        "operator-secret",
+      ),
+    ).toEqual({ ...grant, replayed: true });
+    expect(() =>
+      store.issueCaptureGrant(
+        drain.drainId,
+        "different-conversation",
+        "https://chatgpt.com/c/different-conversation",
+        "issue-capture-key",
+        "operator-secret",
+      ),
+    ).toThrow("capture_grant_issue_conflict");
+    const payload = maintenanceCaptureRequest(conversationUrl, grant.grantId);
+    const accepted = await store.submitGrantedCapture(grant.token, "capture-key", payload);
+    await expect(
+      store.submitGrantedCapture(grant.token, "capture-key", payload),
+    ).resolves.toMatchObject({ id: accepted.id });
+    await expect(store.submitGrantedCapture(grant.token, "second-key", payload)).rejects.toThrow(
+      "capture_grant_consumed",
+    );
+    expect(store.getCaptureGrant(grant.grantId)).toMatchObject({
+      state: "admitted",
+      runId: accepted.id,
+    });
+    expect(() => store.transition(accepted.id, "completed", "terminal")).toThrow(
+      "verified bridge evidence",
+    );
+    store.transition(accepted.id, "completed", "terminal", {
+      captureAudit: {
+        artifactManifestSha256: "a".repeat(64),
+        artifactCount: 0,
+        submissionAttempted: false,
+        promptSubmitted: false,
+      },
+    });
+    expect(store.getCaptureGrant(grant.grantId)).toMatchObject({
+      state: "completed",
+      terminal: {
+        state: "completed",
+        verified: true,
+        submissionAttempted: false,
+        promptSubmitted: false,
+        artifactCount: 0,
+        artifactManifestSha256: "a".repeat(64),
+      },
+    });
+    for (const file of [store.dbPath, `${store.dbPath}-wal`, `${store.dbPath}-shm`]) {
+      const bytes = await readFile(file).catch(() => Buffer.alloc(0));
+      expect(bytes.includes(Buffer.from(grant.token))).toBe(false);
+    }
+    expect(store.releaseDrain(drain.drainId).state).toBe("open");
+    store.close();
+  });
+
+  it("fails an interrupted granted capture without reopening its durable fence", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-capture-reconcile-"));
+    const store = await DurableQueueStore.open({ homeDir: home });
+    const drain = store.beginDrainIfIdle("drain-restart", "require-idle");
+    const conversationUrl = "https://chatgpt.com/c/restart-conversation";
+    const grant = store.issueCaptureGrant(
+      drain.drainId,
+      "restart-conversation",
+      conversationUrl,
+      "issue-restart-key",
+      "operator-secret",
+    );
+    const accepted = await store.submitGrantedCapture(
+      grant.token,
+      "restart-key",
+      maintenanceCaptureRequest(conversationUrl, grant.grantId),
+    );
+    expect(store.claimNext()?.id).toBe(accepted.id);
+    store.close();
+
+    const reopened = await DurableQueueStore.open({ homeDir: home });
+    expect(reopened.get(accepted.id)).toMatchObject({ state: "unknown", phase: "terminal" });
+    expect(reopened.getCaptureGrant(grant.grantId)).toMatchObject({
+      state: "failed",
+      terminal: { state: "unknown", failureCode: "restart_interrupted" },
+    });
+    expect(reopened.admission()).toMatchObject({ state: "draining", drainId: drain.drainId });
+    expect(reopened.releaseDrain(drain.drainId).state).toBe("open");
+    reopened.close();
+  });
+
+  it("atomically revokes a never-admitted grant when its idle drain is released", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-capture-unused-release-"));
+    const store = await DurableQueueStore.open({ homeDir: home });
+    const drain = store.beginDrainIfIdle("unused-drain", "require-idle");
+    const grant = store.issueCaptureGrant(
+      drain.drainId,
+      "unused-conversation",
+      "https://chatgpt.com/c/unused-conversation",
+      "unused-grant",
+      "operator-secret",
+    );
+    expect(store.getCaptureGrant(grant.grantId)).toMatchObject({ state: "issued" });
+    expect(store.releaseDrain(drain.drainId)).toEqual({
+      schemaVersion: 1,
+      drainId: drain.drainId,
+      state: "open",
+    });
+    expect(store.getCaptureGrant(grant.grantId)).toMatchObject({
+      state: "revoked",
+      terminal: {
+        state: "canceled",
+        verified: false,
+        submissionAttempted: false,
+        promptSubmitted: false,
+        failureCode: "maintenance_drain_released",
+      },
+    });
+    expect(store.authorizeCaptureGrant(grant.token)).toMatchObject({ active: false });
+    store.close();
   });
 
   it("uses exactly the last 20 verified pro samples and excludes other terminals", async () => {

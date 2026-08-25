@@ -6,7 +6,7 @@ import path from "node:path";
 import net from "node:net";
 import { randomBytes } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, writeFile, stat } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile, stat } from "node:fs/promises";
 import chalk from "chalk";
 import type { BrowserLogger, CookieParam } from "../browser/types.js";
 import { runBrowserMode } from "../browserMode.js";
@@ -22,8 +22,13 @@ import {
 } from "./types.js";
 import {
   DurableQueueStore,
+  CAPTURE_GRANT_CAPABILITY_ID,
+  CAPTURE_GRANT_CAPABILITY_VERSION,
   DURABLE_QUEUE_CAPABILITY_ID,
   DURABLE_QUEUE_CAPABILITY_VERSION,
+  MAINTENANCE_DRAIN_CAPABILITY_ID,
+  MAINTENANCE_DRAIN_CAPABILITY_VERSION,
+  type CaptureGrantAuthorization,
   type DurableErrorMetadata,
   type DurableRunSnapshot as StoredDurableRunSnapshot,
 } from "./durableQueue.js";
@@ -31,6 +36,7 @@ import {
   persistBrowserRunArtifacts,
   resolveDurableArtifact,
   sanitizeDurableBrowserResult,
+  verifyProviderNativeCaptureArtifacts,
 } from "./durableArtifacts.js";
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
@@ -51,6 +57,7 @@ import {
   writeDevToolsActivePort,
 } from "../browser/profileState.js";
 import { normalizeChatgptUrl } from "../browser/utils.js";
+import { extractStableConversationIdFromUrl } from "../browser/conversationUrl.js";
 import { sanitizeArtifactFilename, sanitizeArtifactMimeType } from "../browser/artifacts.js";
 
 export interface RemoteServerOptions {
@@ -98,6 +105,16 @@ interface RemoteServerInstance {
 
 const ARTIFACT_PROTOCOL_VERSION = 1;
 
+class MaintenanceCaptureViolationError extends Error {
+  constructor(
+    readonly code: string,
+    readonly terminalState: "failed" | "unknown" = "failed",
+  ) {
+    super(code);
+    this.name = "MaintenanceCaptureViolationError";
+  }
+}
+
 function artifactCapabilities(
   allowCaptureOnly: boolean,
   queue: { capacity: number; backlog: number },
@@ -112,6 +129,14 @@ function artifactCapabilities(
       id: DURABLE_QUEUE_CAPABILITY_ID,
       version: DURABLE_QUEUE_CAPABILITY_VERSION,
       limits: { maxQueued: queue.backlog, maxConcurrentRuns: queue.capacity },
+    },
+    {
+      id: MAINTENANCE_DRAIN_CAPABILITY_ID,
+      version: MAINTENANCE_DRAIN_CAPABILITY_VERSION,
+    },
+    {
+      id: CAPTURE_GRANT_CAPABILITY_ID,
+      version: CAPTURE_GRANT_CAPABILITY_VERSION,
     },
   ];
   if (allowCaptureOnly) features.splice(1, 0, { id: CAPTURE_ONLY_FEATURE_ID, version: 1 });
@@ -141,7 +166,10 @@ export async function createRemoteServer(
   options: RemoteServerOptions = {},
   deps: RemoteServerDeps = {},
 ): Promise<RemoteServerInstance> {
-  const runtime = getOracleRuntimeIdentity();
+  const runtime = {
+    ...getOracleRuntimeIdentity(),
+    ...(await authenticatedServiceIdentity()),
+  };
   const runBrowser = deps.runBrowser ?? runBrowserMode;
   const server = http.createServer();
   const logger = options.logger ?? console.log;
@@ -207,6 +235,7 @@ export async function createRemoteServer(
       const worker = (async () => {
         const started = Date.now();
         const id = next.id;
+        const captureGrant = durableQueue.captureGrantForRun(id);
         try {
           const payload = await durableQueue.request(id);
           if (!payload) throw new Error("durable request missing");
@@ -269,9 +298,11 @@ export async function createRemoteServer(
                 }
               : {}),
           };
-          const sessionId = payload.options?.sessionId
-            ? `${String(payload.options.sessionId)}-${id.slice(0, 8)}`
-            : id;
+          const sessionId = captureGrant
+            ? `maintenance-capture-${captureGrant.grantId}`
+            : payload.options?.sessionId
+              ? `${String(payload.options.sessionId)}-${id.slice(0, 8)}`
+              : id;
           const automationLogger: BrowserLogger = ((message?: string) => {
             if (typeof message === "string") {
               logger(`[run ${id}] ${message}`);
@@ -299,6 +330,33 @@ export async function createRemoteServer(
             runtimeHintCb: async (hint, modelSelection) => {
               const raw = hint as unknown as Record<string, unknown>;
               const publicHint = sanitizeRemoteRuntimeHint(raw, modelSelection);
+              if (captureGrant) {
+                durableQueue.recordCaptureEvidence(id, {
+                  submissionAttempted: raw.submissionAttempted === true,
+                  promptSubmitted: raw.promptSubmitted === true,
+                });
+                if (raw.submissionAttempted === true || raw.promptSubmitted === true) {
+                  const code =
+                    raw.promptSubmitted === true
+                      ? "maintenance_capture_prompt_submitted"
+                      : "maintenance_capture_submission_attempted";
+                  durableQueue.recordCaptureViolation(id, code);
+                  throw new MaintenanceCaptureViolationError(code, "unknown");
+                }
+                const observedConversationId = observedConversationIdFromEvidence(raw);
+                if (
+                  observedConversationId &&
+                  observedConversationId !== captureGrant.conversationId
+                ) {
+                  const code = "maintenance_capture_wrong_conversation";
+                  durableQueue.recordCaptureViolation(id, code);
+                  throw new MaintenanceCaptureViolationError(code);
+                }
+                transitionIfActive(id, "running", "browser_attached", {
+                  runtimeHint: publicHint,
+                });
+                return;
+              }
               if (raw.submissionAttempted === true || raw.promptSubmitted === true) {
                 // This write is the durable side of an irreversible send fence.
                 // If cancel/shutdown won first, throw so the browser must not
@@ -315,6 +373,34 @@ export async function createRemoteServer(
               }
             },
           });
+          if (captureGrant) {
+            const rawResult = result as unknown as Record<string, unknown>;
+            if (rawResult.submissionAttempted === true || result.promptSubmitted === true) {
+              durableQueue.recordCaptureEvidence(id, {
+                submissionAttempted: rawResult.submissionAttempted === true,
+                promptSubmitted: result.promptSubmitted === true,
+              });
+              const code =
+                result.promptSubmitted === true
+                  ? "maintenance_capture_prompt_submitted"
+                  : "maintenance_capture_submission_attempted";
+              durableQueue.recordCaptureViolation(id, code);
+              throw new MaintenanceCaptureViolationError(code, "unknown");
+            }
+            if (result.promptSubmitted !== false) {
+              const code = "maintenance_capture_submission_evidence_missing";
+              durableQueue.recordCaptureViolation(id, code);
+              throw new MaintenanceCaptureViolationError(code);
+            }
+            const observedConversationId = observedConversationIdFromEvidence(rawResult);
+            if (observedConversationId !== captureGrant.conversationId) {
+              const code = observedConversationId
+                ? "maintenance_capture_wrong_conversation"
+                : "maintenance_capture_conversation_unverified";
+              durableQueue.recordCaptureViolation(id, code);
+              throw new MaintenanceCaptureViolationError(code);
+            }
+          }
           let durable: Awaited<ReturnType<typeof persistBrowserRunArtifacts>> | undefined;
           try {
             durable = await persistBrowserRunArtifacts({
@@ -323,6 +409,11 @@ export async function createRemoteServer(
               result,
             });
           } catch (artifactError) {
+            if (captureGrant) {
+              const code = "maintenance_capture_artifact_persistence_failed";
+              durableQueue.recordCaptureViolation(id, code);
+              throw new MaintenanceCaptureViolationError(code);
+            }
             logger(
               `[run ${id}] artifact persistence failed: ${
                 artifactError instanceof Error ? artifactError.message : String(artifactError)
@@ -350,7 +441,6 @@ export async function createRemoteServer(
             payload.browserConfig.captureOnly === true
               ? {
                   ...durable.result,
-                  promptSubmitted: false,
                   modelSelection: undefined,
                   thinkingSelection: undefined,
                 }
@@ -361,11 +451,52 @@ export async function createRemoteServer(
             result,
             payload.browserConfig.captureOnly === true,
           );
+          let captureAudit:
+            | {
+                artifactManifestSha256: string;
+                artifactCount: number;
+                submissionAttempted: false;
+                promptSubmitted: false;
+              }
+            | undefined;
+          if (captureGrant) {
+            let artifactManifestSha256: string;
+            try {
+              artifactManifestSha256 = await verifyProviderNativeCaptureArtifacts({
+                queueRoot: durableQueue.root,
+                runId: id,
+                descriptors: durable.descriptors,
+                conversationId: captureGrant.conversationId,
+                conversationUrl: captureGrant.conversationUrl,
+              });
+            } catch {
+              const code = "maintenance_capture_evidence_incomplete";
+              durableQueue.recordCaptureViolation(id, code);
+              throw new MaintenanceCaptureViolationError(code);
+            }
+            captureAudit = {
+              artifactManifestSha256,
+              artifactCount: durable.descriptors.length,
+              submissionAttempted: false,
+              promptSubmitted: false,
+            };
+            durableQueue.appendEvent(id, {
+              type: "maintenance-capture-verified",
+              grantId: captureGrant.grantId,
+              drainId: captureGrant.drainId,
+              conversationId: captureGrant.conversationId,
+              submissionAttempted: false,
+              promptSubmitted: false,
+              artifactCount: durable.descriptors.length,
+              artifactManifestSha256,
+            });
+          }
           transitionIfActive(id, "completed", "terminal", {
             result: { ...durableResult, artifacts: durable.descriptors },
             elapsedMs: Date.now() - started,
             model: qualifying ? "pro" : model,
             etaQualifying: qualifying,
+            captureAudit,
           });
         } catch (error) {
           const phase = durableQueue.get(id)?.phase;
@@ -388,11 +519,20 @@ export async function createRemoteServer(
                       : "failed",
                 },
               }
-            : formatDurableFailure(error);
+            : error instanceof MaintenanceCaptureViolationError
+              ? {
+                  message: "Maintenance capture verification failed.",
+                  metadata: { code: error.code, type: "maintenance_capture_violation" },
+                }
+              : formatDurableFailure(error);
           const terminalState =
-            phase === "prompt_submitted" || phase === "awaiting_response" || phase === "capturing"
-              ? "unknown"
-              : "failed";
+            error instanceof MaintenanceCaptureViolationError
+              ? error.terminalState
+              : phase === "prompt_submitted" ||
+                  phase === "awaiting_response" ||
+                  phase === "capturing"
+                ? "unknown"
+                : "failed";
           transitionIfActive(id, terminalState, "terminal", {
             error: failure.message,
             errorMetadata: failure.metadata,
@@ -429,16 +569,106 @@ export async function createRemoteServer(
       res.end(JSON.stringify({ ok: true }));
       return;
     }
+    const bearerToken = extractBearerToken(req.headers.authorization);
+    const operatorAuthorized = bearerToken === authToken;
+    const captureAuthorization = operatorAuthorized
+      ? undefined
+      : durableQueue.authorizeCaptureGrant(bearerToken ?? "");
+    const maintenancePath = req.url?.split("?")[0] ?? "";
+    if (maintenancePath.startsWith("/v1/maintenance/")) {
+      if (!operatorAuthorized) {
+        denyAuthorization(res, captureAuthorization !== undefined);
+        return;
+      }
+      try {
+        if (req.method === "POST" && maintenancePath === "/v1/maintenance/drains") {
+          const body = await readJsonObject(req, 16 * 1024);
+          if (!hasExactKeys(body, ["mode"]) || body.mode !== "require-idle")
+            throw new Error("invalid_maintenance_request");
+          const key = req.headers["idempotency-key"];
+          if (typeof key !== "string" || !key.trim())
+            throw new Error("stable Idempotency-Key is required");
+          const wasOpen = durableQueue.admission().state === "open";
+          const drain = durableQueue.beginDrainIfIdle(key, "require-idle");
+          res.writeHead(wasOpen ? 201 : 200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(drain));
+          return;
+        }
+        const drainMatch =
+          /^\/v1\/maintenance\/drains\/([^/]+)(?:\/(capture-grants|release))?$/.exec(
+            maintenancePath,
+          );
+        if (drainMatch) {
+          const drainId = decodeURIComponent(drainMatch[1] ?? "");
+          const action = drainMatch[2];
+          if (req.method === "GET" && !action) {
+            const drain = durableQueue.getDrain(drainId);
+            if (!drain) throw new Error("maintenance_drain_not_found");
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(drain));
+            return;
+          }
+          if (req.method === "POST" && action === "capture-grants") {
+            const body = await readJsonObject(req, 64 * 1024);
+            if (
+              !hasExactKeys(body, ["conversationUrl"]) ||
+              typeof body.conversationUrl !== "string"
+            )
+              throw new Error("invalid_maintenance_request");
+            const key = req.headers["idempotency-key"];
+            if (typeof key !== "string" || !key.trim())
+              throw new Error("stable Idempotency-Key is required");
+            const conversation = normalizeAcceptedConversation(body.conversationUrl);
+            const grant = durableQueue.issueCaptureGrant(
+              drainId,
+              conversation.conversationId,
+              conversation.conversationUrl,
+              key,
+              authToken,
+            );
+            const { replayed, ...publicGrant } = grant;
+            res.writeHead(replayed ? 200 : 201, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(publicGrant));
+            return;
+          }
+          if (req.method === "POST" && action === "release") {
+            const body = await readJsonObject(req, 16 * 1024);
+            if (!hasExactKeys(body, [])) throw new Error("invalid_maintenance_request");
+            const released = durableQueue.releaseDrain(drainId);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(released));
+            return;
+          }
+        }
+        const captureGrantMatch = /^\/v1\/maintenance\/capture-grants\/([^/]+)$/.exec(
+          maintenancePath,
+        );
+        if (req.method === "GET" && captureGrantMatch) {
+          const receipt = durableQueue.getCaptureGrant(
+            decodeURIComponent(captureGrantMatch[1] ?? ""),
+          );
+          if (!receipt) throw new Error("capture_grant_not_found");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(receipt));
+          return;
+        }
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "not_found" }));
+      } catch (error) {
+        const failure = publicMaintenanceFailure(error);
+        res.writeHead(failure.statusCode, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: failure.code }));
+      }
+      return;
+    }
     if (req.method === "GET" && req.url === "/health") {
-      const authHeader = req.headers.authorization ?? "";
-      if (authHeader !== `Bearer ${authToken}`) {
+      if (!operatorAuthorized && captureAuthorization?.active !== true) {
         if (verbose) {
           logger(
             `[serve] Unauthorized /health attempt from ${formatSocket(req)} (missing/invalid token)`,
           );
         }
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "unauthorized" }));
+        denyAuthorization(res, captureAuthorization !== undefined);
         return;
       }
       const queueStatus = durableQueue.status();
@@ -455,7 +685,9 @@ export async function createRemoteServer(
           queuedRuns: queueStatus.queued,
           maxConcurrentRuns: queueStatus.capacity,
           runtime,
+          process: { pid: process.pid },
           queue: queueStatus,
+          admission: durableQueue.admission(),
         }),
       );
       return;
@@ -464,9 +696,8 @@ export async function createRemoteServer(
       ? /^\/v1\/runs\/([^/]+)(?:\/(events|cancel))?$/.exec(req.url.split("?")[0] ?? "")
       : null;
     if (req.url === "/v1/runs" || v1Match) {
-      if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "unauthorized" }));
+      if (!operatorAuthorized && captureAuthorization?.active !== true) {
+        denyAuthorization(res, captureAuthorization !== undefined);
         return;
       }
       if (req.method === "POST" && req.url === "/v1/runs") {
@@ -477,13 +708,24 @@ export async function createRemoteServer(
           return;
         }
         try {
-          const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload;
-          validateRemotePayload(payload);
-          if (payload.browserConfig.captureOnly === true && options.allowCaptureOnly !== true) {
-            throw new Error("capture_only_disabled");
+          let snapshot: StoredDurableRunSnapshot;
+          if (captureAuthorization) {
+            await readRequestBody(req, 1024 * 1024);
+            const payload = fixedMaintenanceCapturePayload(captureAuthorization);
+            snapshot = await durableQueue.submitGrantedCapture(
+              bearerToken ?? "",
+              key,
+              payload as any,
+            );
+          } else {
+            const payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload;
+            validateRemotePayload(payload);
+            if (payload.browserConfig.captureOnly === true && options.allowCaptureOnly !== true) {
+              throw new Error("capture_only_disabled");
+            }
+            normalizeRemotePayload(payload);
+            snapshot = await durableQueue.submit(key, payload as any);
           }
-          normalizeRemotePayload(payload);
-          const snapshot = await durableQueue.submit(key, payload as any);
           res.writeHead(202, { "Content-Type": "application/json" });
           res.end(JSON.stringify(publicDurableSnapshot(snapshot)));
           void pumpDurableQueue();
@@ -501,6 +743,11 @@ export async function createRemoteServer(
       }
       const id = decodeURIComponent(v1Match[1] ?? "");
       const action = v1Match[2];
+      if (captureAuthorization && captureAuthorization.runId !== id) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "forbidden" }));
+        return;
+      }
       if (req.method === "GET" && action === "events") {
         const url = new URL(req.url ?? "", "http://oracle.local");
         const after = Number(url.searchParams.get("after") ?? -1);
@@ -542,9 +789,8 @@ export async function createRemoteServer(
       return;
     }
     if (req.method === "GET" && req.url === "/v1/queue/status") {
-      if ((req.headers.authorization ?? "") !== `Bearer ${authToken}`) {
-        res.writeHead(401);
-        res.end(JSON.stringify({ error: "unauthorized" }));
+      if (!operatorAuthorized) {
+        denyAuthorization(res, captureAuthorization !== undefined);
         return;
       }
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -553,10 +799,19 @@ export async function createRemoteServer(
     }
     const artifactMatch = matchArtifactRequest(req);
     if (artifactMatch) {
+      if (!operatorAuthorized && captureAuthorization?.active !== true) {
+        denyAuthorization(res, captureAuthorization !== undefined);
+        return;
+      }
+      if (captureAuthorization && captureAuthorization.runId !== artifactMatch.runId) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "forbidden" }));
+        return;
+      }
       await serveRemoteArtifact({
         req,
         res,
-        authToken,
+        authorized: true,
         logger,
         verbose,
         runId: artifactMatch.runId,
@@ -743,15 +998,14 @@ function matchArtifactRequest(
 async function serveRemoteArtifact(params: {
   req: http.IncomingMessage;
   res: http.ServerResponse;
-  authToken: string;
+  authorized: boolean;
   logger: (message: string) => void;
   verbose: boolean;
   runId: string;
   artifactId: string;
   queueRoot?: string;
 }): Promise<void> {
-  const authHeader = params.req.headers.authorization ?? "";
-  if (authHeader !== `Bearer ${params.authToken}`) {
+  if (!params.authorized) {
     if (params.verbose) {
       params.logger(
         `[serve] Unauthorized artifact transfer attempt from ${formatSocket(params.req)} (missing/invalid token)`,
@@ -786,6 +1040,105 @@ async function serveRemoteArtifact(params: {
       return;
     }
   }
+}
+
+function extractBearerToken(header: string | undefined): string | undefined {
+  if (!header?.startsWith("Bearer ")) return;
+  const token = header.slice("Bearer ".length);
+  return token && !/\s/.test(token) ? token : undefined;
+}
+
+async function authenticatedServiceIdentity(): Promise<{
+  nodeBin: string;
+  oracleCli?: string;
+  sourceCommit?: string;
+}> {
+  const nodeBin = await realpath(process.execPath).catch(() => process.execPath);
+  const argvEntrypoint = process.argv[1];
+  if (!argvEntrypoint) return { nodeBin };
+  const oracleCli = await realpath(argvEntrypoint).catch(() => undefined);
+  if (!oracleCli) return { nodeBin };
+  const installRoot = path.resolve(path.dirname(oracleCli), "../..");
+  let sourceCommit: string | undefined;
+  try {
+    const receipt = JSON.parse(
+      await readFile(path.join(installRoot, "install.json"), "utf8"),
+    ) as Record<string, unknown>;
+    if (typeof receipt.sourceCommit === "string" && /^[a-f0-9]{40}$/.test(receipt.sourceCommit)) {
+      sourceCommit = receipt.sourceCommit;
+    }
+  } catch {
+    // Development and test invocations need not originate in an immutable install.
+  }
+  return { nodeBin, oracleCli, ...(sourceCommit ? { sourceCommit } : {}) };
+}
+
+function denyAuthorization(res: http.ServerResponse, recognizedScopedToken: boolean): void {
+  res.writeHead(recognizedScopedToken ? 403 : 401, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: recognizedScopedToken ? "forbidden" : "unauthorized" }));
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+async function readJsonObject(
+  req: http.IncomingMessage,
+  maxBytes: number,
+): Promise<Record<string, unknown>> {
+  const parsed = JSON.parse(await readRequestBody(req, maxBytes)) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    throw new Error("invalid_maintenance_request");
+  return parsed as Record<string, unknown>;
+}
+
+function normalizeAcceptedConversation(raw: string): {
+  conversationId: string;
+  conversationUrl: string;
+} {
+  if (!raw.trim()) throw new Error("invalid_maintenance_request");
+  const conversationUrl = normalizeChatgptUrl(raw, CHATGPT_URL);
+  const parsed = new URL(conversationUrl);
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    (parsed.hostname !== "chatgpt.com" && parsed.hostname !== "chat.openai.com")
+  )
+    throw new Error("invalid_maintenance_request");
+  const conversationId = extractStableConversationIdFromUrl(conversationUrl);
+  if (!conversationId) throw new Error("invalid_maintenance_request");
+  return { conversationId, conversationUrl };
+}
+
+function fixedMaintenanceCapturePayload(grant: CaptureGrantAuthorization): RemoteRunPayload {
+  return {
+    prompt: "",
+    attachments: [],
+    browserConfig: {
+      chatgptUrl: grant.conversationUrl,
+      url: grant.conversationUrl,
+      resumeConversationUrl: grant.conversationUrl,
+      captureOnly: true,
+      captureProviderNative: true,
+    },
+    options: { sessionId: `maintenance-capture-${grant.grantId}` },
+  };
+}
+
+function observedConversationIdFromEvidence(evidence: Record<string, unknown>): string | undefined {
+  if (typeof evidence.conversationId === "string" && evidence.conversationId.trim())
+    return evidence.conversationId.trim();
+  for (const field of ["tabUrl", "conversationUrl"] as const) {
+    const value = evidence[field];
+    if (typeof value === "string") {
+      const id = extractStableConversationIdFromUrl(value);
+      if (id) return id;
+    }
+  }
+  return;
 }
 
 async function readRequestBody(
@@ -983,8 +1336,14 @@ function remoteFailureIdentifier(value: unknown): string | undefined {
 function publicAdmissionFailure(error: unknown): { statusCode: number; code: string } {
   const message = error instanceof Error ? error.message : String(error);
   if (message === "queue_full") return { statusCode: 503, code: "queue_full" };
+  if (message === "admission_draining") return { statusCode: 503, code: "admission_draining" };
   if (message.includes("idempotency key conflicts"))
     return { statusCode: 409, code: "idempotency_conflict" };
+  if (message === "capture_grant_consumed")
+    return { statusCode: 409, code: "capture_grant_consumed" };
+  if (message === "capture_grant_not_active")
+    return { statusCode: 409, code: "capture_grant_not_active" };
+  if (message === "capture_grant_invalid") return { statusCode: 401, code: "unauthorized" };
   if (message === "capture_only_disabled")
     return { statusCode: 400, code: "capture_only_disabled" };
   if (
@@ -995,6 +1354,29 @@ function publicAdmissionFailure(error: unknown): { statusCode: number; code: str
   )
     return { statusCode: 400, code: "invalid_request" };
   return { statusCode: 500, code: "admission_failed" };
+}
+
+function publicMaintenanceFailure(error: unknown): { statusCode: number; code: string } {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message === "bridge_busy") return { statusCode: 409, code: "bridge_busy" };
+  if (message === "maintenance_drain_active")
+    return { statusCode: 409, code: "maintenance_drain_active" };
+  if (message === "maintenance_drain_not_found")
+    return { statusCode: 404, code: "maintenance_drain_not_found" };
+  if (message === "capture_grant_not_found")
+    return { statusCode: 404, code: "capture_grant_not_found" };
+  if (message === "capture_grants_pending")
+    return { statusCode: 409, code: "capture_grants_pending" };
+  if (message === "capture_grant_issue_conflict")
+    return { statusCode: 409, code: "idempotency_conflict" };
+  if (
+    error instanceof SyntaxError ||
+    message === "invalid_maintenance_request" ||
+    message === "request body too large" ||
+    message === "stable Idempotency-Key is required"
+  )
+    return { statusCode: 400, code: "invalid_maintenance_request" };
+  return { statusCode: 500, code: "maintenance_failed" };
 }
 
 function publicFailureMetadata(

@@ -461,6 +461,7 @@ describe("collectGeneratedImageArtifacts", () => {
   });
 
   test("retries behavior button downloads after waiting for delayed image generation", async () => {
+    const realHrtime = process.hrtime.bigint;
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-06-12T00:00:00Z"));
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "oracle-chatgpt-image-delayed-"));
@@ -469,13 +470,16 @@ describe("collectGeneratedImageArtifacts", () => {
     const png = Buffer.from([
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x00,
     ]);
-    const buttonAvailableAt = Date.now() + 10_000;
+    const startedAt = Date.now();
+    const buttonAvailableAt = startedAt + 20_000;
+    let buttonClickedAt: number | undefined;
     const runtime = {
       evaluate: vi.fn(async ({ expression }: { expression: string }) => {
         if (expression.includes("behavior-btn")) {
           if (Date.now() < buttonAvailableAt) {
             return { result: { value: [] } };
           }
+          buttonClickedAt = Date.now();
           await fs.writeFile(downloadedPath, png);
           return {
             result: {
@@ -507,15 +511,25 @@ describe("collectGeneratedImageArtifacts", () => {
         waitTimeoutMs: 15_000,
       });
       let settled = false;
-      void resultPromise.finally(() => {
-        settled = true;
-      });
-      for (let index = 0; index < 20 && !settled; index += 1) {
-        await vi.advanceTimersByTimeAsync(1500);
+      void resultPromise.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      const pumpDeadline = realHrtime() + 5_000_000_000n;
+      while (!settled && realHrtime() < pumpDeadline) {
+        if (vi.getTimerCount() > 0) {
+          await vi.advanceTimersToNextTimerAsync();
+        }
         await fs.readdir(tmpDir);
       }
+      expect(settled).toBe(true);
       const result = await resultPromise;
 
+      expect(buttonClickedAt).toBeGreaterThanOrEqual(startedAt + 30_000);
       expect(result.imageCount).toBe(1);
       expect(result.savedImages[0]).toMatchObject({
         path: outputPath,
