@@ -117,6 +117,7 @@ export class DurableQueueStore {
     const dbPath = path.join(root, "queue.sqlite");
     await safeDescendant(root, dbPath, "database");
     await safeDescendant(root, `${dbPath}-wal`, "WAL");
+    await safeDescendant(root, `${dbPath}-shm`, "SHM");
     const db = new DatabaseSync(dbPath);
     await chmod(dbPath, 0o600);
     for (const suffix of ["-wal", "-shm"]) {
@@ -126,7 +127,12 @@ export class DurableQueueStore {
         await chmod(p, 0o600);
       }
     }
-    return new DurableQueueStore(db, root, o);
+    const store = new DurableQueueStore(db, root, o);
+    for (const suffix of ["-wal", "-shm"]) {
+      const p = `${dbPath}${suffix}`;
+      if (await lstat(p).catch(() => undefined)) await chmod(p, 0o600);
+    }
+    return store;
   }
   close(): void {
     if (this.db.isOpen) this.db.close();
@@ -304,12 +310,23 @@ export class DurableQueueStore {
     }
   }
   cancel(id: string): DurableRunSnapshot | undefined {
-    const r = this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Row | undefined;
-    if (!r) return;
-    const t = this.now();
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      const out = r.state === "queued" ? "canceled" : "requested";
+      const r = this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Row | undefined;
+      if (!r) {
+        this.db.exec("ROLLBACK");
+        return;
+      }
+      if (terminal.has(r.state as DurableRunState)) {
+        this.db.exec("COMMIT");
+        return this.get(id);
+      }
+      const t = this.now();
+      const preSubmit =
+        r.state === "queued" ||
+        (r.state === "running" &&
+          ["accepted", "dispatching", "browser_attached"].includes(String(r.phase)));
+      const out = preSubmit ? "canceled" : "unknown";
       (
         this.db.prepare(
           "UPDATE runs SET cancellation=?,updated_at=?,state=?,phase=? WHERE id=?",
@@ -317,8 +334,8 @@ export class DurableQueueStore {
       ).run(
         JSON.stringify({ requestedAt: new Date(t).toISOString(), outcome: out }),
         t,
-        r.state === "queued" ? "canceled" : String(r.state),
-        r.state === "queued" ? "terminal" : String(r.phase),
+        out,
+        "terminal",
         id,
       );
       this.append(id, t, { type: "cancellation", outcome: out });
@@ -343,19 +360,23 @@ export class DurableQueueStore {
       etaQualifying?: boolean;
     } = {},
   ): void {
-    const o = this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Row | undefined;
-    if (!o) throw new Error("unknown run");
-    if (terminal.has(o.state as DurableRunState) && o.state === state) return;
-    if (terminal.has(o.state as DurableRunState)) throw new Error("terminal run cannot transition");
-    const t = this.now(),
-      hint =
-        p.runtimeHint === undefined
-          ? o.runtime_hint
-            ? JSON.parse(String(o.runtime_hint))
-            : null
-          : { ...(o.runtime_hint ? JSON.parse(String(o.runtime_hint)) : {}), ...p.runtimeHint };
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const o = this.db.prepare("SELECT * FROM runs WHERE id=?").get(id) as Row | undefined;
+      if (!o) throw new Error("unknown run");
+      if (terminal.has(o.state as DurableRunState) && o.state === state) {
+        this.db.exec("COMMIT");
+        return;
+      }
+      if (terminal.has(o.state as DurableRunState))
+        throw new Error("terminal run cannot transition");
+      const t = this.now(),
+        hint =
+          p.runtimeHint === undefined
+            ? o.runtime_hint
+              ? JSON.parse(String(o.runtime_hint))
+              : null
+            : { ...(o.runtime_hint ? JSON.parse(String(o.runtime_hint)) : {}), ...p.runtimeHint };
       (
         this.db.prepare(
           "UPDATE runs SET state=?,phase=?,updated_at=?,result=?,error=?,error_meta=?,runtime_hint=?,elapsed_ms=?,model=?,eta_qualifying=? WHERE id=?",
@@ -377,8 +398,8 @@ export class DurableQueueStore {
       if (
         terminal.has(state) &&
         p.elapsedMs !== undefined &&
-        state !== "canceled" &&
-        state !== "unknown" &&
+        state === "completed" &&
+        /pro/i.test(p.model ?? String(o.model ?? "")) &&
         p.etaQualifying === true
       )
         this.db.prepare("INSERT INTO eta_samples VALUES(?,?,?,1)").run(p.elapsedMs, t, "pro");
