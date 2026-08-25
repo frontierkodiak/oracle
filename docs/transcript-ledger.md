@@ -11,6 +11,11 @@ The default root is `$ORACLE_HOME_DIR/transcript-ledger` (normally
 SQLite index, and object files are owner-only. Symlinked ledger descendants are
 rejected. The index uses SQLite WAL mode. Raw provider JSON and evidence JSON
 are immutable, content-addressed objects; the raw bytes are authoritative.
+Ingest validates the provider mapping graph, selected current-node chain, and
+evidence-to-turn digest correspondence before publication. Bounded JSON depth,
+node count, turn count, body size, and artifact size prevent untrusted captures
+from exhausting the process. Startup removes unreferenced crash orphans and
+fails closed if an indexed object is missing or altered.
 
 ## Commands
 
@@ -28,7 +33,9 @@ capture-only path with an empty prompt, provider-native capture enabled, and the
 canonical conversation URL. It never types or submits a prompt. A failed,
 challenged, or unavailable-auth attempt is an observation, not deletion. The
 `schedule` command records an interval for an external scheduler; Oracle does
-not start an internal daemon.
+not start an internal daemon. `sync <thread>` must name one watched thread;
+`sync --all` is the explicit opt-in for all enabled watches. A bare `sync` is
+rejected. Intervals must be finite and strictly positive.
 
 Each conversation identity is `(provider, opaque provider-profile id,
 provider conversation id)`. Every successful observation retains both raw and

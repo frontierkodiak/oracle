@@ -153,6 +153,7 @@ export async function performSessionRun({
       try {
         const ledgerResult = await ingestProviderNativeArtifacts({
           artifacts: result.artifacts,
+          requirePair: browserConfig.captureProviderNative === true,
           profileId: deriveChatgptProfileId(browserConfig),
           conversationId: result.runtime.conversationId,
           canonicalUrl: result.runtime.tabUrl,

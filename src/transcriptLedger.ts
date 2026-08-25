@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
-import { chmod, mkdir, open, readFile, rename, rm, lstat } from "node:fs/promises";
+import { chmod, mkdir, open, rename, rm, lstat, readdir } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { getOracleHomeDir } from "./oracleHome.js";
@@ -9,6 +9,13 @@ import { extractStableConversationIdFromUrl } from "./browser/conversationUrl.js
 export const TRANSCRIPT_LEDGER_SCHEMA = "oracle.transcript-ledger/v1";
 export const TRANSCRIPT_LEDGER_NORMALIZATION = "oracle.transcript-ledger-normalized-turns/v1";
 export const DEFAULT_LEDGER_DIR_NAME = "transcript-ledger";
+const MAX_RAW_BYTES = 64 * 1024 * 1024;
+const MAX_EVIDENCE_BYTES = 16 * 1024 * 1024;
+const MAX_JSON_DEPTH = 128;
+const MAX_JSON_NODES = 250_000;
+const MAX_GRAPH_NODES = 100_000;
+const MAX_TURNS = 25_000;
+const MAX_TURN_BODY_BYTES = 16 * 1024 * 1024;
 
 export type LedgerObservationStatus = "captured" | "failed" | "challenged" | "auth-unavailable";
 
@@ -50,7 +57,7 @@ export interface LedgerIngestResult {
 }
 
 export interface LedgerWarning {
-  code: "transcript-ledger-ingest-failed";
+  code: "transcript-ledger-ingest-failed" | "transcript-ledger-artifact-pair-incomplete";
   severity: "warning";
   message: string;
 }
@@ -70,8 +77,18 @@ export interface LedgerListRow {
 type RawNode = {
   id?: unknown;
   parent?: unknown;
+  children?: unknown;
   message?: Record<string, unknown> | null;
 };
+
+export class LedgerArtifactPairError extends Error {
+  readonly code = "transcript-ledger-artifact-pair-incomplete" as const;
+
+  constructor() {
+    super("provider-native raw/evidence artifact pair is incomplete");
+    this.name = "LedgerArtifactPairError";
+  }
+}
 
 type NormalizedTurn = {
   ordinal: number;
@@ -115,6 +132,23 @@ function safeId(value: string, label: string): string {
   return trimmed;
 }
 
+function assertJsonBounds(value: unknown, label: string): void {
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+  let count = 0;
+  while (stack.length > 0) {
+    const entry = stack.pop();
+    if (!entry) continue;
+    count += 1;
+    if (count > MAX_JSON_NODES) throw new Error(`${label} exceeds object-count bounds`);
+    if (entry.depth > MAX_JSON_DEPTH) throw new Error(`${label} exceeds depth bounds`);
+    if (!entry.value || typeof entry.value !== "object") continue;
+    const values = Array.isArray(entry.value)
+      ? entry.value
+      : Object.values(entry.value as Record<string, unknown>);
+    for (const child of values) stack.push({ value: child, depth: entry.depth + 1 });
+  }
+}
+
 export function resolveTranscriptLedgerRoot(root?: string): string {
   return path.resolve(
     root ??
@@ -153,11 +187,21 @@ async function ensurePrivateDirectory(target: string): Promise<void> {
     await mkdir(dir, { mode: 0o700 });
     await chmod(dir, 0o700);
     checkMode((await lstat(dir)).mode, 0o700, dir);
+    await syncDirectory(path.dirname(dir));
   }
   // Only ledger-owned directories are normalized; never chmod an ancestor such as /Users.
   if (missing.length === 0 || missing[missing.length - 1] === absolute) {
     await chmod(absolute, 0o700);
     checkMode((await lstat(absolute)).mode, 0o700, absolute);
+  }
+}
+
+async function syncDirectory(target: string): Promise<void> {
+  const handle = await open(target, fsConstants.O_RDONLY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }
 
@@ -179,6 +223,7 @@ async function ensureRoot(root: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     const handle = await open(index, "wx", 0o600);
     await handle.close();
+    await syncDirectory(root);
   }
 }
 
@@ -196,7 +241,13 @@ async function writeObject(
   await ensurePrivateDirectory(parent);
   try {
     await ensurePrivateFile(target);
-    const existing = await readFile(target);
+    const existingHandle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    let existing: Buffer;
+    try {
+      existing = await existingHandle.readFile();
+    } finally {
+      await existingHandle.close();
+    }
     if (hashBytes(existing) !== digest)
       throw new Error(`content-addressed object mismatch: ${target}`);
     return { path: target, created: false };
@@ -215,6 +266,7 @@ async function writeObject(
     await handle.close();
     await chmod(temp, 0o600);
     await rename(temp, target);
+    await syncDirectory(parent);
     return { path: target, created: true };
   } catch (error) {
     await handle.close().catch(() => undefined);
@@ -224,11 +276,74 @@ async function writeObject(
 }
 
 async function readArtifactBytes(target: string): Promise<Buffer> {
-  const entry = await lstat(target);
-  if (entry.isSymbolicLink() || !entry.isFile()) {
-    throw new Error(`capture artifact must be a regular non-symlink file: ${target}`);
+  const handle = await open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  try {
+    const entry = await handle.stat();
+    if (!entry.isFile()) throw new Error(`capture artifact must be a regular file: ${target}`);
+    return await handle.readFile();
+  } finally {
+    await handle.close();
   }
-  return readFile(target);
+}
+
+async function recoverObjectStore(root: string, db: DatabaseSync): Promise<void> {
+  const objectRoot = path.join(root, "objects", "sha256");
+  const prefixes = await readdir(objectRoot, { withFileTypes: true });
+  for (const prefix of prefixes) {
+    const prefixPath = path.join(objectRoot, prefix.name);
+    if (prefix.isSymbolicLink() || !prefix.isDirectory()) {
+      throw new Error(`ledger object store contains an unsafe descendant: ${prefixPath}`);
+    }
+    await ensurePrivateDirectory(prefixPath);
+    const entries = await readdir(prefixPath, { withFileTypes: true });
+    for (const entry of entries) {
+      const target = path.join(prefixPath, entry.name);
+      if (entry.isSymbolicLink())
+        throw new Error(`ledger object store contains a symlink: ${target}`);
+      if (!entry.isFile()) throw new Error(`ledger object store contains a non-file: ${target}`);
+      if (entry.name.startsWith(".")) {
+        await rm(target, { force: true });
+        await syncDirectory(prefixPath);
+        continue;
+      }
+      if (!/^[a-f0-9]{64}$/.test(entry.name) || entry.name.slice(0, 2) !== prefix.name) {
+        throw new Error(`ledger object has an invalid name: ${target}`);
+      }
+      const bytes = await readArtifactBytes(target);
+      if (hashBytes(bytes) !== entry.name)
+        throw new Error(`ledger object hash mismatch: ${target}`);
+      const row = db.prepare("SELECT path FROM objects WHERE sha256=?").get(entry.name) as
+        | { path?: string }
+        | undefined;
+      if (!row) {
+        await rm(target, { force: true });
+        await syncDirectory(prefixPath);
+      } else if (row.path !== path.relative(root, target)) {
+        throw new Error(`ledger object index path mismatch: ${target}`);
+      }
+    }
+  }
+  const rows = db.prepare("SELECT sha256,path FROM objects").all() as Array<{
+    sha256: string;
+    path: string;
+  }>;
+  for (const row of rows) {
+    const target = path.resolve(root, row.path);
+    const relative = path.relative(root, target);
+    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+      throw new Error(`ledger object index path escapes the ledger root: ${row.sha256}`);
+    }
+    try {
+      const bytes = await readArtifactBytes(target);
+      if (hashBytes(bytes) !== row.sha256)
+        throw new Error(`ledger object hash mismatch: ${target}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        throw new Error(`ledger index references missing object: ${row.sha256}`);
+      }
+      throw error;
+    }
+  }
 }
 
 function parseConversation(
@@ -239,15 +354,130 @@ function parseConversation(
   url: string | null;
   currentNode: string | null;
   mapping: Record<string, RawNode>;
+  selectedChain: string[];
 } {
+  if (supplied && typeof raw.conversation_id === "string" && raw.conversation_id !== supplied) {
+    throw new Error("raw conversation id does not match supplied conversation id");
+  }
   const id = safeId(supplied ?? String(raw.conversation_id ?? raw.id ?? ""), "conversation id");
   const url = typeof raw.conversation_url === "string" ? raw.conversation_url : null;
-  const mapping =
-    raw.mapping && typeof raw.mapping === "object" && !Array.isArray(raw.mapping)
-      ? (raw.mapping as Record<string, RawNode>)
-      : {};
-  const current = typeof raw.current_node === "string" ? raw.current_node : null;
-  return { id, url, currentNode: current, mapping };
+  if (!raw.mapping || typeof raw.mapping !== "object" || Array.isArray(raw.mapping)) {
+    throw new Error("provider raw document has no object mapping");
+  }
+  const mapping = raw.mapping as Record<string, RawNode>;
+  const nodeIds = Object.keys(mapping);
+  if (nodeIds.length === 0 || nodeIds.length > MAX_GRAPH_NODES) {
+    throw new Error("provider raw mapping has an invalid node count");
+  }
+  const current = raw.current_node;
+  if (typeof current !== "string" || !Object.hasOwn(mapping, current)) {
+    throw new Error("provider raw current_node is missing from mapping");
+  }
+  const roots: string[] = [];
+  for (const nodeId of nodeIds) {
+    const node = mapping[nodeId];
+    if (!node || typeof node !== "object" || Array.isArray(node)) {
+      throw new Error(`provider raw mapping node is not an object: ${nodeId}`);
+    }
+    if (node.id !== nodeId) throw new Error(`provider raw mapping node id mismatch: ${nodeId}`);
+    if (!("parent" in node)) throw new Error(`provider raw mapping node has no parent: ${nodeId}`);
+    if (
+      node.message !== null &&
+      (typeof node.message !== "object" || Array.isArray(node.message))
+    ) {
+      throw new Error(`provider raw mapping message is invalid: ${nodeId}`);
+    }
+    if (node.message) {
+      const author = node.message.author;
+      const content = node.message.content;
+      if (
+        !author ||
+        typeof author !== "object" ||
+        Array.isArray(author) ||
+        typeof (author as Record<string, unknown>).role !== "string"
+      ) {
+        throw new Error(`provider raw mapping message author is invalid: ${nodeId}`);
+      }
+      if (!content || typeof content !== "object" || Array.isArray(content)) {
+        throw new Error(`provider raw mapping message content is invalid: ${nodeId}`);
+      }
+    }
+    if (node.parent === null) roots.push(nodeId);
+    else if (typeof node.parent !== "string" || !Object.hasOwn(mapping, node.parent)) {
+      throw new Error(`provider raw mapping parent is invalid: ${nodeId}`);
+    }
+    if (!("children" in node) || !Array.isArray(node.children)) {
+      throw new Error(`provider raw mapping node has no children array: ${nodeId}`);
+    }
+    const children = node.children as unknown[];
+    if (
+      new Set(children).size !== children.length ||
+      children.some((child) => typeof child !== "string")
+    ) {
+      throw new Error(`provider raw mapping children are invalid: ${nodeId}`);
+    }
+    for (const childValue of children) {
+      const child = childValue as string;
+      if (!Object.hasOwn(mapping, child))
+        throw new Error(`provider raw child is missing: ${child}`);
+      if (mapping[child]?.parent !== nodeId)
+        throw new Error(`provider raw parent/child mismatch: ${nodeId}`);
+    }
+  }
+  if (roots.length === 0) throw new Error("provider raw mapping has no root");
+  const visited = new Set<string>();
+  const stack = [...roots];
+  while (stack.length > 0) {
+    const nodeId = stack.pop();
+    if (!nodeId || visited.has(nodeId)) continue;
+    visited.add(nodeId);
+    const children = mapping[nodeId]?.children;
+    if (!Array.isArray(children)) throw new Error(`provider raw children are missing: ${nodeId}`);
+    for (const child of children as string[]) stack.push(child);
+  }
+  if (visited.size !== nodeIds.length)
+    throw new Error("provider raw mapping contains a disconnected or cyclic graph");
+  const selectedChain: string[] = [];
+  const selectedSeen = new Set<string>();
+  let cursor: string | null = current;
+  while (cursor !== null) {
+    if (selectedSeen.has(cursor)) throw new Error("provider raw selected branch contains a cycle");
+    selectedSeen.add(cursor);
+    selectedChain.push(cursor);
+    const parent: unknown = mapping[cursor]?.parent;
+    cursor = typeof parent === "string" ? parent : null;
+  }
+  if (
+    selectedChain[selectedChain.length - 1] === undefined ||
+    mapping[selectedChain[selectedChain.length - 1] as string]?.parent !== null
+  ) {
+    throw new Error("provider raw selected branch does not terminate at a root");
+  }
+  selectedChain.reverse();
+  return { id, url, currentNode: current, mapping, selectedChain };
+}
+
+function normalizedAttachments(value: unknown): unknown[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is Record<string, unknown> =>
+      Boolean(entry && typeof entry === "object" && !Array.isArray(entry)),
+    )
+    .map((entry) => ({
+      name: typeof entry.name === "string" ? entry.name : null,
+      bytes:
+        typeof entry.size === "number"
+          ? entry.size
+          : typeof entry.bytes === "number"
+            ? entry.bytes
+            : null,
+      mimeType:
+        typeof entry.mime_type === "string"
+          ? entry.mime_type
+          : typeof entry.mimeType === "string"
+            ? entry.mimeType
+            : null,
+    }));
 }
 
 function contentBody(message: Record<string, unknown>): { type: string; body: string } {
@@ -264,24 +494,23 @@ function contentBody(message: Record<string, unknown>): { type: string; body: st
     const text = parts
       .map((part) => (typeof part === "string" ? part : stableJson(part)))
       .join("\n\n");
+    if (Buffer.byteLength(text, "utf8") > MAX_TURN_BODY_BYTES)
+      throw new Error("provider turn body exceeds bounds");
     return { type: contentType || "text", body: text };
   }
-  if (typeof content === "string") return { type: contentType || "text", body: content };
-  return { type: contentType || "unknown", body: stableJson(content ?? "") };
+  if (typeof content === "string") {
+    if (Buffer.byteLength(content, "utf8") > MAX_TURN_BODY_BYTES)
+      throw new Error("provider turn body exceeds bounds");
+    return { type: contentType || "text", body: content };
+  }
+  const body = stableJson(content ?? "");
+  if (Buffer.byteLength(body, "utf8") > MAX_TURN_BODY_BYTES)
+    throw new Error("provider turn body exceeds bounds");
+  return { type: contentType || "unknown", body };
 }
 
 function selectedTurns(parsed: ReturnType<typeof parseConversation>): NormalizedTurn[] {
-  const chain: string[] = [];
-  const seen = new Set<string>();
-  let cursor = parsed.currentNode;
-  while (cursor && !seen.has(cursor)) {
-    seen.add(cursor);
-    chain.push(cursor);
-    const parent = parsed.mapping[cursor]?.parent;
-    cursor = typeof parent === "string" ? parent : null;
-  }
-  chain.reverse();
-  return chain.flatMap((nodeId, ordinal) => {
+  const turns = parsed.selectedChain.flatMap((nodeId, ordinal) => {
     const node = parsed.mapping[nodeId];
     const message = node?.message;
     if (!message || typeof message !== "object") return [];
@@ -291,13 +520,11 @@ function selectedTurns(parsed: ReturnType<typeof parseConversation>): Normalized
         : "unknown";
     const body = contentBody(message);
     const text = body.body;
-    const attachments = Array.isArray(
+    const attachments = normalizedAttachments(
       message.metadata && typeof message.metadata === "object"
         ? (message.metadata as Record<string, unknown>).attachments
         : undefined,
-    )
-      ? ((message.metadata as Record<string, unknown>).attachments as unknown[])
-      : [];
+    );
     return [
       {
         ordinal,
@@ -312,6 +539,76 @@ function selectedTurns(parsed: ReturnType<typeof parseConversation>): Normalized
       },
     ];
   });
+  if (turns.length > MAX_TURNS)
+    throw new Error("provider selected branch exceeds turn-count bounds");
+  return turns;
+}
+
+function validateEvidence(
+  evidence: Record<string, unknown>,
+  parsed: ReturnType<typeof parseConversation>,
+  turns: NormalizedTurn[],
+  rawSha256: string,
+  rawBytes: number,
+): void {
+  if (evidence.schema !== "oracle.provider-native-capture-evidence/v1") {
+    throw new Error("unsupported provider evidence schema");
+  }
+  if (evidence.conversation_id !== parsed.id) {
+    throw new Error("raw and evidence conversation ids do not match");
+  }
+  const materialized = evidence.materialized_document;
+  if (!materialized || typeof materialized !== "object" || Array.isArray(materialized)) {
+    throw new Error("evidence has no materialized document descriptor");
+  }
+  const materializedRecord = materialized as Record<string, unknown>;
+  if (materializedRecord.sha256 !== rawSha256 || materializedRecord.bytes !== rawBytes) {
+    throw new Error("evidence does not describe the supplied raw bytes");
+  }
+  const independent = evidence.independent_fetch;
+  if (!independent || typeof independent !== "object" || Array.isArray(independent)) {
+    throw new Error("evidence has no independent fetch descriptor");
+  }
+  const perTurn = evidence.per_turn;
+  if (!Array.isArray(perTurn)) throw new Error("evidence has no per-turn digest array");
+  const expected = turns.filter((turn) => turn.role !== "system");
+  if (perTurn.length !== expected.length)
+    throw new Error("evidence turn count does not match selected branch");
+  for (let index = 0; index < expected.length; index += 1) {
+    const actual = perTurn[index];
+    const turn = expected[index];
+    if (!actual || typeof actual !== "object" || Array.isArray(actual))
+      throw new Error(`evidence turn ${index} is not an object`);
+    const record = actual as Record<string, unknown>;
+    if (
+      record.i !== index ||
+      record.role !== turn.role ||
+      record.ct !== turn.contentType ||
+      record.blen !== turn.bodyBytes
+    ) {
+      throw new Error(`evidence turn ${index} does not correspond to the selected branch`);
+    }
+    if (record.sha256_hex !== turn.bodySha256)
+      throw new Error(`evidence turn ${index} body hash mismatch`);
+    const decimal = record.sha256_dec;
+    const expectedDecimal = [...Buffer.from(turn.bodySha256, "hex")];
+    const decimalValues =
+      typeof decimal === "string" && decimal.trim().length > 0
+        ? decimal
+            .trim()
+            .split(/\s+/)
+            .map((value) => Number(value))
+        : [];
+    if (
+      decimalValues.length !== expectedDecimal.length ||
+      decimalValues.some((value, i) => value !== expectedDecimal[i])
+    ) {
+      throw new Error(`evidence turn ${index} decimal hash mismatch`);
+    }
+    if (stableJson(normalizedAttachments(record.attachments)) !== stableJson(turn.attachments)) {
+      throw new Error(`evidence turn ${index} attachment metadata mismatch`);
+    }
+  }
 }
 
 function conversationKey(provider: string, profileId: string, conversationId: string): string {
@@ -377,9 +674,15 @@ export class TranscriptLedger {
     await ensureRoot(root);
     const ledger = new TranscriptLedger(root);
     ledger.db = createDb(path.join(root, "index.sqlite"));
-    await ensurePrivateFile(path.join(root, "index.sqlite-wal")).catch((error) => {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    });
+    try {
+      await ensurePrivateFile(path.join(root, "index.sqlite-wal")).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      });
+      await recoverObjectStore(root, ledger.database);
+    } catch (error) {
+      ledger.close();
+      throw error;
+    }
     return ledger;
   }
 
@@ -396,27 +699,33 @@ export class TranscriptLedger {
   async ingestPair(input: IngestPairInput): Promise<LedgerIngestResult> {
     const rawBytes = await readArtifactBytes(input.rawPath);
     const evidenceBytes = await readArtifactBytes(input.evidencePath);
-    const raw = JSON.parse(rawBytes.toString("utf8")) as Record<string, unknown>;
+    if (rawBytes.byteLength > MAX_RAW_BYTES)
+      throw new Error("provider raw document exceeds byte bounds");
+    if (evidenceBytes.byteLength > MAX_EVIDENCE_BYTES)
+      throw new Error("provider evidence document exceeds byte bounds");
+    let raw: Record<string, unknown>;
+    let evidence: Record<string, unknown>;
+    try {
+      raw = JSON.parse(rawBytes.toString("utf8")) as Record<string, unknown>;
+      assertJsonBounds(raw, "provider raw document");
+    } catch (error) {
+      throw new Error(
+        `provider raw document is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     const parsed = parseConversation(raw, input.conversationId);
-    const evidence = JSON.parse(evidenceBytes.toString("utf8")) as Record<string, unknown>;
-    if (evidence.schema && evidence.schema !== "oracle.provider-native-capture-evidence/v1") {
-      throw new Error("unsupported provider evidence schema");
+    try {
+      evidence = JSON.parse(evidenceBytes.toString("utf8")) as Record<string, unknown>;
+      assertJsonBounds(evidence, "provider evidence document");
+    } catch (error) {
+      throw new Error(
+        `provider evidence document is invalid: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
     const rawSha256 = hashBytes(rawBytes);
     const evidenceSha256 = hashBytes(evidenceBytes);
-    if (typeof evidence.conversation_id === "string" && evidence.conversation_id !== parsed.id) {
-      throw new Error("raw and evidence conversation ids do not match");
-    }
-    const materialized = evidence.materialized_document;
-    if (
-      materialized &&
-      typeof materialized === "object" &&
-      typeof (materialized as Record<string, unknown>).sha256 === "string" &&
-      (materialized as Record<string, unknown>).sha256 !== rawSha256
-    ) {
-      throw new Error("evidence does not describe the supplied raw bytes");
-    }
     const turns = selectedTurns(parsed);
+    validateEvidence(evidence, parsed, turns, rawSha256, rawBytes.byteLength);
     const sequence = turns.map(
       ({ ordinal, nodeId, parentId, role, contentType, bodySha256, bodyBytes, attachments }) => ({
         ordinal,
@@ -602,6 +911,12 @@ export class TranscriptLedger {
     intervalSeconds?: number;
   }): { watchId: string; conversationKey: string } {
     const id = safeId(input.conversationId, "conversation id");
+    if (
+      input.intervalSeconds !== undefined &&
+      (!Number.isFinite(input.intervalSeconds) || input.intervalSeconds <= 0)
+    ) {
+      throw new Error("watch interval must be a positive finite number");
+    }
     const key = conversationKey(input.provider, input.profileId, id);
     const watchId = hashText(`${key}\u0000watch`);
     const timestamp = now();
@@ -659,12 +974,12 @@ export class TranscriptLedger {
     const timestamp = now();
     this.database
       .prepare(
-        "UPDATE watches SET last_attempt_at=?,last_success_at=CASE WHEN ? IS NOT NULL THEN ? ELSE last_success_at END,last_observation_id=COALESCE(?,last_observation_id),last_error_code=? WHERE watch_id=?",
+        "UPDATE watches SET last_attempt_at=?,last_success_at=CASE WHEN ? IS NULL THEN ? ELSE last_success_at END,last_observation_id=COALESCE(?,last_observation_id),last_error_code=? WHERE watch_id=?",
       )
       .run(
         timestamp,
-        result.observationId ?? null,
-        result.observationId ? timestamp : null,
+        result.errorCode ?? null,
+        timestamp,
         result.observationId ?? null,
         result.errorCode ?? null,
         watchId,
@@ -683,6 +998,17 @@ export class TranscriptLedger {
 export function canonicalConversationId(value: string): string {
   const id = extractStableConversationIdFromUrl(value) ?? value.trim();
   return safeId(id, "conversation id");
+}
+
+export function selectSyncWatches(
+  rows: Array<Record<string, unknown>>,
+  conversationId: string | undefined,
+  all: boolean,
+): Array<Record<string, unknown>> {
+  if (!conversationId && !all) throw new Error("sync requires a conversation argument or --all");
+  return rows.filter(
+    (row) => Number(row.enabled) === 1 && (all || row.conversationId === conversationId),
+  );
 }
 
 /** The only request shape the ledger sync path is allowed to send to Oracle. */
@@ -712,6 +1038,14 @@ export function buildCaptureOnlySyncRequest(
 }
 
 export function ledgerWarning(_error: unknown): LedgerWarning {
+  if (_error instanceof LedgerArtifactPairError) {
+    return {
+      code: "transcript-ledger-artifact-pair-incomplete",
+      severity: "warning",
+      message:
+        "Provider-native capture returned an incomplete raw/evidence pair; the completed provider result was retained.",
+    };
+  }
   return {
     code: "transcript-ledger-ingest-failed",
     severity: "warning",
@@ -726,11 +1060,43 @@ export function deriveChatgptProfileId(config: {
 }): string {
   const source =
     config.manualLoginProfileDir ?? config.chromeProfile ?? config.chromeCookiePath ?? "default";
-  return `chatgpt-profile-${hashText(path.resolve(source)).slice(0, 32)}`;
+  const stableSource = path.isAbsolute(source) ? source : path.resolve(getOracleHomeDir(), source);
+  return `chatgpt-profile-${hashText(stableSource).slice(0, 32)}`;
+}
+
+export function parsePositiveFiniteInterval(value: string): number {
+  const interval = Number(value);
+  if (!Number.isFinite(interval) || interval <= 0) {
+    throw new Error("interval must be a positive finite number");
+  }
+  return interval;
+}
+
+export function classifyObservationFailure(
+  error: unknown,
+): Exclude<LedgerObservationStatus, "captured"> {
+  const candidate = error as { message?: unknown; details?: unknown };
+  let detailText = "";
+  try {
+    detailText = JSON.stringify(candidate?.details ?? "");
+  } catch {
+    detailText = String(candidate?.details ?? "");
+  }
+  const text = `${String(candidate?.message ?? "")} ${detailText}`.toLowerCase();
+  if (text.includes("challenged") || text.includes("bot mitigation")) return "challenged";
+  if (
+    text.includes("auth-session-unavailable") ||
+    text.includes("authentication unavailable") ||
+    text.includes("not authenticated")
+  ) {
+    return "auth-unavailable";
+  }
+  return "failed";
 }
 
 export async function ingestProviderNativeArtifacts(params: {
   artifacts?: Array<{ path: string; label?: string }>;
+  requirePair?: boolean;
   provider?: string;
   profileId: string;
   conversationId?: string;
@@ -743,7 +1109,11 @@ export async function ingestProviderNativeArtifacts(params: {
   const evidence = params.artifacts?.find(
     (artifact) => artifact.label === "provider-native-conversation-evidence",
   );
-  if (!raw || !evidence) return undefined;
+  if (!raw && !evidence) {
+    if (params.requirePair) throw new LedgerArtifactPairError();
+    return undefined;
+  }
+  if (!raw || !evidence) throw new LedgerArtifactPairError();
   const ledger = await TranscriptLedger.open();
   try {
     return await ledger.ingestPair({

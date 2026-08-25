@@ -104,6 +104,9 @@ import {
   ingestProviderNativeArtifacts,
   ledgerWarning,
   buildCaptureOnlySyncRequest,
+  parsePositiveFiniteInterval,
+  classifyObservationFailure,
+  selectSyncWatches,
 } from "../src/transcriptLedger.js";
 
 interface CliOptions extends OptionValues {
@@ -1056,7 +1059,7 @@ transcriptCommand
   .option(
     "--interval <seconds>",
     "Optional periodic-sync interval; no scheduler is started.",
-    parseIntOption,
+    parsePositiveFiniteInterval,
   )
   .action(async (thread: string, options: Record<string, unknown>) => {
     const ledger = await TranscriptLedger.open({ root: options.root as string | undefined });
@@ -1087,7 +1090,11 @@ transcriptCommand
   .description("Set a periodic-sync interval on a watch; this command does not run a daemon.")
   .option("--root <path>", "Private transcript ledger root.")
   .option("--profile <id>", "Opaque provider-profile id.")
-  .requiredOption("--interval <seconds>", "Requested scheduler interval.", parseIntOption)
+  .requiredOption(
+    "--interval <seconds>",
+    "Requested scheduler interval.",
+    parsePositiveFiniteInterval,
+  )
   .action(async (thread: string, options: Record<string, unknown>) => {
     const ledger = await TranscriptLedger.open({ root: options.root as string | undefined });
     try {
@@ -1167,11 +1174,11 @@ transcriptCommand
   .action(async (thread: string | undefined, options: Record<string, unknown>) => {
     const ledger = await TranscriptLedger.open({ root: options.root as string | undefined });
     try {
-      const rows = ledger
-        .watchRows()
-        .filter(
-          (row) => options.all || !thread || row.conversationId === canonicalConversationId(thread),
-        );
+      const rows = selectSyncWatches(
+        ledger.watchRows(),
+        thread ? canonicalConversationId(thread) : undefined,
+        options.all === true,
+      );
       if (rows.length === 0) throw new Error("no matching enabled transcript watch");
       const { runBrowserMode } = await import("../src/browserMode.js");
       const output: Array<Record<string, unknown>> = [];
@@ -1215,13 +1222,13 @@ transcriptCommand
             profileId: String(options.profile ?? row.profileId),
             conversationId: String(row.conversationId),
             canonicalUrl: conversationUrl,
-            status: "failed",
-            errorCode: "capture-failed",
+            status: classifyObservationFailure(error),
+            errorCode: `capture-${classifyObservationFailure(error)}`,
             errorMessage: error instanceof Error ? error.message : String(error),
           });
           ledger.recordWatchAttempt(String(row.watchId), {
             observationId: failure.observationId,
-            errorCode: "capture-failed",
+            errorCode: `capture-${classifyObservationFailure(error)}`,
           });
           output.push({
             watchId: row.watchId,
