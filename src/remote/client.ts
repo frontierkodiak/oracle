@@ -171,6 +171,40 @@ export async function submitDurableRemoteRun(p: {
   validateSnapshot(s);
   return s;
 }
+
+/** Submit an explicit operator request, allocating its durable receipt before POST. */
+export async function submitDurableRemoteRunWithReceipt(p: {
+  host: string;
+  token?: string;
+  sessionId: string;
+  payload: RemoteRunPayload;
+}): Promise<{ receipt: DurableReceipt; snapshot: DurableRunSnapshot }> {
+  let receipt = await readDurableReceipt(p.sessionId);
+  if (!receipt) {
+    receipt = { sessionId: p.sessionId, idempotencyKey: randomBytes(32).toString("hex") };
+    await writeDurableReceipt(receipt);
+  }
+  const payloadHash = createHash("sha256").update(JSON.stringify(p.payload)).digest("hex");
+  if (receipt.payloadHash && receipt.payloadHash !== payloadHash)
+    throw new Error("durable receipt payload does not match the current request");
+  if (!receipt.payloadHash) {
+    receipt = { ...receipt, payloadHash };
+    await writeDurableReceipt(receipt);
+  }
+  const snapshot = receipt.runId
+    ? await getDurableRemoteRun(p.host, receipt.runId, p.token)
+    : await submitDurableRemoteRun({
+        host: p.host,
+        token: p.token,
+        idempotencyKey: receipt.idempotencyKey,
+        payload: p.payload,
+      });
+  if (!receipt.runId) {
+    receipt = { ...receipt, runId: snapshot.id, submission: undefined };
+    await writeDurableReceipt(receipt);
+  }
+  return { receipt, snapshot };
+}
 export async function getDurableRemoteRun(
   host: string,
   id: string,

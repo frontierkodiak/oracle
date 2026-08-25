@@ -14,6 +14,7 @@ import {
   watchDurableRemoteRun,
   writeDurableReceipt,
   submitDurableRemoteRun,
+  submitDurableRemoteRunWithReceipt,
 } from "../../src/remote/client.js";
 
 const runSnapshot = (id: string, state: "queued" | "completed" = "completed") => ({
@@ -68,6 +69,41 @@ async function body(req: http.IncomingMessage): Promise<any> {
 }
 
 describe("durable remote client receipts", () => {
+  it("persists the receipt before authenticated explicit submission", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-explicit-submit-"));
+    setOracleHomeDirOverrideForTest(home);
+    const seen: { key?: string; auth?: string } = {};
+    const server = http.createServer((req, res) => {
+      seen.key = String(req.headers["idempotency-key"]);
+      seen.auth = String(req.headers.authorization);
+      res.end(JSON.stringify(runSnapshot("run-explicit", "queued")));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const result = await submitDurableRemoteRunWithReceipt({
+        host: `127.0.0.1:${(server.address() as any).port}`,
+        token: "secret-token",
+        sessionId: "explicit-session",
+        payload: {
+          prompt: "hello",
+          attachments: [],
+          browserConfig: {} as any,
+          options: { sessionId: "explicit-session" },
+        },
+      });
+      expect(result.snapshot.id).toBe("run-explicit");
+      expect(seen.key).toMatch(/^[a-f0-9]{64}$/);
+      expect(seen.auth).toBe("Bearer secret-token");
+      expect(await readDurableReceipt("explicit-session")).toMatchObject({
+        runId: "run-explicit",
+        idempotencyKey: seen.key,
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
   it("writes an atomic private receipt and reopens the same key", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "oracle-client-"));
     setOracleHomeDirOverrideForTest(home);

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
 import { Command, Option } from "commander";
 import type { OptionValues } from "commander";
 // Allow `npx @steipete/oracle oracle-mcp` to resolve the MCP server even though npx runs the default binary.
@@ -73,6 +75,15 @@ import {
 import { loadUserConfig, type UserConfig } from "../src/config.js";
 import { shouldBlockDuplicatePrompt } from "../src/cli/duplicatePromptGuard.js";
 import { resolveRemoteServiceConfig } from "../src/remote/remoteServiceConfig.js";
+import { buildBrowserConfig } from "../src/cli/browserConfig.js";
+import {
+  cancelDurableRemoteRun,
+  getDurableRemoteQueueStatus,
+  getDurableRemoteRun,
+  submitDurableRemoteRunWithReceipt,
+  watchDurableRemoteRun,
+} from "../src/remote/client.js";
+import type { RemoteRunPayload } from "../src/remote/types.js";
 import { resolveConfiguredMaxFileSizeBytes } from "../src/cli/fileSize.js";
 import {
   isAzureOpenAICandidateModel,
@@ -336,6 +347,7 @@ const docsCheckRequested = docsArgIndex >= 0 && routingCliArgs[docsArgIndex + 1]
 const suppressIntro =
   doctorJsonRequested ||
   docsCheckRequested ||
+  routingCliArgs[0] === "remote" ||
   (routingCliArgs[0] === "bridge" &&
     (routingCliArgs[1] === "codex-config" || routingCliArgs[1] === "claude-config"));
 
@@ -353,6 +365,9 @@ program.hook("preAction", async (thisCommand) => {
   if (thisCommand !== program) {
     return;
   }
+  // Remote operator commands own their prompt positional/options and must not
+  // be interpreted as a normal one-shot invocation by the root hook.
+  if (routingCliArgs[0] === "remote") return;
   if (routingCliArgs.some((arg) => arg === "--help" || arg === "-h")) {
     return;
   }
@@ -984,17 +999,193 @@ program
     "Copy cookies from this host's live Chrome profile instead of using the dedicated profile.",
     false,
   )
+  .option(
+    "--allow-capture-only",
+    "Allow capture-only durable requests (opt-in; default false).",
+    false,
+  )
   .action(async (commandOptions) => {
     const { serveRemote } = await import("../src/remote/server.js");
-    await serveRemote({
+    const serverOptions = {
       host: commandOptions.host,
       port: commandOptions.port,
       token: commandOptions.token,
       manualLoginDefault: commandOptions.manualLogin,
       manualLoginProfileDir: commandOptions.manualLoginProfileDir,
       cookieSyncDefault: commandOptions.browserCookieSync,
-    });
+    };
+    // The exact-commit server type predates this forward-compatible flag;
+    // newer servers consume it while older ones safely ignore its absence.
+    if (commandOptions.allowCaptureOnly) {
+      (serverOptions as typeof serverOptions & { allowCaptureOnly: boolean }).allowCaptureOnly =
+        true;
+    }
+    await serveRemote(serverOptions);
   });
+
+const remoteCommand = program
+  .command("remote")
+  .description("Submit and operate durable runs on an Oracle remote service.");
+
+function addRemoteConnectionOptions(command: Command): Command {
+  return command
+    .option("--remote-host <host:port>", "Remote oracle serve host (or ORACLE_REMOTE_HOST).")
+    .option("--remote-token <token>", "Remote access token (or ORACLE_REMOTE_TOKEN).")
+    .option("--json", "Print machine-readable JSON.", false);
+}
+
+function remoteHostAndToken(command: Command): { host: string; token?: string } {
+  const options = command.opts<Record<string, unknown>>();
+  const config = resolveRemoteServiceConfig({
+    cliHost: options.remoteHost as string | undefined,
+    cliToken: options.remoteToken as string | undefined,
+  });
+  if (!config.host)
+    throw new Error("Remote host is required (--remote-host or ORACLE_REMOTE_HOST).");
+  return { host: config.host, token: config.token };
+}
+
+async function resolveRemotePrompt(prompt: string | undefined): Promise<string> {
+  if (prompt?.trim()) return prompt;
+  if (!process.stdin.isTTY) {
+    const input = (await readFile("/dev/stdin", "utf8")).trimEnd();
+    if (input.trim()) return input;
+  }
+  throw new Error("Prompt is required; provide --prompt or pipe prompt text on stdin.");
+}
+
+function printRemoteValue(value: unknown, json: boolean, human: string): void {
+  if (json) console.log(JSON.stringify(value, null, 2));
+  else console.log(human);
+}
+
+const remoteSubmit = addRemoteConnectionOptions(
+  remoteCommand
+    .command("submit")
+    .description("Persist a receipt and submit one durable browser run.")
+    .option("-p, --prompt <text>", "Prompt text; stdin is used when omitted.")
+    .option("--session-id <id>", "Stable durable session/receipt ID.")
+    .option("--model <model>", "Browser model label/model (default gpt-5.6-sol).", "gpt-5.6-sol")
+    .option("--chatgpt-url <url>", "ChatGPT URL or project URL.")
+    .option("--browser-timeout <duration>", "Browser timeout (for example 10m).")
+    .option("--browser-input-timeout <duration>", "Composer input timeout.")
+    .option("--browser-attachment-timeout <duration>", "Attachment timeout.")
+    .option("--browser-manual-login", "Use the persistent manual-login browser profile.")
+    .option("--browser-manual-login-profile-dir <path>", "Manual-login profile directory.")
+    .option("--browser-cookie-sync", "Copy cookies from the host Chrome profile.")
+    .option("--browser-no-cookie-sync", "Disable cookie synchronization.")
+    .option("--browser-headless", "Run browser headlessly.")
+    .option("--browser-keep-browser", "Keep the remote browser open after completion.")
+    .option("--browser-tab <ref>", "Browser tab reference to reuse.")
+    .option("--browser-model-strategy <strategy>", "Model selection: select, current, or ignore.")
+    .option("--browser-thinking-time <level>", "Thinking intensity.")
+    .option("--browser-research <mode>", "Research mode: off or deep.")
+    .option("--verbose", "Enable remote browser logging."),
+);
+remoteSubmit.action(async function (this: Command) {
+  const options = this.opts<Record<string, unknown>>();
+  const { host, token } = remoteHostAndToken(this);
+  const prompt = await resolveRemotePrompt(options.prompt as string | undefined);
+  const sessionId =
+    (options.sessionId as string | undefined) ?? `remote-${randomBytes(12).toString("hex")}`;
+  const model = String(options.model ?? "gpt-5.6-sol") as ModelName;
+  const browserConfig = await buildBrowserConfig({
+    model,
+    chatgptUrl: options.chatgptUrl as string | undefined,
+    browserTimeout: options.browserTimeout as string | undefined,
+    browserInputTimeout: options.browserInputTimeout as string | undefined,
+    browserAttachmentTimeout: options.browserAttachmentTimeout as string | undefined,
+    browserManualLogin: options.browserManualLogin as boolean | undefined,
+    browserManualLoginProfileDir: options.browserManualLoginProfileDir as string | undefined,
+    browserCookieSync: options.browserCookieSync as boolean | undefined,
+    browserNoCookieSync: options.browserNoCookieSync as boolean | undefined,
+    browserHeadless: options.browserHeadless as boolean | undefined,
+    browserKeepBrowser: options.browserKeepBrowser as boolean | undefined,
+    browserTab: options.browserTab as string | undefined,
+    browserModelStrategy: options.browserModelStrategy as
+      | "select"
+      | "current"
+      | "ignore"
+      | undefined,
+    browserThinkingTime: options.browserThinkingTime as CliOptions["browserThinkingTime"],
+    browserResearch: options.browserResearch as "off" | "deep" | undefined,
+    verbose: options.verbose as boolean | undefined,
+  });
+  const payload: RemoteRunPayload = {
+    prompt,
+    attachments: [],
+    browserConfig,
+    options: { sessionId, verbose: options.verbose as boolean | undefined },
+  };
+  const submitted = await submitDurableRemoteRunWithReceipt({ host, token, sessionId, payload });
+  const snapshot = submitted.snapshot;
+  printRemoteValue(
+    {
+      sessionId,
+      runId: snapshot.id,
+      state: snapshot.state,
+      queuePosition: snapshot.queuePosition,
+      roughEtaMs: snapshot.roughEtaMs,
+    },
+    Boolean(options.json),
+    `Submitted ${snapshot.id} (${snapshot.state}); queue position ${snapshot.queuePosition}, ETA ${snapshot.roughEtaMs}ms`,
+  );
+});
+
+const remoteWatch = addRemoteConnectionOptions(
+  remoteCommand
+    .command("watch <run-id>")
+    .description("Reconnect to and watch a durable run without canceling it.")
+    .option("--timeout <duration>", "Maximum watch duration (default 10m)."),
+);
+remoteWatch.action(async function (this: Command, runId: string) {
+  const options = this.opts<Record<string, unknown>>();
+  const { host, token } = remoteHostAndToken(this);
+  const outcome = await watchDurableRemoteRun(host, runId, {
+    token,
+    onSnapshot: (snapshot) => {
+      if (!options.json) console.error(`${snapshot.id}: ${snapshot.state} (${snapshot.phase})`);
+    },
+  });
+  printRemoteValue(
+    outcome.snapshot,
+    Boolean(options.json),
+    `${outcome.snapshot.id}: ${outcome.snapshot.state}`,
+  );
+  if (outcome.snapshot.state !== "completed") process.exitCode = 1;
+});
+
+const remoteCancel = addRemoteConnectionOptions(
+  remoteCommand
+    .command("cancel <run-id>")
+    .description("Explicitly request cancellation of a durable run."),
+);
+remoteCancel.action(async function (this: Command, runId: string) {
+  const options = this.opts<Record<string, unknown>>();
+  const { host, token } = remoteHostAndToken(this);
+  const snapshot = await cancelDurableRemoteRun(host, runId, token);
+  printRemoteValue(snapshot, Boolean(options.json), `${snapshot.id}: ${snapshot.state}`);
+});
+
+const remoteStatus = addRemoteConnectionOptions(
+  remoteCommand
+    .command("status [run-id]")
+    .description("Show a run snapshot or the remote queue status."),
+);
+remoteStatus.action(async function (this: Command, runId: string | undefined) {
+  const options = this.opts<Record<string, unknown>>();
+  const { host, token } = remoteHostAndToken(this);
+  const value = runId
+    ? await getDurableRemoteRun(host, runId, token)
+    : await getDurableRemoteQueueStatus(host, token);
+  printRemoteValue(
+    value,
+    Boolean(options.json),
+    runId
+      ? `${runId}: ${(value as any).state}`
+      : `Queue: ${(value as any).queued} queued / ${(value as any).active} active`,
+  );
+});
 
 const projectSourcesCommand = program
   .command("project-sources")
