@@ -273,11 +273,14 @@ export async function createRemoteServer(
           const attachments = await materialize(payload.attachments as any[] | undefined, "attachments");
           const fallback = payload.fallbackSubmission as any;
           const fallbackSubmission = fallback ? { prompt: fallback.prompt, attachments: await materialize(fallback.attachments as any[] | undefined, "fallback-attachments") } : undefined;
+          const clientRequestedKeepBrowser = payload.browserConfig.keepBrowser === true;
+          const hostConfig = { ...payload.browserConfig, inlineCookies: null, inlineCookiesSource: null, cookieSync: options.cookieSyncDefault === true, ...(options.manualLoginDefault ? { manualLogin: true, manualLoginProfileDir: options.manualLoginProfileDir, keepBrowser: true } : {}) };
+          const sessionId = payload.options?.sessionId ? `${String(payload.options.sessionId)}-${id.slice(0, 8)}` : id;
           const automationLogger: BrowserLogger = ((message?: string) => {
             if (typeof message === "string") logger(`[run ${id}] ${message}`);
           }) as BrowserLogger;
           automationLogger.verbose = Boolean(payload.options?.verbose);
-          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: payload.browserConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId: String(payload.options?.sessionId ?? id), followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && payload.browserConfig.keepBrowser !== true) });
+          const result = await runBrowser({ prompt: payload.prompt, attachments, fallbackSubmission, config: hostConfig as any, signal: controller.signal, log: automationLogger, verbose: Boolean(payload.options?.verbose), heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined, sessionId, followUpPrompts: payload.options?.followUpPrompts as string[] | undefined, closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser) });
           durableQueue.transition(id, "completed", "terminal", { result, elapsedMs: Date.now() - started });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -667,9 +670,14 @@ export async function createRemoteServer(
     port: address.port,
     token: authToken,
     async close() {
+      for (const controller of durableControllers.values()) controller.abort();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });
+      const deadline = Date.now() + 10_000;
+      while (durableWorkers > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
       durableQueue.close();
     },
   };
