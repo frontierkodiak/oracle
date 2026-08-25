@@ -719,6 +719,8 @@ async function createFakeArtifactBridge({
             queuePosition: 0,
             roughEtaMs: 0,
             requestHash: "a".repeat(64),
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
             result: {
               answerText: "done",
               answerMarkdown: "done",
@@ -764,6 +766,8 @@ async function createFakeArtifactBridge({
             queuePosition: 0,
             roughEtaMs: 0,
             requestHash: "a".repeat(64),
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
             result: {
               answerText: "done",
               answerMarkdown: "done",
