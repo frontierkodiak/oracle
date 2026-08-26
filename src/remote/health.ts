@@ -21,10 +21,16 @@ export interface RemoteHealthResult {
   statusCode?: number;
   error?: string;
   version?: string;
+  installSha?: string | null;
   uptimeSeconds?: number;
   runtime?: OracleRuntimeIdentity;
   manifest?: RemoteCapabilityManifest;
   capabilities?: RemoteArtifactCapabilities;
+  browser?: RemoteBrowserHealth;
+}
+
+export interface RemoteBrowserHealth {
+  windowMode: "hidden" | "visible";
 }
 
 export async function checkTcpConnection(
@@ -96,10 +102,12 @@ export async function checkRemoteHealth({
         ok: ok && parsed.ok,
         statusCode: response.statusCode,
         version: typeof version === "string" ? version : undefined,
+        installSha: parsed.installSha,
         uptimeSeconds: typeof uptimeSeconds === "number" ? uptimeSeconds : undefined,
         runtime: parsed.runtime,
         manifest: parsed.manifest,
         capabilities: parsed.artifact,
+        browser: parsed.browser,
       };
     }
     if (response.statusCode === 404) {
@@ -123,6 +131,8 @@ export function parseHealthEnvelope(value: unknown):
       runtime: OracleRuntimeIdentity;
       manifest: RemoteCapabilityManifest;
       artifact?: RemoteArtifactCapabilities;
+      installSha?: string | null;
+      browser?: RemoteBrowserHealth;
     }
   | undefined {
   if (!value || typeof value !== "object") return undefined;
@@ -147,6 +157,22 @@ export function parseHealthEnvelope(value: unknown):
     return undefined;
   }
   if (rt.major !== Number(rt.version.split(".")[0])) return undefined;
+  const installSha = raw.installSha;
+  if (
+    installSha !== undefined &&
+    installSha !== null &&
+    (typeof installSha !== "string" || !/^[0-9a-f]{40}$/i.test(installSha))
+  )
+    return undefined;
+  const rawBrowser = raw.browser;
+  let browser: RemoteBrowserHealth | undefined;
+  if (rawBrowser !== undefined) {
+    if (!rawBrowser || typeof rawBrowser !== "object" || Array.isArray(rawBrowser))
+      return undefined;
+    const windowMode = (rawBrowser as Record<string, unknown>).windowMode;
+    if (windowMode !== "hidden" && windowMode !== "visible") return undefined;
+    browser = { windowMode };
+  }
   const caps = raw.capabilities;
   if (!caps || typeof caps !== "object") return undefined;
   const c = caps as Record<string, unknown>;
@@ -211,6 +237,8 @@ export function parseHealthEnvelope(value: unknown):
     runtime: rt as unknown as OracleRuntimeIdentity,
     manifest: { schemaVersion: REMOTE_HEALTH_SCHEMA_VERSION, features },
     artifact,
+    ...(installSha !== undefined ? { installSha: installSha as string | null } : {}),
+    ...(browser ? { browser } : {}),
   };
 }
 

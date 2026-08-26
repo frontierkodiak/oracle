@@ -74,6 +74,25 @@ export async function positionChromeWindowOffscreen(
   }
 }
 
+export async function positionChromeWindowOnscreen(
+  client: ChromeClient,
+  logger: BrowserLogger,
+): Promise<boolean> {
+  try {
+    const { windowId } = await client.Browser.getWindowForTarget();
+    await client.Browser.setWindowBounds({
+      windowId,
+      bounds: { left: 80, top: 80, windowState: "normal" },
+    });
+    logger("Chrome window positioned on-screen");
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`Failed to bring Chrome window on-screen: ${message}`);
+    return false;
+  }
+}
+
 export function registerTerminationHooks(
   chrome: LaunchedChrome,
   userDataDir: string,
@@ -760,14 +779,7 @@ function buildChromeFlags(
     flags.push(`--remote-debugging-address=${debugBindAddress}`);
   }
 
-  if (headless) {
-    flags.push("--headless=new");
-  } else if (hideWindow && process.platform === "darwin") {
-    // Cmd-H stops macOS Chrome from compositing the page, which can swallow
-    // trusted CDP clicks and retain the prompt as a draft. Keeping the window
-    // off-screen avoids desktop disruption while preserving normal rendering.
-    flags.push("--window-position=-32000,-32000");
-  }
+  flags.push(...buildChromeWindowModeFlags(headless, hideWindow));
 
   // Opt-in only: container/CI Chromium often cannot use the sandbox. Callers must
   // set ORACLE_CHROME_NO_SANDBOX=1 explicitly (never default this on).
@@ -776,6 +788,23 @@ function buildChromeFlags(
   }
 
   return flags;
+}
+
+export function buildChromeWindowModeFlags(
+  headless: boolean,
+  hideWindow: boolean,
+  platform: NodeJS.Platform = process.platform,
+): string[] {
+  if (headless) {
+    return ["--headless=new"];
+  }
+  if (hideWindow && platform === "darwin") {
+    // Cmd-H stops macOS Chrome from compositing the page, which can swallow
+    // trusted CDP clicks and retain the prompt as a draft. Keeping the window
+    // off-screen avoids desktop disruption while preserving normal rendering.
+    return ["--window-position=-32000,-32000"];
+  }
+  return [];
 }
 
 export function buildChromeFlagsForTest(
