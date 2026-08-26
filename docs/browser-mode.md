@@ -353,6 +353,8 @@ Prefer to keep Chrome entirely on the remote Mac (no DevTools tunneling, no manu
    Use `--host`, `--port`, or `--token` to override the defaults if needed.
    On first use, sign in to ChatGPT in the dedicated automation Chrome window. The service keeps that profile for later runs.
 
+   On macOS, hidden-window mode (`browser.hideWindow` or `--browser-hide-window`) keeps Chrome composited by moving its main window beyond a display edge instead of minimizing it. Chrome may clamp the requested position, leaving a sliver of up to 64 pixels visible along one edge; that is expected platform behavior, and the automation Chrome does not remain frontmost after launch. Use `--browser-show-window` when you intentionally need the window visible.
+
 2. **Run from your laptop**
 
    ```bash
