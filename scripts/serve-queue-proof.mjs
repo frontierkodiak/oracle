@@ -525,6 +525,65 @@ try {
     results.push({ legacyDefault409: true });
 
     const service = await startService("queue-service", true);
+    const partialUploads = [];
+    let overflowUpload;
+    try {
+      for (let index = 0; index < 4; index++) {
+        const body = JSON.stringify({ prompt: `body-${index}`, options: {}, browserConfig: {} });
+        const request = http.request({
+          host: "127.0.0.1",
+          port: service.port,
+          path: "/runs",
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}`, "Content-Length": Buffer.byteLength(body) },
+        });
+        request.on("error", () => {});
+        request.write(body.slice(0, 1));
+        partialUploads.push(request);
+        await waitFor(async () => {
+          const state = await service.health();
+          return state.activeRuns + state.queuedRuns === index + 1;
+        }, "body reservation");
+      }
+      const rejected = await new Promise((resolve, reject) => {
+        overflowUpload = http.request(
+          {
+            host: "127.0.0.1",
+            port: service.port,
+            path: "/runs",
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Length": 100000 },
+          },
+          (response) => {
+            response.resume();
+            response.on("end", () => resolve(response.statusCode));
+          },
+        );
+        overflowUpload.on("error", reject);
+        overflowUpload.flushHeaders();
+      });
+      assert.equal(rejected, 503);
+      assert.equal(
+        [...submitted.keys()].some((name) => name.startsWith("body-")),
+        false,
+      );
+      const receiving = await service.health();
+      assert.equal(receiving.activeRuns, 2);
+      assert.equal(receiving.queuedRuns, 2);
+    } finally {
+      overflowUpload?.destroy();
+      for (const request of partialUploads) request.destroy();
+    }
+    await waitFor(async () => {
+      const state = await service.health();
+      return state.activeRuns === 0 && state.queuedRuns === 0;
+    }, "body reservation cleanup");
+    results.push({
+      incompleteBodiesBounded: true,
+      refusedBeforePayload: true,
+      cancelledReadersReleased: true,
+    });
+
     assert.equal((await service.health()).maxConcurrentRuns, 2);
     const a = await startClient("A", service),
       b = await startClient("B", service);
@@ -600,7 +659,10 @@ try {
       leaseTwo = await acquireBrowserTabLease(profile, { maxConcurrentTabs: 2 });
     try {
       const waiting = await startClient("lease-wait", service);
-      await waitFor(async () => (await service.health()).activeRuns === 1, "accepted lease waiter");
+      await waitFor(
+        () => waiting.output.includes("Waiting for ChatGPT browser slot"),
+        "browser lease waiter entered",
+      );
       await stop(waiting);
       await waitFor(
         async () => (await service.health()).activeRuns === 0,

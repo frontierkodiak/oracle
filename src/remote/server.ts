@@ -241,15 +241,52 @@ export async function createRemoteServer(
     }
     if (!admissionEnabled) legacyBusy = true;
     const runStartedAt = Date.now();
+    const controller = new AbortController();
+    let signal = admissionEnabled ? controller.signal : undefined;
+    const onClientGone = () => controller.abort();
+    res.on("close", onClientGone);
+    req.on("aborted", onClientGone);
+    controllers.add(controller);
+    const detachController = () => {
+      res.off("close", onClientGone);
+      req.off("aborted", onClientGone);
+      controllers.delete(controller);
+    };
+    let queuePosition = 0;
+    let slotReady = false;
+    let pendingSlot: Promise<() => void> | undefined;
+    let release: (() => void) | undefined;
+    const reserve = () => {
+      queuePosition = slots.positionFor();
+      pendingSlot = slots.acquire(signal).then((releaseSlot) => {
+        slotReady = true;
+        return releaseSlot;
+      });
+      // A queued request can disconnect before its body finishes parsing.
+      void pendingSlot.catch(() => undefined);
+    };
+    const abandon = async () => {
+      controller.abort();
+      if (pendingSlot)
+        await pendingSlot.then(
+          (releaseSlot) => releaseSlot(),
+          () => {},
+        );
+      detachController();
+      legacyBusy = false;
+    };
+    // Opt-in admission includes body reception, bounding buffered requests and
+    // preserving arrival order even when a later caller uploads faster.
+    if (admissionEnabled) reserve();
     let payload: RemoteRunPayload;
     try {
-      payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload;
+      payload = JSON.parse(await readRequestBody(req, controller.signal)) as RemoteRunPayload;
       if (!payload || typeof payload.prompt !== "string") throw new Error("Missing prompt");
       payload.options ??= {};
       if (payload.browserConfig)
         payload.browserConfig.url = normalizeChatgptUrl(payload.browserConfig.url, CHATGPT_URL);
     } catch {
-      legacyBusy = false;
+      await abandon();
       if (!res.destroyed) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "invalid_request" }));
@@ -257,46 +294,30 @@ export async function createRemoteServer(
       return;
     }
     if (res.destroyed || req.aborted) {
-      legacyBusy = false;
+      await abandon();
       return;
     }
-    // No await between this check, reservation, and headers: delayed body reads cannot overfill the queue.
-    if (slots.isSaturated) {
-      if (!admissionEnabled) legacyBusy = false;
-      refuse();
-      return;
+    if (!admissionEnabled) {
+      signal = payload.options.cancelOnDisconnect === true ? controller.signal : undefined;
+      reserve();
     }
-    const controller = new AbortController();
-    const signal =
-      admissionEnabled || payload.options.cancelOnDisconnect === true
-        ? controller.signal
-        : undefined;
-    const onClientGone = () => controller.abort();
-    res.on("close", onClientGone);
-    req.on("aborted", onClientGone);
-    controllers.add(controller);
-    const queuePosition = slots.positionFor();
-    const pendingSlot = slots.acquire(signal);
     res.writeHead(200, { "Content-Type": "application/x-ndjson" });
     const sendEvent = (event: RemoteRunEvent) => {
       if (!res.destroyed && !res.writableEnded) res.write(`${JSON.stringify(event)}\n`);
     };
-    if (queuePosition > 0)
+    if (queuePosition > 0 && !slotReady)
       sendEvent({
         type: "log",
         message: `[serve] Waiting for a browser slot (position ${queuePosition}; ${slots.activeCount} active).`,
       });
-    let release: (() => void) | undefined;
     try {
-      release = await pendingSlot;
+      release = await pendingSlot!;
       signal?.throwIfAborted();
     } catch (error) {
       release?.();
       legacyBusy = false;
       sendEvent({ type: "error", message: error instanceof Error ? error.message : String(error) });
-      res.off("close", onClientGone);
-      req.off("aborted", onClientGone);
-      controllers.delete(controller);
+      detachController();
       if (!res.destroyed) res.end();
       return;
     }
@@ -476,9 +497,7 @@ export async function createRemoteServer(
         `[serve] Run ${runId} ${cancelled ? "cancelled" : "failed"} after ${Date.now() - runStartedAt}ms: ${message}`,
       );
     } finally {
-      res.off("close", onClientGone);
-      req.off("aborted", onClientGone);
-      controllers.delete(controller);
+      detachController();
       legacyBusy = false;
       release();
       if (!res.destroyed) res.end();
@@ -847,12 +866,23 @@ function classifySourceUrlKind(sourceUrl?: string): RemoteArtifactDescriptor["so
   return "chatgpt-file-endpoint";
 }
 
-async function readRequestBody(req: http.IncomingMessage): Promise<string> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+async function readRequestBody(req: http.IncomingMessage, signal?: AbortSignal): Promise<string> {
+  if (signal?.aborted) {
+    req.destroy();
+    signal.throwIfAborted();
   }
-  return Buffer.concat(chunks).toString("utf8");
+  const onAbort = () => req.destroy();
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    }
+    signal?.throwIfAborted();
+    return Buffer.concat(chunks).toString("utf8");
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 /**

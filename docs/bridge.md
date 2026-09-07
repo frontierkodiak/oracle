@@ -168,3 +168,5 @@ It checks:
 - Bridge does **not** extract/decrypt cookies from arbitrary profiles; the Windows machine keeps the authenticated session locally.
 
 Cancellation also removes Oracle’s attachment input, prompt, and send guards from retained tabs. Guard cleanup runs outside the aborted request scope; it does not cancel provider processing that already received a file or prompt.
+
+With opt-in queue admission, capacity is reserved when authenticated request headers arrive, before buffering the JSON body. Active/queued health counts include body reception; invalid or disconnected uploads release their reservation. This bounds concurrent body buffers by the configured active-plus-queued capacity and preserves admission order across slow uploads. The existing individual payload-size policy is unchanged.

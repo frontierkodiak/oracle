@@ -61,7 +61,7 @@ test("legacy default refuses a second caller with HTTP 409", async () => {
   }
 });
 
-test("simultaneously completed request bodies cannot exceed the queue bound", async () => {
+test("queue capacity is reserved before concurrent request bodies are buffered", async () => {
   const finishes: (() => void)[] = [];
   const server = await createRemoteServer(
     { host: "127.0.0.1", port: 0, token, logger: () => {}, maxConcurrentRuns: 1, maxQueuedRuns: 1 },
@@ -105,14 +105,15 @@ test("simultaneously completed request bodies cannot exceed the queue bound", as
     return request;
   });
   try {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    for (const request of requests) request.end(payload.slice(1));
     await vi.waitFor(() => expect(codes.filter((code) => code === 503)).toHaveLength(4));
+    expect(finishes).toHaveLength(0);
+    for (const request of requests) request.end(payload.slice(1));
     expect(await health(server.port)).toMatchObject({
       activeRuns: 1,
       queuedRuns: 1,
       maxQueuedRuns: 1,
     });
+    await vi.waitFor(() => expect(finishes).toHaveLength(1));
     finishes.shift()?.();
     await vi.waitFor(() => expect(finishes).toHaveLength(1));
     finishes.shift()?.();
@@ -185,5 +186,107 @@ test("explicit cancellation refuses an old host before starting a run", async ()
     expect(posts).toBe(0);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+function partialRequest(port: number, prompt: string) {
+  const body = JSON.stringify({ prompt, options: {}, browserConfig: {} });
+  let finish!: (code: number) => void;
+  const completed = new Promise<number>((resolve) => {
+    finish = resolve;
+  });
+  const req = http.request(
+    {
+      host: "127.0.0.1",
+      port,
+      path: "/runs",
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Length": Buffer.byteLength(body) },
+    },
+    (response) => {
+      response.resume();
+      response.on("end", () => finish(response.statusCode ?? 0));
+    },
+  );
+  req.on("error", () => finish(-1));
+  req.write(body.slice(0, 1));
+  return { req, completed, end: () => req.end(body.slice(1)) };
+}
+
+test("slow body reception retains FIFO order over a later complete body", async () => {
+  const started: string[] = [];
+  const server = await createRemoteServer(
+    { host: "127.0.0.1", port: 0, token, logger: () => {}, maxConcurrentRuns: 1, maxQueuedRuns: 1 },
+    {
+      runBrowser: async (options) => {
+        started.push(options.prompt);
+        return result;
+      },
+    },
+  );
+  const first = partialRequest(server.port, "first");
+  let second: ReturnType<typeof partialRequest> | undefined;
+  try {
+    await vi.waitFor(async () =>
+      expect(await health(server.port)).toMatchObject({ activeRuns: 1 }),
+    );
+    second = partialRequest(server.port, "second");
+    second.end();
+    await vi.waitFor(async () =>
+      expect(await health(server.port)).toMatchObject({ queuedRuns: 1 }),
+    );
+    expect(started).toEqual([]);
+    first.end();
+    expect(await first.completed).toBe(200);
+    expect(await second.completed).toBe(200);
+    expect(started).toEqual(["first", "second"]);
+  } finally {
+    first.req.destroy();
+    second?.req.destroy();
+    await server.close();
+  }
+});
+
+test("invalid and disconnected incomplete bodies release their reservations", async () => {
+  const runBrowser = vi.fn(async () => result);
+  const server = await createRemoteServer(
+    { host: "127.0.0.1", port: 0, token, logger: () => {}, maxConcurrentRuns: 1, maxQueuedRuns: 1 },
+    { runBrowser },
+  );
+  let active: ReturnType<typeof partialRequest> | undefined;
+  let queued: ReturnType<typeof partialRequest> | undefined;
+  try {
+    const bad = await fetch(`http://127.0.0.1:${server.port}/runs`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: "{",
+      signal: AbortSignal.timeout(3000),
+    });
+    expect(bad.status).toBe(400);
+    await bad.text();
+    expect(await health(server.port)).toMatchObject({ activeRuns: 0, queuedRuns: 0 });
+    active = partialRequest(server.port, "unfinished-active");
+    await vi.waitFor(async () =>
+      expect(await health(server.port)).toMatchObject({ activeRuns: 1 }),
+    );
+    queued = partialRequest(server.port, "unfinished-queued");
+    await vi.waitFor(async () =>
+      expect(await health(server.port)).toMatchObject({ queuedRuns: 1 }),
+    );
+    queued.req.destroy();
+    await queued.completed;
+    await vi.waitFor(async () =>
+      expect(await health(server.port)).toMatchObject({ queuedRuns: 0 }),
+    );
+    active.req.destroy();
+    await active.completed;
+    await vi.waitFor(async () =>
+      expect(await health(server.port)).toMatchObject({ activeRuns: 0 }),
+    );
+    expect(runBrowser).not.toHaveBeenCalled();
+  } finally {
+    active?.req.destroy();
+    queued?.req.destroy();
+    await server.close();
   }
 });
