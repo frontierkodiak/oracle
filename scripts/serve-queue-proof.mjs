@@ -9,6 +9,10 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const WebSocket = createRequire(require.resolve("chrome-remote-interface"))("ws");
+const WebSocketServer = WebSocket.Server;
 import { Launcher } from "chrome-launcher";
 import CDP from "chrome-remote-interface";
 
@@ -20,6 +24,7 @@ const option = (name) => {
 };
 const captures = option("--captures");
 const baseline = option("--baseline-cli");
+const guardOnly = process.argv.includes("--guard-only");
 const root = await fs.mkdtemp(path.join(os.homedir(), "oracle-serve-queue-proof-"));
 const previousHome = process.env.ORACLE_HOME_DIR;
 process.env.ORACLE_HOME_DIR = path.join(root, "integration-home");
@@ -38,6 +43,8 @@ const chromePath = [
 assert.ok(chromePath, "Chrome/Chromium is required");
 const token = "oracle-queue-synthetic-proof";
 const profile = path.join(root, "profile");
+const guardFile = path.join(root, "guard.txt");
+await fs.writeFile(guardFile, "Synthetic guard cancellation attachment");
 const releases = new Set();
 const submitted = new Map();
 const children = [];
@@ -87,12 +94,25 @@ const page = (name) => `<!doctype html><meta charset="utf-8"><title>Oracle queue
 <h1>Oracle queue fixture</h1><p>Synthetic ${name} run; no provider account.</p><span id="run-name">${name}</span>
 <button data-testid="profile-button">Synthetic profile</button><button data-testid="model-switcher-dropdown-button">GPT-5.5</button>
 <a class="__menu-item" aria-label="Synthetic Chat" href="/c/borrowed-fixture">Synthetic Chat</a>
-<main><div id="turns"></div><form><textarea id="prompt-textarea" name="prompt-textarea" placeholder="Ask anything"></textarea><button type="button" data-testid="send-button">Send</button></form></main>
+<main><div id="turns"></div><form><textarea id="prompt-textarea" name="prompt-textarea" placeholder="Ask anything"></textarea><button type="button" id="composer-plus-btn" aria-expanded="false">+</button><input type="file" id="upload"><div id="chips"></div><button type="button" data-testid="send-button">Send</button></form></main>
 <script>
-const name=${JSON.stringify(name)};let sends=0;
+const name=${JSON.stringify(name)};let sends=0;const files=[];
+window.__oracleProofListeners=new Map();window.__oracleProofArmed=false;
+const add=window.addEventListener.bind(window), remove=window.removeEventListener.bind(window);
+window.addEventListener=(type,handler,...args)=>{
+ add(type,handler,...args);
+ if(window.__oracleProofArmed&&['keydown','keyup','click','beforeinput','input','change'].includes(type)){
+  const listeners=window.__oracleProofListeners.get(type)||new Set();listeners.add(handler);window.__oracleProofListeners.set(type,listeners);
+ }
+
+};
+window.removeEventListener=(type,handler,...args)=>{window.__oracleProofListeners.get(type)?.delete(handler);return remove(type,handler,...args);};
+document.querySelector('#composer-plus-btn').onclick=event=>event.currentTarget.setAttribute('aria-expanded',String(event.currentTarget.getAttribute('aria-expanded')!=='true'));
+document.addEventListener('keydown',event=>{if(event.key==='Escape')document.querySelector('#composer-plus-btn').setAttribute('aria-expanded','false');});
+document.querySelector('#upload').onchange=event=>{for(const file of event.target.files){files.push(file.name);const chip=document.createElement('div');chip.dataset.testid='attachment-chip';chip.textContent=file.name;document.querySelector('#chips').append(chip);}event.target.value='';};
 function send(){
  sends++;const editor=document.querySelector('textarea');const prompt=editor.value;editor.value='';
- const user=document.createElement('article');user.dataset.testid='conversation-turn-0';user.dataset.turn='user';const text=document.createElement('div');text.dataset.messageAuthorRole='user';text.textContent=prompt;user.append(text);document.querySelector('#turns').append(user);
+ const user=document.createElement('article');user.dataset.testid='conversation-turn-0';user.dataset.turn='user';const text=document.createElement('div');text.dataset.messageAuthorRole='user';text.textContent=prompt;user.append(text);for(const name of files){const chip=document.createElement('div');chip.dataset.testid='attachment-chip';chip.textContent=name;user.append(chip);}document.querySelector('#turns').append(user);
  history.replaceState({},'', '/c/queue-'+name);fetch('/submitted/'+name,{method:'POST',body:JSON.stringify({name,sends,url:location.href})});
  const stop=document.createElement('button');stop.dataset.testid='stop-button';stop.type='button';stop.textContent='Stop';document.querySelector('form').append(stop);
  const timer=setInterval(async()=>{const state=await fetch('/release/'+name).then(r=>r.json());if(!state.ready)return;clearInterval(timer);stop.remove();
@@ -115,9 +135,8 @@ function responseFor(url, body = "") {
   if (url.pathname === "/api/auth/session")
     return { mime: "application/json", body: JSON.stringify({ user: { name: "Synthetic" } }) };
   const name =
-    url.pathname === "/c/borrowed-fixture"
-      ? "borrowed"
-      : (url.searchParams.get("name") ?? "warmup");
+    url.searchParams.get("name") ??
+    (url.pathname === "/c/borrowed-fixture" ? "borrowed" : "warmup");
   return { mime: "text/html", body: page(/^[a-zA-Z0-9_-]+$/.test(name) ? name : "warmup") };
 }
 const fixture = http.createServer(async (req, res) => {
@@ -211,7 +230,7 @@ async function startService(name, queued) {
   }, "service readiness");
   return { run, port, home, health };
 }
-async function startClient(name, service, binary = cli) {
+async function startClient(name, service, binary = cli, extraArgs = []) {
   const home = path.join(root, "client-" + name);
   await fs.mkdir(home);
   const args = [
@@ -242,7 +261,7 @@ async function startClient(name, service, binary = cli) {
     "--wait",
     "--verbose",
   ];
-  const run = child(name, args, home);
+  const run = child(name, [...args, ...extraArgs], home);
   run.home = home;
   return run;
 }
@@ -331,6 +350,119 @@ async function delayedProxy(kind) {
   proxies.push(handle);
   return handle;
 }
+// Delay only the acknowledgement: the renderer has finished installing the guard,
+// while Oracle still awaits the real CDP response. Cleanup RPCs remain usable.
+async function guardResponseProxy() {
+  let selected = null,
+    held = null;
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    const upstream = http.request(
+      { host: "127.0.0.1", port: chrome.port, path: req.url, method: req.method },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          let body = Buffer.concat(chunks).toString();
+          try {
+            body = JSON.stringify(JSON.parse(body), (key, value) =>
+              key === "webSocketDebuggerUrl"
+                ? value.replace(/^ws:\/\/[^/]+/, `ws://127.0.0.1:${server.address().port}`)
+                : value,
+            );
+          } catch {}
+          res.writeHead(response.statusCode, {
+            "content-type": response.headers["content-type"] ?? "application/json",
+          });
+          res.end(body);
+        });
+      },
+    );
+    upstream.on("error", () => {
+      res.writeHead(502);
+      res.end();
+    });
+    req.pipe(upstream);
+  });
+  const wss = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) =>
+    wss.handleUpgrade(req, socket, head, (client) => {
+      const remote = new WebSocket(`ws://127.0.0.1:${chrome.port}${req.url}`);
+      sockets.add(client);
+      sockets.add(remote);
+      const waiting = [];
+      const candidates = new Set();
+      client.on("message", (data) => {
+        const message = JSON.parse(data.toString());
+        const expression = message.params?.expression ?? "";
+        if (selected && message.method === "Runtime.evaluate") {
+          const [stage, route] = selected;
+          const match =
+            stage === "file"
+              ? route === "local"
+                ? expression.includes("return { installed: true }")
+                : expression.includes("const base64Data")
+              : stage === "plus"
+                ? expression.includes("const guard = { sawKeyDown: false, clicked: false")
+                : stage === "prompt"
+                  ? expression.includes("guard.fallback = text")
+                  : expression.includes("window.__oracleAttachmentDispatchGuard = guard");
+          if (match) candidates.add(message.id);
+        }
+        if (remote.readyState === WebSocket.OPEN) remote.send(data.toString());
+        else waiting.push(data);
+      });
+      remote.on("open", () => {
+        for (const data of waiting) remote.send(data.toString());
+        waiting.length = 0;
+      });
+      remote.on("message", (data) => {
+        const message = JSON.parse(data.toString());
+        if (selected && !held && candidates.delete(message.id)) {
+          held = { client, data };
+          selected = null;
+          return;
+        }
+        if (client.readyState === WebSocket.OPEN) client.send(data.toString());
+      });
+      client.on("close", () => {
+        remote.close();
+        sockets.delete(client);
+      });
+      remote.on("close", () => {
+        client.close();
+        sockets.delete(remote);
+      });
+      client.on("error", () => {});
+      remote.on("error", () => client.close());
+    }),
+  );
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const release = () => {
+    if (held?.client.readyState === WebSocket.OPEN) held.client.send(held.data.toString());
+    held = null;
+    selected = null;
+  };
+  const handle = {
+    port: server.address().port,
+    arm(stage, route) {
+      release();
+      selected = [stage, route];
+    },
+    held: () => Boolean(held),
+    release,
+    close: async () => {
+      release();
+      for (const socket of sockets) socket.terminate();
+      wss.close();
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+  proxies.push(handle);
+  return handle;
+}
+
 try {
   await fs.mkdir(profile);
   await chrome.launch();
@@ -376,308 +508,459 @@ try {
     filter: [{ type: "page", exclude: false }, { exclude: true }],
   });
 
-  const legacy = await startService("legacy-service", false);
-  const legacyClient = await startClient("legacy", legacy);
-  await waitFor(() => submitted.has("legacy"), "legacy submit");
-  const refused = await fetch(`http://127.0.0.1:${legacy.port}/runs`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ prompt: "overflow", options: {}, browserConfig: {} }),
-  });
-  assert.equal(refused.status, 409);
-  assert.deepEqual(await refused.json(), { error: "busy" });
-  assert.equal((await legacy.health()).admissionMode, "legacy");
-  await finishClient(legacyClient);
-  await stop(legacy.run);
-  results.push({ legacyDefault409: true });
+  if (!guardOnly) {
+    const legacy = await startService("legacy-service", false);
+    const legacyClient = await startClient("legacy", legacy);
+    await waitFor(() => submitted.has("legacy"), "legacy submit");
+    const refused = await fetch(`http://127.0.0.1:${legacy.port}/runs`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ prompt: "overflow", options: {}, browserConfig: {} }),
+    });
+    assert.equal(refused.status, 409);
+    assert.deepEqual(await refused.json(), { error: "busy" });
+    assert.equal((await legacy.health()).admissionMode, "legacy");
+    await finishClient(legacyClient);
+    await stop(legacy.run);
+    results.push({ legacyDefault409: true });
 
-  const service = await startService("queue-service", true);
-  assert.equal((await service.health()).maxConcurrentRuns, 2);
-  const a = await startClient("A", service),
-    b = await startClient("B", service);
-  await waitFor(() => submitted.has("A") && submitted.has("B"), "two active clients");
-  const aTarget = await targetFor("A"),
-    bTarget = await targetFor("B");
-  assert.ok(aTarget && bTarget);
-  assert.notEqual(aTarget.id, bTarget.id);
-  const c = await startClient("C", service);
-  await waitFor(async () => (await service.health()).queuedRuns === 1, "first waiter");
-  const d = await startClient("D", service, baseline ?? cli);
-  await waitFor(async () => (await service.health()).queuedRuns === 2, "second waiter");
-  const overflow = await fetch(`http://127.0.0.1:${service.port}/runs`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ prompt: "overflow", options: {}, browserConfig: {} }),
-  });
-  assert.equal(overflow.status, 503);
-  assert.equal(overflow.headers.get("retry-after"), "60");
-  assert.deepEqual(await overflow.json(), { error: "queue_full" });
-  await stop(c);
-  await waitFor(async () => (await service.health()).queuedRuns === 1, "queued cancellation");
-  assert.equal(submitted.has("C"), false);
-  const e = await startClient("E", service);
-  await waitFor(async () => (await service.health()).queuedRuns === 2, "replacement waiter");
-  const cancelledAt = Date.now();
-  await stop(a);
-  await waitFor(
-    async () => !(await targetFor("A")) && submitted.has("D"),
-    "active cancellation and FIFO handoff",
-    10000,
-  );
-  assert.equal(submitted.has("E"), false);
-  assert.ok((await CDP.List({ port: chrome.port })).some((t) => t.id === bTarget.id));
-  const activeCancellationMs = Date.now() - cancelledAt;
-  await finishClient(b);
-  await waitFor(() => submitted.has("E"), "next FIFO handoff");
-  await finishClient(d);
-  await finishClient(e);
-  await waitFor(
-    async () => (await service.health()).activeRuns === 0 && (await registry()).length === 0,
-    "empty service and lease registry",
-  );
-  const hostSessions = await fs.readdir(path.join(service.home, "sessions"));
-  assert.ok(new Set(hostSessions).size >= 3);
-  for (const name of ["B", "D", "E"]) {
-    let found = false;
-    for (const id of hostSessions) {
-      const text = await fs
-        .readFile(path.join(service.home, "sessions", id, "artifacts", "transcript.md"), "utf8")
-        .catch(() => "");
-      if (text.includes(`QUEUE_${name}_OK`)) {
-        found = true;
-        for (const other of ["B", "D", "E"].filter((n) => n !== name))
-          assert.ok(!text.includes(`QUEUE_${other}_OK`));
+    const service = await startService("queue-service", true);
+    assert.equal((await service.health()).maxConcurrentRuns, 2);
+    const a = await startClient("A", service),
+      b = await startClient("B", service);
+    await waitFor(() => submitted.has("A") && submitted.has("B"), "two active clients");
+    const aTarget = await targetFor("A"),
+      bTarget = await targetFor("B");
+    assert.ok(aTarget && bTarget);
+    assert.notEqual(aTarget.id, bTarget.id);
+    const c = await startClient("C", service);
+    await waitFor(async () => (await service.health()).queuedRuns === 1, "first waiter");
+    const d = await startClient("D", service, baseline ?? cli);
+    await waitFor(async () => (await service.health()).queuedRuns === 2, "second waiter");
+    const overflow = await fetch(`http://127.0.0.1:${service.port}/runs`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ prompt: "overflow", options: {}, browserConfig: {} }),
+    });
+    assert.equal(overflow.status, 503);
+    assert.equal(overflow.headers.get("retry-after"), "60");
+    assert.deepEqual(await overflow.json(), { error: "queue_full" });
+    await stop(c);
+    await waitFor(async () => (await service.health()).queuedRuns === 1, "queued cancellation");
+    assert.equal(submitted.has("C"), false);
+    const e = await startClient("E", service);
+    await waitFor(async () => (await service.health()).queuedRuns === 2, "replacement waiter");
+    const cancelledAt = Date.now();
+    await stop(a);
+    await waitFor(
+      async () => !(await targetFor("A")) && submitted.has("D"),
+      "active cancellation and FIFO handoff",
+      10000,
+    );
+    assert.equal(submitted.has("E"), false);
+    assert.ok((await CDP.List({ port: chrome.port })).some((t) => t.id === bTarget.id));
+    const activeCancellationMs = Date.now() - cancelledAt;
+    await finishClient(b);
+    await waitFor(() => submitted.has("E"), "next FIFO handoff");
+    await finishClient(d);
+    await finishClient(e);
+    await waitFor(
+      async () => (await service.health()).activeRuns === 0 && (await registry()).length === 0,
+      "empty service and lease registry",
+    );
+    const hostSessions = await fs.readdir(path.join(service.home, "sessions"));
+    assert.ok(new Set(hostSessions).size >= 3);
+    for (const name of ["B", "D", "E"]) {
+      let found = false;
+      for (const id of hostSessions) {
+        const text = await fs
+          .readFile(path.join(service.home, "sessions", id, "artifacts", "transcript.md"), "utf8")
+          .catch(() => "");
+        if (text.includes(`QUEUE_${name}_OK`)) {
+          found = true;
+          for (const other of ["B", "D", "E"].filter((n) => n !== name))
+            assert.ok(!text.includes(`QUEUE_${other}_OK`));
+        }
       }
+      assert.ok(found, `missing host transcript ${name}`);
     }
-    assert.ok(found, `missing host transcript ${name}`);
-  }
-  results.push({
-    effectiveHostCap: 2,
-    overflow503: true,
-    fifo: ["D", "E"],
-    queuedCancelledWithoutSubmit: true,
-    activeCancelledTargetClosed: true,
-    activeCancellationMs,
-    peerSurvived: true,
-    isolatedHostSessions: true,
-    priorClientCompleted: Boolean(baseline),
-  });
+    results.push({
+      effectiveHostCap: 2,
+      overflow503: true,
+      fifo: ["D", "E"],
+      queuedCancelledWithoutSubmit: true,
+      activeCancelledTargetClosed: true,
+      activeCancellationMs,
+      peerSurvived: true,
+      isolatedHostSessions: true,
+      priorClientCompleted: Boolean(baseline),
+    });
 
-  const leaseOne = await acquireBrowserTabLease(profile, { maxConcurrentTabs: 2 }),
-    leaseTwo = await acquireBrowserTabLease(profile, { maxConcurrentTabs: 2 });
-  try {
-    const waiting = await startClient("lease-wait", service);
-    await waitFor(async () => (await service.health()).activeRuns === 1, "accepted lease waiter");
-    await stop(waiting);
-    await waitFor(
-      async () => (await service.health()).activeRuns === 0,
-      "lease waiter cancellation",
-    );
-    assert.equal(submitted.has("lease-wait"), false);
-    assert.deepEqual((await registry()).map((l) => l.id).sort(), [leaseOne.id, leaseTwo.id].sort());
-  } finally {
-    await leaseOne.release();
-    await leaseTwo.release();
-  }
-  await stop(service.run);
-  results.push({ leaseWaitCancelled: true, foreignLeasesPreserved: true });
-
-  let heldLock;
-  let lockPromise;
-  const lockedController = makeController();
-  let lockTarget;
-  let sawLock = false;
-  const locked = startIntegration({
-    prompt: "synthetic lock wait",
-    signal: lockedController.signal,
-    config: {
-      manualLogin: true,
-      manualLoginProfileDir: profile,
-      keepBrowser: true,
-      modelStrategy: "ignore",
-      profileLockTimeoutMs: 20000,
-      timeoutMs: 30000,
-      chatgptUrl: urlFor("lock-wait"),
-      archiveConversations: "never",
-    },
-    closeOwnedTabOnCancel: true,
-    runtimeHintCb: async (hint) => {
-      lockTarget ??= hint.chromeTargetId;
-      if (lockTarget && !lockPromise)
-        lockPromise = acquireProfileRunLock(profile, { timeoutMs: 1000 });
-      if (lockPromise) heldLock = await lockPromise;
-    },
-    log: (message) => {
-      if (message.includes("profile lock held")) sawLock = true;
-    },
-  });
-  locked.catch(() => {});
-  try {
-    await waitFor(() => sawLock && lockTarget, "profile lock wait");
-    lockedController.abort();
-    await assert.rejects(locked, /cancelled/);
-    assert.ok(existsSync(heldLock.path));
-    assert.equal(JSON.parse(await fs.readFile(heldLock.path, "utf8")).lockId, heldLock.lockId);
-    assert.ok(!(await CDP.List({ port: chrome.port })).some((t) => t.id === lockTarget));
-    assert.equal(submitted.has("lock-wait"), false);
-  } finally {
-    lockedController.abort();
-    await locked.catch(() => {});
-    await heldLock?.release();
-  }
-  results.push({
-    profileLockWaitCancelled: true,
-    lockOwnerPreserved: true,
-    ownedTargetClosed: true,
-  });
-
-  const borrowed = await CDP.New({
-    port: chrome.port,
-    url: "about:blank",
-  });
-  await waitFor(() => interceptedTargets.has(borrowed.id), "borrowed target interception");
-  const borrowedInspector = await CDP({ port: chrome.port, target: borrowed.id });
-  await borrowedInspector.Page.navigate({ url: "https://chatgpt.com/c/borrowed-fixture" });
-  await borrowedInspector.close();
-  await waitFor(
-    async () =>
-      (await CDP.List({ port: chrome.port })).some(
-        (target) =>
-          target.id === borrowed.id && target.url === "https://chatgpt.com/c/borrowed-fixture",
-      ),
-    "borrowed page navigation",
-  );
-  const borrowedController = makeController();
-  const borrowing = startIntegration({
-    prompt: "synthetic borrowed run",
-    signal: borrowedController.signal,
-    config: {
-      remoteChrome: { host: "127.0.0.1", port: chrome.port },
-      browserTabRef: borrowed.id,
-      keepBrowser: true,
-      modelStrategy: "ignore",
-      timeoutMs: 30000,
-      archiveConversations: "never",
-    },
-  });
-  borrowing.catch(() => {});
-  await waitFor(() => {
-    if (borrowing.observedError)
-      throw new Error(`${borrowing.observedError.message}\n${borrowing.observedLogs.join("\n")}`);
-    return submitted.has("borrowed");
-  }, "borrowed target submit");
-  borrowedController.abort();
-  await assert.rejects(borrowing, /cancelled/);
-  assert.ok((await CDP.List({ port: chrome.port })).some((t) => t.id === borrowed.id));
-  await CDP.Close({ port: chrome.port, id: borrowed.id });
-  results.push({ borrowedTargetPreservedOnCancel: true });
-
-  const proxy = await delayedProxy("target");
-  const lateController = makeController();
-  const late = startIntegration({
-    prompt: "no late submit",
-    signal: lateController.signal,
-    config: {
-      remoteChrome: { host: "127.0.0.1", port: proxy.port },
-      modelStrategy: "ignore",
-      timeoutMs: 30000,
-      chatgptUrl: urlFor("late"),
-    },
-  });
-  late.catch(() => {});
-  try {
-    await waitFor(() => proxy.observed()?.id, "created target with delayed reply");
-    const id = proxy.observed().id;
-    lateController.abort();
-    await assert.rejects(late, /cancelled/);
-    proxy.release();
-    await waitFor(
-      async () => !(await CDP.List({ port: chrome.port })).some((t) => t.id === id),
-      "late target cleanup",
-    );
-    assert.equal(submitted.has("late"), false);
-  } finally {
-    lateController.abort();
-    proxy.release();
-    await late.catch(() => {});
-    await proxy.close();
-  }
-  results.push({ delayedCdpSetupCancelled: true, lateOwnedTargetClosed: true });
-
-  const acquisitionProxy = await delayedProxy("version");
-  await writeDevToolsActivePort(profile, acquisitionProxy.port);
-  const acquisitionController = makeController();
-  const acquiring = startIntegration({
-    prompt: "no acquisition submit",
-    signal: acquisitionController.signal,
-    config: {
-      manualLogin: true,
-      manualLoginProfileDir: profile,
-      keepBrowser: true,
-      modelStrategy: "ignore",
-      timeoutMs: 30000,
-      reuseChromeWaitMs: 0,
-      chatgptUrl: urlFor("acquisition"),
-    },
-  });
-  acquiring.catch(() => {});
-  try {
-    await waitFor(() => acquisitionProxy.observed(), "pending Chrome acquisition");
-    acquisitionController.abort();
-    await assert.rejects(acquiring, /cancelled/);
-    acquisitionProxy.release();
-    await waitFor(acquisitionProxy.idle, "acquisition response drain");
-    await pause(100);
-    assert.equal(submitted.has("acquisition"), false);
-  } finally {
-    acquisitionController.abort();
-    acquisitionProxy.release();
-    await acquiring.catch(() => {});
-    await acquisitionProxy.close();
-    await writeDevToolsActivePort(profile, chrome.port);
-  }
-  results.push({ chromeAcquisitionCancelled: true, sharedChromePreserved: true });
-
-  const temporaryController = makeController();
-  let temporaryPid;
-  let temporaryProfile;
-  const temporary = startIntegration({
-    prompt: "no temporary submit",
-    signal: temporaryController.signal,
-    config: {
-      chromePath,
-      headless: true,
-      cookieSync: false,
-      modelStrategy: "ignore",
-      debugPort: await unusedPort(),
-    },
-    log: (message) => {
-      if (message.startsWith("Created temporary Chrome profile at "))
-        temporaryProfile = message.slice("Created temporary Chrome profile at ".length);
-      if (message.startsWith("Launched Chrome")) {
-        temporaryPid = Number(message.match(/pid (\d+)/)?.[1]);
-        temporaryController.abort();
-      }
-    },
-  });
-  await assert.rejects(temporary, /cancelled/);
-  assert.ok(temporaryPid && temporaryProfile);
-  await waitFor(() => {
+    const leaseOne = await acquireBrowserTabLease(profile, { maxConcurrentTabs: 2 }),
+      leaseTwo = await acquireBrowserTabLease(profile, { maxConcurrentTabs: 2 });
     try {
-      process.kill(temporaryPid, 0);
-      return false;
-    } catch {
-      return true;
+      const waiting = await startClient("lease-wait", service);
+      await waitFor(async () => (await service.health()).activeRuns === 1, "accepted lease waiter");
+      await stop(waiting);
+      await waitFor(
+        async () => (await service.health()).activeRuns === 0,
+        "lease waiter cancellation",
+      );
+      assert.equal(submitted.has("lease-wait"), false);
+      assert.deepEqual(
+        (await registry()).map((l) => l.id).sort(),
+        [leaseOne.id, leaseTwo.id].sort(),
+      );
+    } finally {
+      await leaseOne.release();
+      await leaseTwo.release();
     }
-  }, "late temporary Chrome termination");
-  await waitFor(() => !existsSync(temporaryProfile), "temporary profile cleanup");
-  results.push({
-    temporaryLaunchCancelled: true,
-    lateChromeClosed: true,
-    temporaryProfileRemoved: true,
-  });
-  assert.equal(interceptError, undefined);
-  assert.equal((await registry()).length, 0);
+    await stop(service.run);
+    results.push({ leaseWaitCancelled: true, foreignLeasesPreserved: true });
+
+    let heldLock;
+    let lockPromise;
+    const lockedController = makeController();
+    let lockTarget;
+    let sawLock = false;
+    const locked = startIntegration({
+      prompt: "synthetic lock wait",
+      signal: lockedController.signal,
+      config: {
+        manualLogin: true,
+        manualLoginProfileDir: profile,
+        keepBrowser: true,
+        modelStrategy: "ignore",
+        profileLockTimeoutMs: 20000,
+        timeoutMs: 30000,
+        chatgptUrl: urlFor("lock-wait"),
+        archiveConversations: "never",
+      },
+      closeOwnedTabOnCancel: true,
+      runtimeHintCb: async (hint) => {
+        lockTarget ??= hint.chromeTargetId;
+        if (lockTarget && !lockPromise)
+          lockPromise = acquireProfileRunLock(profile, { timeoutMs: 1000 });
+        if (lockPromise) heldLock = await lockPromise;
+      },
+      log: (message) => {
+        if (message.includes("profile lock held")) sawLock = true;
+      },
+    });
+    locked.catch(() => {});
+    try {
+      await waitFor(() => sawLock && lockTarget, "profile lock wait");
+      lockedController.abort();
+      await assert.rejects(locked, /cancelled/);
+      assert.ok(existsSync(heldLock.path));
+      assert.equal(JSON.parse(await fs.readFile(heldLock.path, "utf8")).lockId, heldLock.lockId);
+      assert.ok(!(await CDP.List({ port: chrome.port })).some((t) => t.id === lockTarget));
+      assert.equal(submitted.has("lock-wait"), false);
+    } finally {
+      lockedController.abort();
+      await locked.catch(() => {});
+      await heldLock?.release();
+    }
+    results.push({
+      profileLockWaitCancelled: true,
+      lockOwnerPreserved: true,
+      ownedTargetClosed: true,
+    });
+
+    const borrowed = await CDP.New({
+      port: chrome.port,
+      url: "about:blank",
+    });
+    await waitFor(() => interceptedTargets.has(borrowed.id), "borrowed target interception");
+    const borrowedInspector = await CDP({ port: chrome.port, target: borrowed.id });
+    await borrowedInspector.Page.navigate({ url: "https://chatgpt.com/c/borrowed-fixture" });
+    await borrowedInspector.close();
+    await waitFor(
+      async () =>
+        (await CDP.List({ port: chrome.port })).some(
+          (target) =>
+            target.id === borrowed.id && target.url === "https://chatgpt.com/c/borrowed-fixture",
+        ),
+      "borrowed page navigation",
+    );
+    const borrowedController = makeController();
+    const borrowing = startIntegration({
+      prompt: "synthetic borrowed run",
+      signal: borrowedController.signal,
+      config: {
+        remoteChrome: { host: "127.0.0.1", port: chrome.port },
+        browserTabRef: borrowed.id,
+        keepBrowser: true,
+        modelStrategy: "ignore",
+        timeoutMs: 30000,
+        archiveConversations: "never",
+      },
+    });
+    borrowing.catch(() => {});
+    await waitFor(() => {
+      if (borrowing.observedError)
+        throw new Error(`${borrowing.observedError.message}\n${borrowing.observedLogs.join("\n")}`);
+      return submitted.has("borrowed");
+    }, "borrowed target submit");
+    borrowedController.abort();
+    await assert.rejects(borrowing, /cancelled/);
+    assert.ok((await CDP.List({ port: chrome.port })).some((t) => t.id === borrowed.id));
+    await CDP.Close({ port: chrome.port, id: borrowed.id });
+    results.push({ borrowedTargetPreservedOnCancel: true });
+  }
+
+  const guardProxy = await guardResponseProxy();
+  await writeDevToolsActivePort(profile, guardProxy.port);
+  // Cancel while the actual guard registration/transfer response is in flight.
+  for (const [stage, route] of [
+    ["file", "local"],
+    ["file", "remote"],
+    ["prompt", "local"],
+    ["prompt", "remote"],
+    ["plus", "local"],
+    ["send", "local"],
+    ["send", "remote"],
+  ]) {
+    console.error(`Checking ${stage} guard cancellation on ${route} Chrome`);
+    const name = `guard-${stage}`;
+    const target = await CDP.New({ port: chrome.port, url: "about:blank" });
+    await waitFor(() => interceptedTargets.has(target.id), "guard target interception");
+    const inspector = await CDP({ port: chrome.port, target: target.id });
+    await inspector.Page.navigate({ url: `https://chatgpt.com/c/borrowed-fixture?name=${name}` });
+    await waitFor(
+      async () =>
+        (
+          await inspector.Runtime.evaluate({
+            expression: "Boolean(window.__oracleProofListeners)",
+            returnByValue: true,
+          })
+        ).result.value,
+      "guard fixture ready",
+    );
+    await inspector.Runtime.evaluate({ expression: "window.__oracleProofArmed = true" });
+    guardProxy.arm(stage, route);
+    const controller = makeController();
+    const pending = startIntegration({
+      prompt: "Synthetic guarded attachment prompt",
+      attachments: [{ path: guardFile, displayPath: "guard.txt" }],
+      signal: controller.signal,
+      config: {
+        ...(route === "remote"
+          ? { remoteChrome: { host: "127.0.0.1", port: guardProxy.port } }
+          : { manualLogin: true, manualLoginProfileDir: profile, chromePath, headless: true }),
+        browserTabRef: target.id,
+        keepBrowser: true,
+        modelStrategy: "ignore",
+        timeoutMs: 30000,
+        archiveConversations: "never",
+      },
+    });
+    try {
+      await waitFor(() => {
+        if (pending.observedError) throw pending.observedError;
+        return guardProxy.held();
+      }, `${stage} guard installed`);
+      const activeGuards = (
+        await inspector.Runtime.evaluate({
+          expression: `Object.keys(window.__oracleAttachmentInputGuards ?? {}).length + Object.keys(window.__oracleAttachmentPromptGuards ?? {}).length + Object.keys(window.__oracleAttachmentPlusGuards ?? {}).length + Number(Boolean(window.__oracleAttachmentDispatchGuard))`,
+          returnByValue: true,
+        })
+      ).result.value;
+      if (!(stage === "file" && route === "remote"))
+        assert.ok(activeGuards > 0, "guard must be installed before abort");
+      controller.abort();
+      await assert.rejects(pending, /cancelled/);
+      guardProxy.release();
+      const observed = (
+        await inspector.Runtime.evaluate({
+          expression: `({
+        listeners: [...window.__oracleProofListeners.values()].reduce((sum, set) => sum + set.size, 0),
+        remaining: [...window.__oracleProofListeners].filter(([, set]) => set.size).map(([type, set]) => [type, [...set].map(fn => fn.name)]),
+        file: Object.keys(window.__oracleAttachmentInputGuards ?? {}).length,
+        prompt: Object.keys(window.__oracleAttachmentPromptGuards ?? {}).length,
+        plus: Object.keys(window.__oracleAttachmentPlusGuards ?? {}).length,
+        nodes: Object.keys(window.__oracleAttachmentPlusNodes ?? {}).length,
+        send: Boolean(window.__oracleAttachmentDispatchGuard)
+      })`,
+          returnByValue: true,
+        })
+      ).result.value;
+      assert.deepEqual(observed, {
+        listeners: 0,
+        remaining: [],
+        file: 0,
+        prompt: 0,
+        plus: 0,
+        nodes: 0,
+        send: false,
+      });
+      assert.equal(submitted.has(name), false);
+      assert.ok((await CDP.List({ port: chrome.port })).some((t) => t.id === target.id));
+      results.push({
+        guardCancellation: stage,
+        route,
+        guardObservedBeforeAbort: activeGuards > 0,
+        listenersRemoved: true,
+        noSubmit: true,
+        borrowedTargetPreserved: true,
+      });
+    } finally {
+      controller.abort();
+      guardProxy.release();
+      await pending.catch(() => {});
+      await inspector.close();
+      await CDP.Close({ port: chrome.port, id: target.id }).catch(() => {});
+    }
+  }
+
+  console.error("Checking built CLI/service cancellation with an active prompt guard");
+  const guardService = await startService("guard-service", true);
+  guardProxy.arm("prompt", "local");
+  const guardClient = await startClient("guard-prompt", guardService, cli, [
+    "--file",
+    guardFile,
+    "--browser-attachments",
+    "always",
+  ]);
+  try {
+    await waitFor(() => {
+      if (guardClient.done) throw new Error(guardClient.output);
+      return guardProxy.held();
+    }, "service prompt guard installed");
+    const ownedTarget = (await CDP.List({ port: chrome.port })).find(
+      (target) => target.url === urlFor("guard-prompt"),
+    );
+    assert.ok(ownedTarget);
+    await stop(guardClient);
+    await waitFor(
+      async () => (await guardService.health()).activeRuns === 0,
+      "guarded service cancellation",
+    );
+    guardProxy.release();
+    assert.equal(submitted.has("guard-prompt"), false);
+    assert.equal(
+      (await CDP.List({ port: chrome.port })).some((t) => t.id === ownedTarget.id),
+      false,
+    );
+    results.push({ builtClientGuardCancellation: true, noSubmit: true, ownedTargetClosed: true });
+  } finally {
+    guardProxy.release();
+    await stop(guardClient);
+    await stop(guardService.run);
+  }
+
+  await writeDevToolsActivePort(profile, chrome.port);
+  await guardProxy.close();
+  proxies.splice(proxies.indexOf(guardProxy), 1);
+
+  if (!guardOnly) {
+    const proxy = await delayedProxy("target");
+    const lateController = makeController();
+    const late = startIntegration({
+      prompt: "no late submit",
+      signal: lateController.signal,
+      config: {
+        remoteChrome: { host: "127.0.0.1", port: proxy.port },
+        modelStrategy: "ignore",
+        timeoutMs: 30000,
+        chatgptUrl: urlFor("late"),
+      },
+    });
+    late.catch(() => {});
+    try {
+      await waitFor(() => proxy.observed()?.id, "created target with delayed reply");
+      const id = proxy.observed().id;
+      lateController.abort();
+      await assert.rejects(late, /cancelled/);
+      proxy.release();
+      await waitFor(
+        async () => !(await CDP.List({ port: chrome.port })).some((t) => t.id === id),
+        "late target cleanup",
+      );
+      assert.equal(submitted.has("late"), false);
+    } finally {
+      lateController.abort();
+      proxy.release();
+      await late.catch(() => {});
+      await proxy.close();
+    }
+    results.push({ delayedCdpSetupCancelled: true, lateOwnedTargetClosed: true });
+
+    const acquisitionProxy = await delayedProxy("version");
+    await writeDevToolsActivePort(profile, acquisitionProxy.port);
+    const acquisitionController = makeController();
+    const acquiring = startIntegration({
+      prompt: "no acquisition submit",
+      signal: acquisitionController.signal,
+      config: {
+        manualLogin: true,
+        manualLoginProfileDir: profile,
+        keepBrowser: true,
+        modelStrategy: "ignore",
+        timeoutMs: 30000,
+        reuseChromeWaitMs: 0,
+        chatgptUrl: urlFor("acquisition"),
+      },
+    });
+    acquiring.catch(() => {});
+    try {
+      await waitFor(() => acquisitionProxy.observed(), "pending Chrome acquisition");
+      acquisitionController.abort();
+      await assert.rejects(acquiring, /cancelled/);
+      acquisitionProxy.release();
+      await waitFor(acquisitionProxy.idle, "acquisition response drain");
+      await pause(100);
+      assert.equal(submitted.has("acquisition"), false);
+    } finally {
+      acquisitionController.abort();
+      acquisitionProxy.release();
+      await acquiring.catch(() => {});
+      await acquisitionProxy.close();
+      await writeDevToolsActivePort(profile, chrome.port);
+    }
+    results.push({ chromeAcquisitionCancelled: true, sharedChromePreserved: true });
+
+    const temporaryController = makeController();
+    let temporaryPid;
+    let temporaryProfile;
+    const temporary = startIntegration({
+      prompt: "no temporary submit",
+      signal: temporaryController.signal,
+      config: {
+        chromePath,
+        headless: true,
+        cookieSync: false,
+        modelStrategy: "ignore",
+        debugPort: await unusedPort(),
+      },
+      log: (message) => {
+        if (message.startsWith("Created temporary Chrome profile at "))
+          temporaryProfile = message.slice("Created temporary Chrome profile at ".length);
+        if (message.startsWith("Launched Chrome")) {
+          temporaryPid = Number(message.match(/pid (\d+)/)?.[1]);
+          temporaryController.abort();
+        }
+      },
+    });
+    await assert.rejects(temporary, /cancelled/);
+    assert.ok(temporaryPid && temporaryProfile);
+    await waitFor(() => {
+      try {
+        process.kill(temporaryPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    }, "late temporary Chrome termination");
+    await waitFor(() => !existsSync(temporaryProfile), "temporary profile cleanup");
+    results.push({
+      temporaryLaunchCancelled: true,
+      lateChromeClosed: true,
+      temporaryProfileRemoved: true,
+    });
+    assert.equal(interceptError, undefined);
+    assert.equal((await registry()).length, 0);
+  }
   console.log(JSON.stringify({ provider: "synthetic local renderer", results }, null, 2));
 } finally {
   for (const controller of controllers) controller.abort();

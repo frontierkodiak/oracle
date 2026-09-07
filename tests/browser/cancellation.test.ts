@@ -113,3 +113,22 @@ test("cancelled tab and profile waiters never steal their owners' locks", async 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("cleanup CDP calls survive abort while ordinary calls remain cancelled", async () => {
+  const controller = new AbortController();
+  const scope = new BrowserCancellation(controller.signal);
+  const evaluate = vi.fn(async () => ({ result: { value: true } }));
+  const client = scope.client({ Runtime: { evaluate } } as never);
+  controller.abort();
+  try {
+    await expect(
+      withoutBrowserCancellation(() => client.Runtime.evaluate({ expression: "cleanup" })),
+    ).resolves.toMatchObject({ result: { value: true } });
+    await expect(client.Runtime.evaluate({ expression: "ordinary" })).rejects.toMatchObject({
+      name: "BrowserRunCancelledError",
+    });
+    expect(evaluate).toHaveBeenCalledExactlyOnceWith({ expression: "cleanup" });
+  } finally {
+    scope.dispose();
+  }
+});

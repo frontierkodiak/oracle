@@ -2,14 +2,17 @@
 // Built CLI + real Chrome proof against a synthetic ChatGPT-shaped page.
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { Launcher } from "chrome-launcher";
 import CDP from "chrome-remote-interface";
+import { writeChromePid, writeDevToolsActivePort } from "../dist/src/browser/profileState.js";
 
 const repo = fileURLToPath(new URL("..", import.meta.url));
 const option = (name) => {
@@ -39,16 +42,16 @@ const page = (
 <h1>Oracle effort readiness fixture</h1><p>Synthetic controls; no provider account or generated model answer.</p>
 <button data-testid="profile-button">Synthetic profile</button><button data-testid="model-switcher-dropdown-button">GPT-5.6 Sol</button>
 <main><div id="turns"></div><form><textarea id="prompt-textarea" name="prompt-textarea" placeholder="Ask anything"></textarea>
-<button id="pill" type="button" class="__composer-pill" aria-haspopup="menu" aria-controls="menu" aria-expanded="false">Extra High</button>
+<button id="pill" type="button" class="__composer-pill" aria-haspopup="menu" aria-controls="menu" aria-expanded="false">${mode === "already" ? "Pro" : "Extra High"}</button>
 <button type="button" data-testid="send-button">Send</button></form></main>
 <div id="menu" role="menu" style="display:none"><div data-testid="composer-intelligence-picker-content" role="group"><div data-model-selection-view="true"><div id="simple" data-testid="composer-model-picker-slider-simple-view" data-active="true"></div></div></div></div>
 <script>
 const mode=${JSON.stringify(mode)}, labels=['Instant','Medium','High','Extra High','Pro'];
-let index=3, opened=false; const state={mode,keys:[],sends:0,ready:false,tier:'Extra High'};
+let index=${mode === "already" ? 4 : 3}, opened=false; const state={mode,keys:[],sends:0,ready:false,tier:labels[index]};
 const report=()=>fetch('/events/'+mode,{method:'POST',body:JSON.stringify(state)});
 const close=()=>{document.querySelector('#menu').style.display='none';document.querySelector('#pill').setAttribute('aria-expanded','false');};
 const mount=()=>{
- const simple=document.querySelector('#simple');simple.innerHTML='<div id="control" tabindex="0" role="menuitem" aria-label="Power" aria-describedby="announcement"><div data-model-reasoning-effort-slider><div role="slider" aria-hidden="true" aria-valuemin="0" aria-valuemax="4" aria-valuenow="3"></div></div></div><div id="announcement">Extra High, 4 of 5.</div>';
+ const simple=document.querySelector('#simple');simple.innerHTML='<div id="control" tabindex="0" role="menuitem" aria-label="Power" aria-describedby="announcement"><div data-model-reasoning-effort-slider><div role="slider" aria-hidden="true" aria-valuemin="0" aria-valuemax="4" aria-valuenow="'+index+'"></div></div></div><div id="announcement">'+labels[index]+', '+(index+1)+' of 5.</div>';
  const control=document.querySelector('#control');
  if(mode==='geometry'||mode==='never')control.className='hidden';
  else state.ready=true;
@@ -138,6 +141,108 @@ async function captureSelectedTier(name) {
   }
 }
 const results = [];
+const serviceToken = "oracle-effort-fixture-only";
+let service;
+let serviceDone;
+let servicePort;
+let interceptor;
+let interceptorError;
+async function startBridge() {
+  await writeChromePid(path.join(root, "chrome"), chrome.pid);
+  await writeDevToolsActivePort(path.join(root, "chrome"), chrome.port);
+  const version = await fetch(`http://127.0.0.1:${chrome.port}/json/version`).then((r) => r.json());
+  interceptor = await CDP({ target: version.webSocketDebuggerUrl });
+  interceptor.on("Target.attachedToTarget", ({ sessionId, targetInfo }) => {
+    if (targetInfo.type !== "page") return;
+    void (async () => {
+      await interceptor.send(
+        "Fetch.enable",
+        { patterns: [{ urlPattern: "https://chatgpt.com/*", requestStage: "Request" }] },
+        sessionId,
+      );
+      await interceptor.send("Runtime.runIfWaitingForDebugger", {}, sessionId);
+    })().catch((error) => {
+      interceptorError = error;
+    });
+  });
+  interceptor.on("Fetch.requestPaused", (event, sessionId) => {
+    const auth = new URL(event.request.url).pathname === "/api/auth/session";
+    void interceptor
+      .send(
+        "Fetch.fulfillRequest",
+        {
+          requestId: event.requestId,
+          responseCode: 200,
+          responseHeaders: [
+            { name: "Content-Type", value: auth ? "application/json" : "text/html" },
+          ],
+          body: Buffer.from(
+            auth ? JSON.stringify({ user: { name: "Synthetic" } }) : page("mounted"),
+          ).toString("base64"),
+        },
+        sessionId,
+      )
+      .catch((error) => {
+        interceptorError = error;
+      });
+  });
+  await interceptor.Target.setAutoAttach({
+    autoAttach: true,
+    waitForDebuggerOnStart: true,
+    flatten: true,
+    filter: [{ type: "page", exclude: false }, { exclude: true }],
+  });
+  const reservation = net.createServer();
+  await new Promise((resolve) => reservation.listen(0, "127.0.0.1", resolve));
+  servicePort = reservation.address().port;
+  await new Promise((resolve) => reservation.close(resolve));
+  service = spawn(
+    process.execPath,
+    [
+      path.join(repo, "dist/bin/oracle-cli.js"),
+      "serve",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      String(servicePort),
+      "--token",
+      serviceToken,
+      "--manual-login",
+      "--manual-login-profile-dir",
+      path.join(root, "chrome"),
+    ],
+    {
+      cwd: repo,
+      env: { ...process.env, ORACLE_HOME_DIR: path.join(root, "service-home") },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  let serviceOutput = "";
+  service.stdout.on("data", (d) => {
+    serviceOutput += d;
+  });
+  service.stderr.on("data", (d) => {
+    serviceOutput += d;
+  });
+  serviceDone = new Promise((resolve, reject) => {
+    service.once("error", reject);
+    service.once("exit", resolve);
+  });
+  serviceDone.catch(() => {});
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${servicePort}/health`, {
+        headers: { Authorization: `Bearer ${serviceToken}` },
+        signal: AbortSignal.timeout(500),
+      });
+      if (response.ok) return;
+    } catch {}
+    if (service.exitCode !== null) throw new Error(`Fixture bridge exited: ${serviceOutput}`);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error("Fixture bridge did not become ready");
+}
 try {
   await fs.mkdir(path.join(root, "chrome"));
   await chrome.launch();
@@ -149,7 +254,29 @@ try {
       cli: path.join(repo, "dist/bin/oracle-cli.js"),
       success: mode !== "never",
     })),
+    {
+      name: "candidate-already",
+      mode: "already",
+      strategy: "select",
+      cli: path.join(repo, "dist/bin/oracle-cli.js"),
+      success: true,
+    },
+    {
+      name: "candidate-unverified",
+      mode: "never",
+      level: "standard",
+      cli: path.join(repo, "dist/bin/oracle-cli.js"),
+      success: true,
+    },
+    {
+      name: "candidate-bridge",
+      mode: "mounted",
+      bridge: true,
+      cli: path.join(repo, "dist/bin/oracle-cli.js"),
+      success: true,
+    },
   ]) {
+    if (run.bridge) await startBridge();
     activeRun = run.name;
     submissionCapture = Promise.resolve();
     observations.delete(run.mode);
@@ -162,11 +289,12 @@ try {
       "--model",
       "gpt-5.6-sol",
       "--browser-thinking-time",
-      "pro",
+      run.level ?? "pro",
       "--browser-model-strategy",
-      "current",
-      "--remote-chrome",
-      `127.0.0.1:${chrome.port}`,
+      run.strategy ?? "current",
+      ...(run.bridge
+        ? ["--remote-host", `127.0.0.1:${servicePort}`, "--remote-token", serviceToken]
+        : ["--remote-chrome", `127.0.0.1:${chrome.port}`]),
       "--browser-keep-browser",
       "--chatgpt-url",
       `http://127.0.0.1:${server.address().port}/?mode=${run.mode}`,
@@ -245,12 +373,12 @@ try {
     assert.equal(state.sends, run.success ? 1 : 0, JSON.stringify(state));
     assert.deepEqual(
       state.keys.map((k) => k.key),
-      run.success ? ["ArrowRight"] : [],
+      run.success && run.mode !== "already" && !run.level ? ["ArrowRight"] : [],
       JSON.stringify(state),
     );
     assert.ok(state.keys.every((k) => k.ready));
     if (run.success) {
-      assert.equal(state.sentTier, "Pro");
+      assert.equal(state.sentTier, run.level ? "Extra High" : "Pro");
       assert.match(result.output, /ORACLE_SLIDER_PROOF_OK/);
     } else
       assert.match(
@@ -263,7 +391,36 @@ try {
       await fs.readFile(path.join(home, "sessions", sessions[0], "meta.json"), "utf8"),
     );
     assert.equal(meta.status, run.success ? "completed" : "error");
-    results.push({ name: run.name, exit: result.code, ...state });
+    if (run.success) {
+      assert.equal(meta.browser.thinkingSelection.requestedLevel, run.level ?? "pro");
+      assert.equal(meta.browser.thinkingSelection.verified, !run.level);
+      assert.equal(meta.browser.thinkingSelection.strictFailClosed, !run.level);
+      assert.equal(meta.browser.thinkingSelection.resolvedLabel, run.level ? null : "Pro");
+      assert.equal(
+        meta.browser.thinkingSelection.status,
+        run.level ? "unverified" : run.mode === "already" ? "already-selected" : "switched",
+      );
+      assert.ok(Number.isFinite(Date.parse(meta.browser.thinkingSelection.capturedAt)));
+      const displayed = await promisify(execFile)(
+        process.execPath,
+        [run.cli, "status", sessions[0]],
+        { cwd: repo, env: { ...process.env, ORACLE_HOME_DIR: home }, timeout: 10000 },
+      );
+      assert.match(displayed.stdout, /effort requestedLevel=/);
+      assert.match(displayed.stdout, run.level ? /verified=no/ : /verified=yes/);
+      if (run.bridge) {
+        assert.equal(meta.browser.runtime?.chromePid, undefined);
+        assert.equal(meta.browser.runtime?.chromePort, undefined);
+        assert.equal(meta.browser.runtime?.userDataDir, undefined);
+        assert.equal(interceptorError, undefined);
+      }
+    } else assert.equal(meta.browser?.thinkingSelection, undefined);
+    results.push({
+      name: run.name,
+      exit: result.code,
+      ...state,
+      evidence: meta.browser?.thinkingSelection,
+    });
     for (const target of await CDP.List({ port: chrome.port })) {
       if (target.type === "page" && target.url.includes(`127.0.0.1:${server.address().port}`))
         await CDP.Close({ port: chrome.port, id: target.id });
@@ -271,6 +428,13 @@ try {
   }
   console.log(JSON.stringify({ provider: "synthetic renderer", results }, null, 2));
 } finally {
+  if (service && service.exitCode === null) {
+    service.kill("SIGTERM");
+    const force = setTimeout(() => service.kill("SIGKILL"), 5000);
+    await serviceDone.catch(() => {});
+    clearTimeout(force);
+  }
+  await interceptor?.close().catch(() => {});
   await Promise.resolve(chrome.kill());
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));

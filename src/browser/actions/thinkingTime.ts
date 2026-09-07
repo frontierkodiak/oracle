@@ -1,5 +1,9 @@
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import type { ThinkingTimeLevel } from "../../oracle/types.js";
+import type {
+  BrowserThinkingSelectionEvidence,
+  BrowserThinkingSelectionStatus,
+} from "../../sessionManager.js";
 import {
   MENU_CONTAINER_SELECTOR,
   MENU_ITEM_SELECTOR,
@@ -101,15 +105,15 @@ function logPickerDiagnostic(result: ThinkingTimeOutcome | undefined, logger: Br
 /**
  * Selects a thinking-time level in ChatGPT's composer.
  *
- * Missing controls remain best-effort except Pro Extended, which fails closed
- * unless the selected option is confirmed.
+ * Returns the UI selection observed at capturedAt, not backend attestation.
+ * Explicit Pro and Pro Extended requests still fail closed when unconfirmed.
  */
 export async function ensureThinkingTime(
   Runtime: ChromeClient["Runtime"],
   level: ThinkingTimeLevel,
   logger: BrowserLogger,
   desiredModel?: string | null,
-) {
+): Promise<BrowserThinkingSelectionEvidence> {
   const result = await evaluateThinkingTimeSelection(Runtime, level, desiredModel);
   const capitalizedLevel = level.charAt(0).toUpperCase() + level.slice(1);
   const targetModelKind = inferThinkingTargetModelKind(desiredModel);
@@ -120,14 +124,28 @@ export async function ensureThinkingTime(
   const strictProEffort =
     level === "pro" ||
     ((targetModelKind === "pro" || observedModelKind === "pro") && level === "extended");
+  const evidence = (
+    status: BrowserThinkingSelectionStatus,
+    resolvedLabel: string | null,
+  ): BrowserThinkingSelectionEvidence => ({
+    requestedLevel: level,
+    status,
+    resolvedLabel,
+    verified: status === "already-selected" || status === "switched",
+    strictFailClosed: strictProEffort,
+    targetModelKind: targetModelKind ?? null,
+    observedModelKind: observedModelKind ?? null,
+    source: "chatgpt-thinking-picker",
+    capturedAt: new Date().toISOString(),
+  });
 
   switch (result?.status) {
     case "already-selected":
       logger(formatBrowserThinkingLog(`${result.label ?? capitalizedLevel} (already selected)`));
-      return;
+      return evidence("already-selected", result.label ?? null);
     case "switched":
       logger(formatBrowserThinkingLog(result.label ?? capitalizedLevel));
-      return;
+      return evidence("switched", result.label ?? null);
     case "option-disabled": {
       await logDomFailure(Runtime, logger, "thinking-option-disabled");
       logPickerDiagnostic(result, logger);
@@ -148,7 +166,7 @@ export async function ensureThinkingTime(
           `${result.label ?? capitalizedLevel} is unavailable on this account (${result.notice ?? "no reason given"}); keeping the effort already selected in ChatGPT.`,
         ),
       );
-      return;
+      return evidence("unverified", null);
     }
     case "chip-not-found":
     case "menu-not-found":
@@ -176,7 +194,7 @@ export async function ensureThinkingTime(
           ? "the effort in ChatGPT is unconfirmed"
           : "keeping the effort already selected in ChatGPT";
       logger(formatBrowserThinkingLog(`${message}; ${outcome}.`));
-      return;
+      return evidence("unverified", null);
     }
     default: {
       await logDomFailure(Runtime, logger, "thinking-time-unknown");
@@ -192,7 +210,7 @@ export async function ensureThinkingTime(
           `unknown outcome selecting ${capitalizedLevel}; continuing with ChatGPT default.`,
         ),
       );
-      return;
+      return evidence("unverified", null);
     }
   }
 }

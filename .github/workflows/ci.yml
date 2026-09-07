@@ -72,5 +72,7 @@ jobs:
         run: node scripts/serve-queue-proof.mjs
       - name: Run attachment send proof
         run: node scripts/attachment-send-proof.mjs
+      - name: Run built CLI attachment context proof
+        run: node scripts/attachment-cli-proof.mjs
       - name: Run effort slider readiness proof
         run: node scripts/effort-readiness-proof.mjs

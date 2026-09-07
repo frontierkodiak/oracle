@@ -147,6 +147,25 @@ export interface BrowserModelSelectionEvidence {
   capturedAt: string;
 }
 
+export type BrowserThinkingSelectionStatus = "already-selected" | "switched" | "unverified";
+
+/**
+ * Selection-time UI evidence, separate from the model picker record.
+ * `verified` confirms the observed selected state at `capturedAt`; it does not
+ * attest backend effort or later UI changes. Strict requests throw if unconfirmed.
+ */
+export interface BrowserThinkingSelectionEvidence {
+  requestedLevel: ThinkingTimeLevel;
+  status: BrowserThinkingSelectionStatus;
+  resolvedLabel?: string | null;
+  verified: boolean;
+  strictFailClosed: boolean;
+  targetModelKind?: string | null;
+  observedModelKind?: string | null;
+  source: "chatgpt-thinking-picker";
+  capturedAt: string;
+}
+
 export interface BrowserRunWarning {
   code: string;
   severity: "warning";
@@ -160,6 +179,7 @@ export interface BrowserMetadata {
   harvest?: BrowserHarvestMetadata;
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
+  thinkingSelection?: BrowserThinkingSelectionEvidence;
   warnings?: BrowserRunWarning[];
 }
 

@@ -937,6 +937,7 @@ async function stageRemoteAttachments(
   return attachments;
 }
 
+// Return conversation identity and observed selection; keep process/profile details on the host.
 function sanitizeResult(
   result: BrowserRunResult,
   warnings: BrowserRunWarning[] = [],
@@ -948,6 +949,12 @@ function sanitizeResult(
     tookMs: result.tookMs,
     answerTokens: result.answerTokens,
     answerChars: result.answerChars,
+    modelSelection: result.modelSelection,
+    thinkingSelection: result.thinkingSelection,
+    archive: result.archive,
+    tabUrl: result.tabUrl,
+    conversationId: result.conversationId,
+    promptSubmitted: result.promptSubmitted,
     warnings: warnings.length > 0 ? warnings : undefined,
     chromePid: undefined,
     chromePort: undefined,

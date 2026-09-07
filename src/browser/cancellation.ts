@@ -3,8 +3,10 @@ import { BrowserRunCancelledError } from "../oracle/errors.js";
 import type { ChromeClient } from "./types.js";
 
 const context = new AsyncLocalStorage<AbortSignal | undefined>();
+const cleanupContext = new AsyncLocalStorage<boolean>();
 export const currentBrowserAbortSignal = (): AbortSignal | undefined => context.getStore();
-export const withoutBrowserCancellation = <T>(task: () => T): T => context.run(undefined, task);
+export const withoutBrowserCancellation = <T>(task: () => T): T =>
+  cleanupContext.run(true, () => context.run(undefined, task));
 
 /** Per-run cancellation, including polling and resources that arrive after their caller left. */
 export class BrowserCancellation {
@@ -31,7 +33,7 @@ export class BrowserCancellation {
     if (this.signal?.aborted) throw new BrowserRunCancelledError();
   }
   run<T>(task: () => T): T {
-    return context.run(this.signal, task);
+    return cleanupContext.run(false, () => context.run(this.signal, task));
   }
   dispose(): void {
     if (this.onAbort) this.signal?.removeEventListener("abort", this.onAbort);
@@ -85,6 +87,7 @@ export class BrowserCancellation {
             return (...args: unknown[]) => {
               // CDP event subscriptions are synchronous and must remain removable during cleanup.
               if (typeof args[0] === "function") return Reflect.apply(value, object, args);
+              if (cleanupContext.getStore()) return Reflect.apply(value, object, args);
               if (this.signal?.aborted) return Promise.reject(new BrowserRunCancelledError());
               const result = Reflect.apply(value, object, args);
               return result && typeof (result as PromiseLike<unknown>).then === "function"

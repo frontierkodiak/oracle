@@ -166,3 +166,5 @@ It checks:
 - Tokens are not printed by default.
 - The connection artifact and config file contain secrets; keep them private (Oracle writes them with restrictive permissions on Unix).
 - Bridge does **not** extract/decrypt cookies from arbitrary profiles; the Windows machine keeps the authenticated session locally.
+
+Cancellation also removes Oracle’s attachment input, prompt, and send guards from retained tabs. Guard cleanup runs outside the aborted request scope; it does not cancel provider processing that already received a file or prompt.
