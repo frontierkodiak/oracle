@@ -8,6 +8,7 @@ import {
 } from "../constants.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { throwIfThrottled } from "../chatgptThrottle.js";
 import { delay } from "../utils.js";
 
 const LEGACY_PRO_VERSION_WORD_TOKENS = ["5 4", "5 2", "5 1", "5 0", "gpt 5 pro"] as const;
@@ -85,6 +86,11 @@ export async function ensureModelSelection(
     }
     case "option-not-found": {
       await logDomFailure(Runtime, logger, "model-switcher-option");
+      // Check for a rate-limit notice before blaming the model name. The notice
+      // is a plain dialog, so its "Got it" button reads as an available option to
+      // the menu scrape — which turns "wait a few minutes" into "your model does
+      // not exist", and sends the reader after the wrong bug.
+      await throwIfThrottled(Runtime, { stage: "model-selection" }, logger);
       const isTemporary = result.hint?.temporaryChat ?? false;
       const available = (result.hint?.availableOptions ?? []).filter(Boolean);
       const availableHint = available.length > 0 ? ` Available: ${available.join(", ")}.` : "";
@@ -98,6 +104,7 @@ export async function ensureModelSelection(
     }
     default: {
       await logDomFailure(Runtime, logger, "model-switcher-button");
+      await throwIfThrottled(Runtime, { stage: "model-selection" }, logger);
       throw new Error(
         "Unable to locate the ChatGPT model selector button. If the desired model is already selected in the browser, retry with --browser-model-strategy current; otherwise retry with --browser-model-strategy ignore to skip model selection.",
       );
@@ -469,10 +476,10 @@ function buildModelSelectionExpression(
     const ADVANCED_VIEW_SELECTOR = '[data-testid="composer-model-picker-slider-advanced-view"]';
     const INTELLIGENCE_PICKER_SELECTOR = '[data-testid="composer-intelligence-picker-content"]';
     const SUBMENU_OPENER_SELECTOR = '[role="menuitem"][aria-haspopup="menu"]';
-    const ADVANCED_WORDS = ['advanced', 'erweitert', '高级', 'avanzado', 'avancado', 'avance'];
-    const MODEL_WORDS = ['model', 'modell', '模型', 'modelo', 'modello', 'modele'];
+    const ADVANCED_WORDS = ['advanced', 'erweitert', '高级', '고급', 'avanzado', 'avancado', 'avance'];
+    const MODEL_WORDS = ['model', 'modell', '模型', '모델', 'modelo', 'modello', 'modele'];
     const EFFORT_WORDS = [
-      'effort', 'aufwand', '强度', '努力',
+      'effort', 'aufwand', '强度', '努力', '추론 수준',
       'esfuerzo', 'esforco', 'sforzo', 'inspanning', 'wysilek',
     ];
     const pickerNodeLabel = (node) => {
@@ -483,6 +490,7 @@ function buildModelSelectionExpression(
           .toLowerCase()
           .normalize('NFD')
           .replace(/[\u0300-\u036f]/g, '')
+          .normalize('NFC')
           .replace(/\\s+/g, ' ')
           .trim();
       } catch {
@@ -749,6 +757,8 @@ function buildModelSelectionExpression(
         node.getAttribute('data-composer-intelligence-pro-effort-action') === 'true' ||
         Boolean(node.closest('[data-model-picker-thinking-effort-action="true"]')) ||
         Boolean(node.closest('[data-composer-intelligence-pro-effort-action="true"]')) ||
+        (isUnifiedPickerMenu(menu) && isSubmenuOpener(node) &&
+          containsPickerWord(pickerNodeLabel(node), EFFORT_WORDS)) ||
         isDetachedProEffortMenu(menu));
     const optionIsSelected = (node) => {
       if (!(node instanceof HTMLElement)) {

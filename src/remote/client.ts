@@ -23,7 +23,10 @@ import {
   type RemoteRunEvent,
   type RemoteAttachmentPayload,
 } from "./types.js";
+import { materializeStagedFallbackBundle } from "../browser/prompt.js";
+import { checkRemoteHealth } from "./health.js";
 import { parseHostPort } from "../bridge/connection.js";
+import { BrowserRunCancelledError } from "../oracle/errors.js";
 
 interface RemoteExecutorOptions {
   host: string;
@@ -35,33 +38,33 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
   return async function remoteBrowserExecutor(
     options: BrowserRunOptions,
   ): Promise<BrowserRunResult> {
+    const callerSignal = options.signal;
+    if (callerSignal?.aborted)
+      throw new BrowserRunCancelledError("Browser run cancelled before the request was sent.");
+    if (callerSignal) {
+      const health = await checkRemoteHealth({ host, token, signal: callerSignal });
+      if (callerSignal.aborted) throw new BrowserRunCancelledError();
+      if (health.capabilities?.runCancellation !== true)
+        throw new Error(
+          "Remote host does not support run cancellation; upgrade the host before using an AbortSignal.",
+        );
+    }
     const payload: RemoteRunPayload = {
       prompt: options.prompt,
       attachments: await serializeAttachments(options.attachments ?? []),
-      fallbackSubmission: options.fallbackSubmission
-        ? {
-            prompt: options.fallbackSubmission.prompt,
-            attachments: await serializeAttachments(options.fallbackSubmission.attachments ?? []),
-          }
-        : undefined,
+      fallbackSubmission: await serializeFallback(options.fallbackSubmission, { host, token }),
       browserConfig: options.config ?? {},
       options: {
         heartbeatIntervalMs: options.heartbeatIntervalMs,
         verbose: options.verbose,
         sessionId: options.sessionId,
         followUpPrompts: options.followUpPrompts,
+        cancelOnDisconnect: callerSignal ? true : undefined,
       },
     };
 
     const body = Buffer.from(JSON.stringify(payload));
     const { hostname, port } = parseHost(host);
-
-    // `BrowserRunOptions.signal` has to mean the same thing on both sides of the
-    // bridge. Observed only locally, it would look like cancellation while the
-    // remote run kept its slot and its browser tab until it finished on its own —
-    // the exact failure the signal exists to prevent, made harder to see because
-    // the caller believes it cancelled.
-    const callerSignal = options.signal;
 
     return new Promise<BrowserRunResult>((resolve, reject) => {
       if (callerSignal?.aborted) {
@@ -78,6 +81,7 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
       const fail = (error: Error) => {
         if (settled) return;
         settled = true;
+        callerSignal?.removeEventListener("abort", onCallerAbort);
         reject(error);
       };
 
@@ -147,6 +151,7 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
                 return;
               }
               settled = true;
+              callerSignal?.removeEventListener("abort", onCallerAbort);
               resolve(mergeTransferredArtifacts(resolved, transferredFiles, transferFailures));
             })().catch(fail);
           });
@@ -160,14 +165,44 @@ export function createRemoteBrowserExecutor({ host, token }: RemoteExecutorOptio
       // browser tab.
       const onCallerAbort = () => {
         req.destroy();
-        fail(new Error("Browser run cancelled: the caller aborted."));
+        fail(new BrowserRunCancelledError("Browser run cancelled: the caller aborted."));
       };
       callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
-      req.on("close", () => callerSignal?.removeEventListener("abort", onCallerAbort));
 
       req.write(body);
       req.end();
     });
+  };
+}
+
+async function serializeFallback(
+  fallback: BrowserRunOptions["fallbackSubmission"],
+  remote: RemoteExecutorOptions,
+): Promise<RemoteRunPayload["fallbackSubmission"]> {
+  if (!fallback) return undefined;
+  if (fallback.pendingBundle) {
+    const health = await checkRemoteHealth(remote);
+    if (!health.ok || health.capabilities?.deferredFallbackBundling !== true) {
+      // Older hosts ignore bundle metadata, so send a ready-to-upload fallback.
+      const prepared = await materializeStagedFallbackBundle({
+        composerText: fallback.prompt,
+        attachments: fallback.attachments,
+        ...fallback.pendingBundle,
+      });
+      try {
+        return {
+          prompt: prepared.composerText,
+          attachments: await serializeAttachments(prepared.attachments),
+        };
+      } finally {
+        await rm(path.dirname(prepared.bundled.bundlePath), { recursive: true, force: true });
+      }
+    }
+  }
+  return {
+    prompt: fallback.prompt,
+    attachments: await serializeAttachments(fallback.attachments),
+    bundle: fallback.pendingBundle,
   };
 }
 
@@ -253,12 +288,17 @@ function handleEvent(params: {
         token: params.token,
         descriptor: event.artifact,
         sessionId: params.options.sessionId,
+        signal: params.options.signal,
         log: params.options.log,
       })
         .then((artifact) => {
           params.onArtifact(artifact);
         })
         .catch((error) => {
+          if (params.options.signal?.aborted) {
+            params.onError(new BrowserRunCancelledError());
+            return;
+          }
           const message = error instanceof Error ? error.message : String(error);
           const fallback = `Oracle captured the browser text response, but bridge artifact transfer failed for ${displayFilename}. Open the ChatGPT browser on the bridge host, download the ZIP/file shown in the current response, and copy it to a cloud-readable path. Reason: ${message}`;
           params.options.log?.(`[browser] ${fallback}`);
@@ -280,7 +320,9 @@ async function transferRemoteArtifact(params: {
   descriptor: RemoteArtifactDescriptor;
   sessionId?: string;
   log?: BrowserRunOptions["log"];
+  signal?: AbortSignal;
 }): Promise<SavedBrowserFile> {
+  params.signal?.throwIfAborted();
   validateRemoteArtifactDescriptor(params.descriptor);
   const sessionId = params.sessionId ?? params.descriptor.runId;
   const artifactsDir = resolveSessionArtifactsDir(sessionId);
@@ -303,6 +345,7 @@ async function transferRemoteArtifact(params: {
     token: params.token,
     targetPath: partPath,
     descriptor: params.descriptor,
+    signal: params.signal,
   }).catch(async (error) => {
     await rm(partPath, { force: true }).catch(() => undefined);
     throw error;
@@ -328,6 +371,10 @@ async function transferRemoteArtifact(params: {
     throw new Error(`${validation.type} validation failed: ${validation.error ?? "invalid"}`);
   }
 
+  if (params.signal?.aborted) {
+    await rm(partPath, { force: true });
+    throw new BrowserRunCancelledError();
+  }
   await rename(partPath, finalPath);
   params.log?.(`[browser] Transferred artifact to ${finalPath}`);
   const publishedFilename = path.basename(finalPath);
@@ -355,6 +402,7 @@ async function downloadArtifactToFile(params: {
   token?: string;
   targetPath: string;
   descriptor: RemoteArtifactDescriptor;
+  signal?: AbortSignal;
 }): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const req = http.request(
@@ -363,6 +411,7 @@ async function downloadArtifactToFile(params: {
         port: params.port,
         path: params.path,
         method: "GET",
+        signal: params.signal,
         headers: params.token ? { authorization: `Bearer ${params.token}` } : undefined,
       },
       (res) => {

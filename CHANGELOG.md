@@ -2,20 +2,32 @@
 
 ## Unreleased
 
-### Changed
+- Release: attach the npm tarball and its checksums to the GitHub Release and verify them before the Homebrew tap updates, so the formula no longer points at a missing asset. Fixes #443.
 
-- **Breaking** — Remote: `oracle serve` now admits concurrent runs with a bounded queue instead of refusing them. A second caller previously received HTTP 409 `busy` and was expected to invent a retry policy; that fits a service where runs are short, and these are not — a Pro answer can take ten minutes, nearly all of it waiting for the model rather than driving the browser. Nothing in the browser stack required the restriction: runs hold their own CDP page connection, clipboard capture is page-local, input and uploads are per-target, temp directories are per-run, and the composer section that genuinely must be serialized already is, by the profile run lock. Up to four runs (configurable) now proceed concurrently and the rest wait in FIFO order, told their position over the existing `log` event so older clients ignore it. Refusal is reserved for a full queue — 503 with `Retry-After`. A client that treated 409 as its back-off signal will no longer see one.
+## 0.18.1 - 2026-09-05
 
-### Added
+**Highlights:** More reliable browser uploads, strict remote-tab isolation, and broader support for ChatGPT's current thinking controls.
 
-- Browser: `BrowserRunOptions.signal`, so a caller can cancel a run it no longer wants. `oracle serve` now observes client disconnect and cancels rather than letting the run finish: measured before, a client killed ten seconds into a thirty-second run held its browser tab and its shared-profile slot for the remaining twenty. Cancellation joins the existing disconnect race, so every awaited step honours it and the existing unwinding releases the tab lease and closes the owned tab. It raises `BrowserRunCancelledError` rather than a generic failure, because a caller that walked away is not a run that went wrong.
-- Remote: the remote executor honours `BrowserRunOptions.signal`, destroying its HTTP request so the service's own disconnect handling cancels the run rather than the caller merely believing it cancelled.
-- Remote: `/health` reports `activeRuns`, `queuedRuns`, and `maxConcurrentRuns`, so a caller can decide when to send work instead of discovering the answer by being queued.
-
-### Fixed
-
-- Remote: bound admission by the shared-profile tab cap rather than overwriting it. The service reads the host's configured `maxConcurrentTabs` and admits at most that many concurrent runs, so an operator who lowered the cap — to stay under an account's throttling, say — keeps that choice.
-- Remote: give each run its own server-side session directory. The client's session slug was used verbatim as the key for the server's artifact directory, and slugs are prompt-derived, so two callers could collide — invisible while only one run existed at a time. The browser tab cap is also pinned to what the service admits, so extra callers wait in the queue where the wait is visible rather than inside the lease loop where it is not.
+- Browser: wait for explicit upload state to clear before completing attachments or sending; ignore unrelated activity, hidden indicators, and filenames that resemble status text. Fixes #446; thanks @HJC704.
+- Browser: retain per-file attachment evidence, including filename-less images, and stabilize the send target without replaying a dispatched prompt. Fixes #418; thanks @hubofvalley.
+- Browser: refuse default-tab fallback when an ordinary remote run cannot create or attach its dedicated tab; thanks @ShunmeiCho.
+- **Breaking — Remote:** accept only conversation-scoped client settings; executable paths, profiles, debugging endpoints, cookie selection, existing-tab selection, and other host settings remain controlled by the service host. Thanks @frontierkodiak.
+- Azure: ignore generic base URLs during model-metadata resolution, preventing OpenRouter catalog requests with Azure credentials.
+- Browser: select and verify thinking effort in ChatGPT's direct slider while keeping explicit Pro requests fail-closed. Fixes #422.
+- Browser: recognize Korean picker labels and localized effort-label punctuation, including Japanese, without confusing High, Extra High, or Unicode word continuations. Fixes #423 and #440; thanks @Gabrielgvl and @kiyo-e.
+- Browser: recognize the Japanese 思考量 effort label and Japanese archive controls.
+- Browser: honor the requested thinking time during Deep Research.
+- CLI: inherit browser.remoteChrome from user configuration while preserving explicit endpoints, attach-running destinations, and copy-profile choices; thanks @ShunmeiCho.
+- Browser: attach to running Chrome without DevToolsActivePort metadata, with IPv6 support and bounded endpoint retries. Fixes #414; thanks @devYRPauli.
+- Remote: preserve every attachment when upload basenames collide after sanitization. Fixes #387; thanks @postoso.
+- Browser: recognize collision-renamed attachment chips while keeping filenames, extensions, and Unicode boundaries distinct. Fixes #393; thanks @devYRPauli.
+- Browser: report ChatGPT rate limiting directly instead of presenting the modal's dismissal button as an available model.
+- Browser: retire dead running-session records when only the controller PID is available. Fixes #391; thanks @OfficialAbhinavSingh.
+- Browser: bound prompt preparation by the configured input timeout. Fixes #381.
+- Browser: restore visible macOS Chrome windows to their prior placement only when Oracle recorded that placement before hiding them.
+- CLI: keep dry-run previews free of session side effects.
+- Remote: advertise only addresses on which the service is listening.
+- Dependencies: refresh provider SDKs, browser and terminal utilities, schema/query tooling, development dependencies, pnpm, and Pages actions; update OpenAI to 7.10, Google GenAI to 2.21, Inquirer to 14.2.1, Puppeteer to 25.10, Fast URI to 4.1.4, and Vitest to 5 while retaining Node >=24 and the two-day release-age policy.
 
 ## 0.18.0 — 2026-08-14
 

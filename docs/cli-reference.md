@@ -100,18 +100,20 @@ See [OpenAI / Azure / OpenRouter](openai-endpoints.md) and [OpenRouter](openrout
 | `--browser-keep-browser`                                                       | Keep the browser open after the run.                                                                                         |
 | `--browser-headless`, `--browser-hide-window`                                  | Visibility controls.                                                                                                         |
 | `--browser-attachments <auto\|never\|always>`                                  | Attach files inline vs upload.                                                                                               |
-| `--browser-bundle-files`, `--browser-bundle-format <auto\|text\|zip>`          | Bundle browser uploads as text or byte-preserving ZIP.                                                                       |
+| `--browser-bundle-files`, `--browser-bundle-format <auto\|text\|zip>`          | Multi-file source uploads bundle by default; `auto` keeps flattened text unless ZIP is selected or raw files are present.    |
 | `--browser-chrome-path`, `--browser-cookie-path`                               | Override Chrome / cookie store discovery (Linux / Windows).                                                                  |
 
 See [Browser Mode](browser-mode.md) for usage.
 
 ## Remote browser
 
-| Flag                          | Purpose                                      |
-| ----------------------------- | -------------------------------------------- |
-| `--remote-host <host:port>`   | Use a remote `oracle serve` host.            |
-| `--remote-token <secret>`     | Auth for the remote host.                    |
-| `--remote-chrome <host:port>` | Attach to an existing remote Chrome session. |
+| Flag                                  | Purpose                                                                                           |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `--remote-host <host:port>`           | Use a remote `oracle serve` host.                                                                 |
+| `--remote-token <secret>`             | Auth for the remote host.                                                                         |
+| `--remote-chrome <host:port>`         | Attach to an existing remote Chrome session.                                                      |
+| `serve --max-concurrent-runs <count>` | Opt into bounded concurrent admission; effective capacity cannot exceed the host browser tab cap. |
+| `serve --max-queued-runs <count>`     | Waiting requests in opt-in mode (default 8; zero disables waiting).                               |
 
 ## Image / media (browser)
 

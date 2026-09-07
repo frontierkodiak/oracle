@@ -1,7 +1,16 @@
-import { rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import * as childProcess from "node:child_process";
 import net from "node:net";
+import path from "node:path";
 import CDP from "chrome-remote-interface";
-import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
+import {
+  launch,
+  Launcher,
+  type LaunchedChrome,
+  type ModuleOverrides as ChromeLauncherModuleOverrides,
+  type Options as ChromeLauncherOptions,
+} from "chrome-launcher";
+import type Protocol from "devtools-protocol";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import { cleanupStaleProfileState } from "./profileState.js";
 import { delay } from "./utils.js";
@@ -14,6 +23,16 @@ export async function launchChrome(
 ) {
   const { connectHost, debugBindAddress, usePatchedLauncher } = resolveWslChromeLaunchRoute();
   const debugPort = config.debugPort ?? parseDebugPortEnv();
+  const usingCopiedProfile = Boolean(config.copyProfileSource);
+  const detachSharedChrome = shouldDetachSharedChrome(config);
+  const launchedProfileDirectory =
+    usingCopiedProfile && config.chromeProfile ? config.chromeProfile : "Default";
+  await prepareChromeWindowStateForHiddenLaunch({
+    config,
+    userDataDir,
+    profileDirectory: launchedProfileDirectory,
+    logger,
+  });
   const chromeFlags = buildChromeFlags(
     config.headless ?? false,
     debugBindAddress,
@@ -23,7 +42,6 @@ export async function launchChrome(
   // Keychain-encrypted, so it must launch with the real Keychain (not mocked):
   // strip the keychain-mocking flags from both chrome-launcher's defaults and
   // Oracle's set, and ignore the defaults so they aren't re-added.
-  const usingCopiedProfile = Boolean(config.copyProfileSource);
   if (usingCopiedProfile && config.chromeProfile) {
     chromeFlags.push(`--profile-directory=${config.chromeProfile}`);
   }
@@ -36,42 +54,325 @@ export async function launchChrome(
         host: connectHost ?? "127.0.0.1",
         requestedPort: debugPort ?? undefined,
         ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
+        detachSharedChrome,
       })
-    : await launch({
-        chromePath: config.chromePath ?? undefined,
-        chromeFlags: launchOptions.chromeFlags,
-        userDataDir,
-        handleSIGINT: false,
-        port: debugPort ?? undefined,
-        ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
-      });
+    : await launchWithStableProcessLifecycle(
+        {
+          chromePath: config.chromePath ?? undefined,
+          chromeFlags: launchOptions.chromeFlags,
+          userDataDir,
+          handleSIGINT: false,
+          port: debugPort ?? undefined,
+          ignoreDefaultFlags: launchOptions.ignoreDefaultFlags,
+        },
+        detachSharedChrome,
+      );
   const pidLabel = typeof launcher.pid === "number" ? ` (pid ${launcher.pid})` : "";
   const hostLabel = connectHost ? ` on ${connectHost}` : "";
   logger(`Launched Chrome${pidLabel} on port ${launcher.port}${hostLabel}`);
+  if (detachSharedChrome) {
+    logger("[browser] Browser control: Windows Chrome lifecycle detached=true; windowsHide=true.");
+  }
   return Object.assign(launcher, { host: connectHost ?? "127.0.0.1" }) as LaunchedChrome & {
     host?: string;
   };
 }
 
+function shouldDetachSharedChrome(
+  config: Pick<ResolvedBrowserConfig, "manualLogin" | "copyProfileSource">,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return platform === "win32" && config.manualLogin === true && !config.copyProfileSource;
+}
+
+export const shouldDetachSharedChromeForTest = shouldDetachSharedChrome;
+
+const spawnDetachedChromeOnWindows = ((
+  command: string,
+  args: readonly string[],
+  options: childProcess.SpawnOptions,
+) => {
+  const child = childProcess.spawn(command, args, resolveChromeChildSpawnOptions(options, "win32"));
+  child.unref();
+  return child;
+}) as NonNullable<ChromeLauncherModuleOverrides["spawn"]>;
+
+function resolveChromeChildSpawnOptions(
+  options: childProcess.SpawnOptions,
+  platform: NodeJS.Platform = process.platform,
+): childProcess.SpawnOptions {
+  return platform === "win32"
+    ? {
+        ...options,
+        detached: true,
+        windowsHide: true,
+      }
+    : options;
+}
+
+export function resolveChromeChildSpawnOptionsForTest(
+  options: childProcess.SpawnOptions,
+  platform: NodeJS.Platform,
+): childProcess.SpawnOptions {
+  return resolveChromeChildSpawnOptions(options, platform);
+}
+
+function chromeLauncherModuleOverrides(
+  detachSharedChrome: boolean,
+  platform: NodeJS.Platform = process.platform,
+): ChromeLauncherModuleOverrides | undefined {
+  return detachSharedChrome && platform === "win32"
+    ? { spawn: spawnDetachedChromeOnWindows }
+    : undefined;
+}
+
+async function launchWithStableProcessLifecycle(
+  options: ChromeLauncherOptions,
+  detachSharedChrome: boolean,
+): Promise<LaunchedChrome> {
+  if (!detachSharedChrome) {
+    return launch(options);
+  }
+  const launcher = new Launcher(options, chromeLauncherModuleOverrides(detachSharedChrome));
+  await launcher.launch();
+  return launchedChromeFromLauncher(launcher);
+}
+
+function launchedChromeFromLauncher(launcher: Launcher): LaunchedChrome {
+  return {
+    pid: launcher.pid ?? 0,
+    port: launcher.port ?? 0,
+    process: launcher.chromeProcess as NonNullable<LaunchedChrome["process"]>,
+    kill: () => launcher.kill(),
+    remoteDebuggingPipes: launcher.remoteDebuggingPipes,
+  };
+}
+
 export async function positionChromeWindowOffscreen(
   client: ChromeClient,
+  userDataDir: string,
   logger: BrowserLogger,
 ): Promise<void> {
   if (process.platform !== "darwin") {
     logger("Window hiding is only supported on macOS");
     return;
   }
+  let savedState = false;
   try {
     const { windowId } = await client.Browser.getWindowForTarget();
+    if (!(await readSavedChromeWindowState(userDataDir))) {
+      const { bounds } = await client.Browser.getWindowBounds({ windowId });
+      await writeSavedChromeWindowState(userDataDir, bounds);
+      savedState = true;
+    }
     await client.Browser.setWindowBounds({
       windowId,
       bounds: { left: -32_000, top: -32_000, windowState: "normal" },
     });
-    logger("Chrome window positioned off-screen");
   } catch (error) {
+    if (savedState) {
+      await rm(chromeWindowStatePath(userDataDir), { force: true }).catch(() => undefined);
+    }
     const message = error instanceof Error ? error.message : String(error);
     logger(`Failed to position Chrome window off-screen: ${message}`);
+    return;
   }
+  logger("Chrome window positioned off-screen");
+}
+
+export async function positionChromeWindowOnscreen(
+  client: ChromeClient,
+  userDataDir: string,
+  logger: BrowserLogger,
+): Promise<void> {
+  if (process.platform !== "darwin") {
+    return;
+  }
+  try {
+    const savedState = await readSavedChromeWindowState(userDataDir);
+    if (!savedState) {
+      return;
+    }
+    const { windowId } = await client.Browser.getWindowForTarget();
+    await client.Browser.setWindowBounds({
+      windowId,
+      bounds: restoreWindowBounds(savedState.bounds),
+    });
+    await rm(chromeWindowStatePath(userDataDir), { force: true });
+    logger("Chrome window restored to its pre-hide bounds");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger(`Failed to position Chrome window on-screen: ${message}`);
+  }
+}
+
+const CHROME_WINDOW_STATE_FILENAME = "oracle-window-state.json";
+
+interface SavedChromeWindowState {
+  version: 1;
+  bounds: Protocol.Browser.Bounds;
+}
+
+interface PersistedChromeWindowPlacement {
+  left?: unknown;
+  top?: unknown;
+  right?: unknown;
+  bottom?: unknown;
+  maximized?: unknown;
+}
+
+const DEFAULT_VISIBLE_WINDOW_BOUNDS: Protocol.Browser.Bounds = {
+  left: 80,
+  top: 80,
+  width: 1280,
+  height: 720,
+  windowState: "normal",
+};
+
+function chromeWindowStatePath(userDataDir: string): string {
+  return path.join(userDataDir, CHROME_WINDOW_STATE_FILENAME);
+}
+
+async function readSavedChromeWindowState(
+  userDataDir: string,
+): Promise<SavedChromeWindowState | null> {
+  try {
+    const parsed = JSON.parse(
+      await readFile(chromeWindowStatePath(userDataDir), "utf8"),
+    ) as Partial<SavedChromeWindowState>;
+    const bounds = parseChromeWindowBounds(parsed.bounds);
+    if (parsed.version !== 1 || !bounds) {
+      return null;
+    }
+    return { version: 1, bounds };
+  } catch {
+    return null;
+  }
+}
+
+async function writeSavedChromeWindowState(
+  userDataDir: string,
+  bounds: Protocol.Browser.Bounds,
+): Promise<void> {
+  await mkdir(userDataDir, { recursive: true });
+  await writeFile(
+    chromeWindowStatePath(userDataDir),
+    `${JSON.stringify({ version: 1, bounds })}\n`,
+    "utf8",
+  );
+}
+
+async function prepareChromeWindowStateForHiddenLaunch({
+  config,
+  userDataDir,
+  profileDirectory,
+  logger,
+}: {
+  config: ResolvedBrowserConfig;
+  userDataDir: string;
+  profileDirectory: string;
+  logger: BrowserLogger;
+}): Promise<void> {
+  if (
+    process.platform !== "darwin" ||
+    config.headless ||
+    !config.hideWindow ||
+    (await readSavedChromeWindowState(userDataDir))
+  ) {
+    return;
+  }
+  const bounds =
+    (await readPersistedChromeWindowBounds(userDataDir, profileDirectory)) ??
+    DEFAULT_VISIBLE_WINDOW_BOUNDS;
+  await writeSavedChromeWindowState(userDataDir, bounds);
+  logger("Recorded Chrome window placement before hidden launch");
+}
+
+async function readPersistedChromeWindowBounds(
+  userDataDir: string,
+  profileDirectory: string,
+): Promise<Protocol.Browser.Bounds | null> {
+  const root = path.resolve(userDataDir);
+  const profile = path.resolve(root, profileDirectory);
+  if (path.dirname(profile) !== root) {
+    return null;
+  }
+  try {
+    const preferences = JSON.parse(await readFile(path.join(profile, "Preferences"), "utf8")) as {
+      browser?: { window_placement?: PersistedChromeWindowPlacement };
+    };
+    return persistedPlacementToBounds(preferences.browser?.window_placement);
+  } catch {
+    return null;
+  }
+}
+
+function persistedPlacementToBounds(
+  placement: PersistedChromeWindowPlacement | undefined,
+): Protocol.Browser.Bounds | null {
+  if (!placement) {
+    return null;
+  }
+  if (placement.maximized === true) {
+    return { windowState: "maximized" };
+  }
+  const left = finiteNumber(placement.left);
+  const top = finiteNumber(placement.top);
+  const right = finiteNumber(placement.right);
+  const bottom = finiteNumber(placement.bottom);
+  if (left === null || top === null || right === null || bottom === null) {
+    return null;
+  }
+  const width = right - left;
+  const height = bottom - top;
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+  return { left, top, width, height, windowState: "normal" };
+}
+
+function parseChromeWindowBounds(value: unknown): Protocol.Browser.Bounds | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const bounds = value as Protocol.Browser.Bounds;
+  const windowState = bounds.windowState ?? "normal";
+  if (windowState !== "normal") {
+    return ["minimized", "maximized", "fullscreen"].includes(windowState) ? { windowState } : null;
+  }
+  const left = finiteNumber(bounds.left);
+  const top = finiteNumber(bounds.top);
+  const width = finiteNumber(bounds.width);
+  const height = finiteNumber(bounds.height);
+  if (
+    left === null ||
+    top === null ||
+    width === null ||
+    height === null ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return null;
+  }
+  return { left, top, width, height, windowState: "normal" };
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function restoreWindowBounds(bounds: Protocol.Browser.Bounds): Protocol.Browser.Bounds {
+  const windowState = bounds.windowState ?? "normal";
+  if (windowState !== "normal") {
+    return { windowState };
+  }
+  return {
+    left: bounds.left ?? 80,
+    top: bounds.top ?? 80,
+    width: bounds.width,
+    height: bounds.height,
+    windowState: "normal",
+  };
 }
 
 export function registerTerminationHooks(
@@ -86,6 +387,8 @@ export function registerTerminationHooks(
     emitRuntimeHint?: () => Promise<void>;
     /** Preserve the profile directory even when Chrome is terminated. */
     preserveUserDataDir?: boolean;
+    /** Shared manual-login profiles must never terminate Chrome directly from a signal hook. */
+    preserveSharedChromeOnSignal?: boolean;
     /**
      * Always terminate Chrome and delete `userDataDir` on signal, even when the run is
      * in-flight — for throwaway copied profiles (`--copy-profile`) that must not be left
@@ -104,7 +407,8 @@ export function registerTerminationHooks(
     handling = true;
     const inFlight = opts?.isInFlight?.() ?? false;
     const forceCleanup = opts?.forceProfileCleanup ?? false;
-    const leaveRunning = (keepBrowser || inFlight) && !forceCleanup;
+    const preserveSharedChrome = opts?.preserveSharedChromeOnSignal ?? false;
+    const leaveRunning = (keepBrowser || inFlight || preserveSharedChrome) && !forceCleanup;
     if (leaveRunning) {
       logger(
         `Received ${signal}; leaving Chrome running${inFlight ? " (assistant response pending)" : ""}`,
@@ -180,6 +484,7 @@ export async function connectToRemoteChrome(
   browserWSEndpoint?: string,
   options?: {
     approvalWaitMs?: number;
+    fallbackToDefault?: boolean;
   },
 ): Promise<RemoteChromeConnection> {
   if (browserWSEndpoint) {
@@ -190,13 +495,15 @@ export async function connectToRemoteChrome(
       approvalWaitMs: options?.approvalWaitMs,
     });
   }
-  if (targetUrl) {
-    const targetConnection = await connectToNewTarget(host, port, targetUrl, logger, {
-      opened: () => `Opened dedicated remote Chrome tab targeting ${targetUrl}`,
+  const newTargetUrl =
+    targetUrl || (options?.fallbackToDefault === false ? "about:blank" : undefined);
+  if (newTargetUrl) {
+    const targetConnection = await connectToNewTarget(host, port, newTargetUrl, logger, {
+      opened: () => `Opened dedicated remote Chrome tab targeting ${newTargetUrl}`,
       openFailed: (message) =>
-        `Failed to open dedicated remote Chrome tab (${message}); falling back to first target.`,
+        `Failed to open dedicated remote Chrome tab (${message}); ${options?.fallbackToDefault === false ? "refusing to reuse an unrelated tab" : "falling back to first target"}.`,
       attachFailed: (targetId, message) =>
-        `Failed to attach to dedicated remote Chrome tab ${targetId} (${message}); falling back to first target.`,
+        `Failed to attach to dedicated remote Chrome tab ${targetId} (${message}); ${options?.fallbackToDefault === false ? "refusing to reuse an unrelated tab" : "falling back to first target"}.`,
       closeFailed: (targetId, message) =>
         `Failed to close unused remote Chrome tab ${targetId}: ${message}`,
     });
@@ -209,6 +516,11 @@ export async function connectToRemoteChrome(
           await closeRemoteChromeTarget(host, port, targetConnection.targetId, logger);
         },
       };
+    }
+    if (options?.fallbackToDefault === false) {
+      throw new Error(
+        "Unable to create a dedicated remote Chrome tab; refusing to reuse an unrelated conversation.",
+      );
     }
   }
   const fallbackClient = await CDP({ host, port });
@@ -825,6 +1137,7 @@ async function launchWithCustomHost({
   host,
   requestedPort,
   ignoreDefaultFlags,
+  detachSharedChrome,
 }: {
   chromeFlags: string[];
   chromePath?: string | null;
@@ -832,15 +1145,19 @@ async function launchWithCustomHost({
   host: string | null;
   requestedPort?: number;
   ignoreDefaultFlags?: boolean;
+  detachSharedChrome: boolean;
 }): Promise<LaunchedChrome & { host?: string }> {
-  const launcher = new Launcher({
-    chromePath: chromePath ?? undefined,
-    chromeFlags,
-    userDataDir,
-    handleSIGINT: false,
-    port: requestedPort ?? undefined,
-    ignoreDefaultFlags,
-  });
+  const launcher = new Launcher(
+    {
+      chromePath: chromePath ?? undefined,
+      chromeFlags,
+      userDataDir,
+      handleSIGINT: false,
+      port: requestedPort ?? undefined,
+      ignoreDefaultFlags,
+    },
+    chromeLauncherModuleOverrides(detachSharedChrome),
+  );
 
   if (host) {
     const patched = launcher as unknown as { isDebuggerReady?: () => Promise<void>; port?: number };
@@ -873,13 +1190,8 @@ async function launchWithCustomHost({
 
   await launcher.launch();
 
-  const kill = async () => launcher.kill();
   return {
-    pid: launcher.pid ?? undefined,
-    port: launcher.port ?? 0,
-    process: launcher.chromeProcess as unknown as NonNullable<LaunchedChrome["process"]>,
-    kill,
+    ...launchedChromeFromLauncher(launcher),
     host: host ?? undefined,
-    remoteDebuggingPipes: launcher.remoteDebuggingPipes,
   } as unknown as LaunchedChrome & { host?: string };
 }

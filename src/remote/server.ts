@@ -9,13 +9,18 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, rm, mkdir, writeFile, stat, realpath } from "node:fs/promises";
 import chalk from "chalk";
 import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
+import { materializeStagedFallbackBundle } from "../browser/prompt.js";
+import type { BrowserSessionConfig } from "../sessionManager.js";
 import { runBrowserMode } from "../browserMode.js";
-import { normalizeMaxConcurrentTabs } from "../browser/tabLeaseRegistry.js";
+import { resolveBrowserConfig } from "../browser/config.js";
+import { RunSlots } from "./runSlots.js";
+export { RunSlots } from "./runSlots.js";
 import { loadUserConfig } from "../config.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import type {
   RemoteArtifactCapabilities,
   RemoteArtifactDescriptor,
+  RemoteAttachmentPayload,
   RemoteRunPayload,
   RemoteRunEvent,
 } from "./types.js";
@@ -74,6 +79,8 @@ const ARTIFACT_PROTOCOL_VERSION = 1;
 const REMOTE_ARTIFACT_TTL_MS = 30 * 60 * 1000;
 
 const ARTIFACT_CAPABILITIES: RemoteArtifactCapabilities = {
+  runCancellation: true,
+  deferredFallbackBundling: true,
   artifactTransfer: true,
   artifactProtocolVersion: ARTIFACT_PROTOCOL_VERSION,
   maxArtifactBytes: MAX_REMOTE_ARTIFACT_BYTES,
@@ -95,109 +102,19 @@ async function findAvailablePort(): Promise<number> {
   });
 }
 
-/**
- * Admission control for the shared browser profile.
- *
- * The service used to be single-flight: a second caller got HTTP 409 and was
- * expected to retry. That is the wrong shape for research runs, which are long —
- * a Pro answer can take ten minutes — and the wait is nearly all of it. Callers
- * can share one browser as long as only one of them is driving the composer at a
- * time, and the profile run lock already enforces that. What was missing was a
- * way to let several of them wait for their answers at once, and a place for the
- * next caller to wait rather than fail.
- *
- * So: a bounded number of concurrent runs, and a FIFO queue for the rest.
- * Refusal is reserved for the case where even the queue is full, because a
- * caller that is told "later" can wait, while a caller that is told "no" has to
- * invent a retry policy.
- *
- * Cancellation matters as much as admission here: a client that disconnects
- * while queued must give up its place, and one that disconnects while running
- * must release both its slot and its browser tab. Otherwise a long-lived service
- * leaks capacity until it stops accepting work entirely.
- */
-export class RunSlots {
-  private active = 0;
-  private readonly waiting: {
-    resolve: (release: () => void) => void;
-    reject: (error: Error) => void;
-    onAbort: () => void;
-  }[] = [];
-
-  constructor(
-    private readonly maxConcurrent: number,
-    private readonly maxQueued: number,
-  ) {}
-
-  get activeCount(): number {
-    return this.active;
-  }
-
-  get queuedCount(): number {
-    return this.waiting.length;
-  }
-
-  get capacity(): number {
-    return this.maxConcurrent;
-  }
-
-  /** True when even the queue is full, i.e. the only honest answer is "no". */
-  get isSaturated(): boolean {
-    return this.active >= this.maxConcurrent && this.waiting.length >= this.maxQueued;
-  }
-
-  /** Position a caller would take in the queue, 1-based; 0 means it runs now. */
-  positionFor(): number {
-    return this.active < this.maxConcurrent ? 0 : this.waiting.length + 1;
-  }
-
-  acquire(signal?: {
-    aborted: boolean;
-    addEventListener: (type: "abort", listener: () => void) => void;
-    removeEventListener: (type: "abort", listener: () => void) => void;
-  }): Promise<() => void> {
-    if (signal?.aborted) {
-      return Promise.reject(new Error("cancelled before a slot was available"));
-    }
-    if (this.active < this.maxConcurrent) {
-      this.active += 1;
-      return Promise.resolve(this.makeRelease());
-    }
-    return new Promise((resolve, reject) => {
-      const entry = {
-        resolve,
-        reject,
-        onAbort: () => {
-          const index = this.waiting.indexOf(entry);
-          if (index >= 0) {
-            this.waiting.splice(index, 1);
-          }
-          signal?.removeEventListener("abort", entry.onAbort);
-          reject(new Error("cancelled while waiting for a slot"));
-        },
-      };
-      this.waiting.push(entry);
-      signal?.addEventListener("abort", entry.onAbort);
-    });
-  }
-
-  private makeRelease(): () => void {
-    let released = false;
-    return () => {
-      if (released) {
-        return;
-      }
-      released = true;
-      const next = this.waiting.shift();
-      if (next) {
-        // The slot passes straight to the next caller rather than being freed and
-        // re-taken, so a burst of arrivals cannot jump the queue.
-        next.resolve(this.makeRelease());
-        return;
-      }
-      this.active -= 1;
-    };
-  }
+function validateAdmissionOptions(options: RemoteServerOptions): void {
+  if (options.maxConcurrentRuns === undefined && options.maxQueuedRuns !== undefined)
+    throw new Error("--max-queued-runs requires --max-concurrent-runs.");
+  if (
+    options.maxConcurrentRuns !== undefined &&
+    (!Number.isSafeInteger(options.maxConcurrentRuns) || options.maxConcurrentRuns < 1)
+  )
+    throw new Error("--max-concurrent-runs must be a positive integer.");
+  if (
+    options.maxQueuedRuns !== undefined &&
+    (!Number.isSafeInteger(options.maxQueuedRuns) || options.maxQueuedRuns < 0)
+  )
+    throw new Error("--max-queued-runs must be a nonnegative integer.");
 }
 
 export async function createRemoteServer(
@@ -213,26 +130,25 @@ export async function createRemoteServer(
   const color = process.stdout.isTTY
     ? (formatter: (msg: string) => string, msg: string) => formatter(msg)
     : (_formatter: (msg: string) => string, msg: string) => msg;
-  // Admission control. The browser profile is shared, so concurrency is bounded;
-  // the profile run lock inside the browser stack keeps composer interaction
-  // serialized underneath this.
-  // Admission is bounded by the browser's own cap, not the other way round. The
-  // tab cap is the physical constraint on a shared profile; a service that
-  // admitted more than it would simply move the waiting from the queue, where it
-  // is visible, into the lease loop, where it is not. Overwriting the browser
-  // cap to match would be worse still — it silently discards an operator's lower
-  // choice, which is exactly what someone avoiding account throttling would set.
-  const browserTabCap = normalizeMaxConcurrentTabs(
-    (await loadUserConfig().catch(() => null))?.config.browser?.maxConcurrentTabs,
-  );
-  const requestedConcurrency = Math.max(1, options.maxConcurrentRuns ?? 4);
-  const effectiveConcurrency = Math.min(requestedConcurrency, browserTabCap);
+  validateAdmissionOptions(options);
+  const admissionEnabled = options.maxConcurrentRuns !== undefined;
+  const hostConfig = admissionEnabled ? (await loadUserConfig()).config.browser : undefined;
+  const browserTabCap = admissionEnabled
+    ? resolveBrowserConfig({ maxConcurrentTabs: hostConfig?.maxConcurrentTabs }).maxConcurrentTabs
+    : undefined;
+  const requestedConcurrency = options.maxConcurrentRuns ?? 1;
+  const effectiveConcurrency = Math.min(requestedConcurrency, browserTabCap ?? 1);
   if (effectiveConcurrency < requestedConcurrency) {
     logger(
-      `[serve] Admitting ${effectiveConcurrency} concurrent run(s): the shared-profile tab cap (${browserTabCap}) is lower than the requested ${requestedConcurrency}.`,
+      `[serve] Admitting ${effectiveConcurrency} concurrent run(s): the host tab cap is lower than the requested ${requestedConcurrency}.`,
     );
   }
-  const slots = new RunSlots(effectiveConcurrency, Math.max(0, options.maxQueuedRuns ?? 8));
+  const slots = new RunSlots(
+    effectiveConcurrency,
+    admissionEnabled ? (options.maxQueuedRuns ?? 8) : 0,
+  );
+  let legacyBusy = false;
+  const controllers = new Set<AbortController>();
   const artifactRegistry = new Map<string, RegisteredRemoteArtifact>();
 
   if (!process.listenerCount("unhandledRejection")) {
@@ -274,6 +190,8 @@ export async function createRemoteServer(
           activeRuns: slots.activeCount,
           queuedRuns: slots.queuedCount,
           maxConcurrentRuns: slots.capacity,
+          maxQueuedRuns: slots.queueCapacity,
+          admissionMode: admissionEnabled ? "queue" : "legacy",
         }),
       );
       return;
@@ -310,125 +228,141 @@ export async function createRemoteServer(
       res.end(JSON.stringify({ error: "unauthorized" }));
       return;
     }
-    if (slots.isSaturated) {
-      if (verbose) {
-        logger(
-          `[serve] Saturated: refusing run from ${formatSocket(req)} (${slots.activeCount} active, ${slots.queuedCount} queued)`,
-        );
-      }
-      res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "60" });
-      res.end(JSON.stringify({ error: "queue_full" }));
+    const refuse = () => {
+      res.writeHead(admissionEnabled ? 503 : 409, {
+        "Content-Type": "application/json",
+        ...(admissionEnabled ? { "Retry-After": "60" } : {}),
+      });
+      res.end(JSON.stringify({ error: admissionEnabled ? "queue_full" : "busy" }));
+    };
+    if (admissionEnabled ? slots.isSaturated : legacyBusy) {
+      refuse();
       return;
     }
+    if (!admissionEnabled) legacyBusy = true;
     const runStartedAt = Date.now();
-
-    // Read the body before taking a slot, so a malformed request cannot occupy
-    // capacity that a well-formed one is waiting for.
-    let payload: RemoteRunPayload | null = null;
+    let payload: RemoteRunPayload;
     try {
-      const body = await readRequestBody(req);
-      payload = JSON.parse(body) as RemoteRunPayload;
-      if (payload?.browserConfig) {
+      payload = JSON.parse(await readRequestBody(req)) as RemoteRunPayload;
+      if (!payload || typeof payload.prompt !== "string") throw new Error("Missing prompt");
+      payload.options ??= {};
+      if (payload.browserConfig)
         payload.browserConfig.url = normalizeChatgptUrl(payload.browserConfig.url, CHATGPT_URL);
-      }
     } catch {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "invalid_request" }));
+      legacyBusy = false;
+      if (!res.destroyed) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_request" }));
+      }
       return;
     }
-
-    res.writeHead(200, { "Content-Type": "application/x-ndjson" });
-
-    // A disconnect is a cancellation. Without this, a client that gives up while
-    // queued keeps its place forever and a client that gives up mid-run keeps
-    // its slot and its browser tab.
+    if (res.destroyed || req.aborted) {
+      legacyBusy = false;
+      return;
+    }
+    // No await between this check, reservation, and headers: delayed body reads cannot overfill the queue.
+    if (slots.isSaturated) {
+      if (!admissionEnabled) legacyBusy = false;
+      refuse();
+      return;
+    }
     const controller = new AbortController();
+    const signal =
+      admissionEnabled || payload.options.cancelOnDisconnect === true
+        ? controller.signal
+        : undefined;
     const onClientGone = () => controller.abort();
     res.on("close", onClientGone);
     req.on("aborted", onClientGone);
-
+    controllers.add(controller);
     const queuePosition = slots.positionFor();
-    if (queuePosition > 0) {
-      // Sent as a `log` event on purpose: older clients ignore event types they
-      // do not know, so telling the caller it is waiting costs no compatibility.
-      res.write(
-        `${JSON.stringify({
-          type: "log",
-          message: `[serve] Waiting for a browser slot (position ${queuePosition}; ${slots.activeCount} active).`,
-        })}\n`,
-      );
-    }
-
-    let release: () => void;
+    const pendingSlot = slots.acquire(signal);
+    res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+    const sendEvent = (event: RemoteRunEvent) => {
+      if (!res.destroyed && !res.writableEnded) res.write(`${JSON.stringify(event)}\n`);
+    };
+    if (queuePosition > 0)
+      sendEvent({
+        type: "log",
+        message: `[serve] Waiting for a browser slot (position ${queuePosition}; ${slots.activeCount} active).`,
+      });
+    let release: (() => void) | undefined;
     try {
-      release = await slots.acquire(controller.signal);
+      release = await pendingSlot;
+      signal?.throwIfAborted();
     } catch (error) {
-      res.write(
-        `${JSON.stringify({
-          type: "error",
-          message: error instanceof Error ? error.message : String(error),
-        })}\n`,
-      );
-      res.end();
+      release?.();
+      legacyBusy = false;
+      sendEvent({ type: "error", message: error instanceof Error ? error.message : String(error) });
       res.off("close", onClientGone);
       req.off("aborted", onClientGone);
+      controllers.delete(controller);
+      if (!res.destroyed) res.end();
       return;
     }
 
     const runId = randomUUID();
-    logger(
-      `[serve] Accepted run ${runId} from ${formatSocket(req)} (prompt ${payload?.prompt?.length ?? 0} chars)`,
-    );
-    // Each run gets an isolated temp dir so attachments/logs don't collide.
-    const runDir = await mkdtemp(path.join(os.tmpdir(), `oracle-serve-${runId}-`));
-    const attachmentDir = path.join(runDir, "attachments");
-    await mkdir(attachmentDir, { recursive: true });
+    let runDir = "";
 
-    const sendEvent = (event: RemoteRunEvent) => {
-      res.write(`${JSON.stringify(event)}\n`);
-    };
-
-    const attachments: BrowserAttachment[] = [];
     let fallbackSubmission:
       | {
           prompt: string;
           attachments: BrowserAttachment[];
+          prepare?: () => Promise<void>;
         }
       | undefined;
     try {
+      signal?.throwIfAborted();
+      logger(
+        `[serve] Accepted run ${runId} from ${formatSocket(req)} (prompt ${payload.prompt.length} chars)`,
+      );
+      runDir = await mkdtemp(path.join(os.tmpdir(), `oracle-serve-${runId}-`));
+      const attachmentDir = path.join(runDir, "attachments");
+      signal?.throwIfAborted();
       const attachmentsPayload = Array.isArray(payload.attachments) ? payload.attachments : [];
-      for (const [index, attachment] of attachmentsPayload.entries()) {
-        const safeName = sanitizeName(attachment.fileName ?? `attachment-${index + 1}`);
-        const filePath = path.join(attachmentDir, safeName);
-        await writeFile(filePath, Buffer.from(attachment.contentBase64, "base64"));
-        attachments.push({
-          path: filePath,
-          displayPath: attachment.displayPath,
-          sizeBytes: attachment.sizeBytes,
-        });
-      }
+      const attachments = await stageRemoteAttachments(
+        attachmentsPayload,
+        attachmentDir,
+        "attachment",
+      );
 
       if (payload.fallbackSubmission) {
         const fallbackAttachmentDir = path.join(runDir, "fallback-attachments");
-        await mkdir(fallbackAttachmentDir, { recursive: true });
-        const fallbackAttachments: BrowserAttachment[] = [];
         const fallbackPayload = Array.isArray(payload.fallbackSubmission.attachments)
           ? payload.fallbackSubmission.attachments
           : [];
-        for (const [index, attachment] of fallbackPayload.entries()) {
-          const safeName = sanitizeName(attachment.fileName ?? `fallback-attachment-${index + 1}`);
-          const filePath = path.join(fallbackAttachmentDir, safeName);
-          await writeFile(filePath, Buffer.from(attachment.contentBase64, "base64"));
-          fallbackAttachments.push({
-            path: filePath,
-            displayPath: attachment.displayPath,
-            sizeBytes: attachment.sizeBytes,
-          });
-        }
+        const fallbackAttachments = await stageRemoteAttachments(
+          fallbackPayload,
+          fallbackAttachmentDir,
+          "fallback-attachment",
+        );
         fallbackSubmission = {
           prompt: payload.fallbackSubmission.prompt,
           attachments: fallbackAttachments,
         };
+        const pendingBundle = payload.fallbackSubmission.bundle;
+        if (pendingBundle) {
+          if (
+            !["text", "zip"].includes(pendingBundle.format) ||
+            !["all", "text-only"].includes(pendingBundle.scope)
+          ) {
+            throw new Error("Invalid fallback bundle format or scope.");
+          }
+          let preparation: Promise<void> | undefined;
+          const prepare = async () => {
+            if (!fallbackSubmission) return;
+            const prepared = await materializeStagedFallbackBundle({
+              composerText: fallbackSubmission.prompt,
+              attachments: fallbackSubmission.attachments,
+              format: pendingBundle.format,
+              scope: pendingBundle.scope,
+              bundleParentDir: runDir,
+            });
+            fallbackSubmission.prompt = prepared.composerText;
+            fallbackSubmission.attachments = prepared.attachments;
+          };
+          fallbackSubmission.prepare = () => (preparation ??= prepare());
+        }
       }
 
       // Reuse the existing browser logger surface so clients see the same log stream.
@@ -443,25 +377,31 @@ export async function createRemoteServer(
       // open before the service forces `keepBrowser` for process lifetime.
       const clientRequestedKeepBrowser = payload.browserConfig?.keepBrowser === true;
 
+      // A client may describe the conversation it wants; it may not describe this
+      // machine. Rebuilding the config from an allowlist rather than deleting
+      // known-bad keys makes that the default: a field added to
+      // BrowserSessionConfig later is host-owned until someone decides otherwise,
+      // instead of reaching Chrome the moment it exists.
+      //
+      // The distinction is not stylistic. `chromePath` names an executable this
+      // process spawns, `remoteChrome` names a debugger to attach to,
+      // `copyProfileSource` names a directory to copy credentials out of, and
+      // `browserTabRef`/`attachRunning` select a tab that may belong to somebody
+      // else's run. With those reachable, a bridge token is not a permission to
+      // ask ChatGPT a question — it is a permission to run code here.
+      payload.browserConfig = pickClientBrowserConfig(payload.browserConfig);
       // Remote runs rely on the host's authentication policy; never accept cookie payloads from clients.
-      if (payload.browserConfig) {
-        payload.browserConfig.inlineCookies = null;
-        payload.browserConfig.inlineCookiesSource = null;
-        payload.browserConfig.cookieSync = options.cookieSyncDefault === true;
-      } else {
-        payload.browserConfig = {} as typeof payload.browserConfig;
-        payload.browserConfig.cookieSync = options.cookieSyncDefault === true;
-      }
+      payload.browserConfig.inlineCookies = null;
+      payload.browserConfig.inlineCookiesSource = null;
+      payload.browserConfig.cookieSync = options.cookieSyncDefault === true;
 
-      // Two callers can legitimately pick the same session slug — they are
-      // prompt-derived — and the server used the client's value verbatim as the
-      // key for its own artifact directory. With one run at a time that was
-      // invisible; with several it is two runs writing into one directory.
-      // Uniqueness is added here rather than asked of clients, and the client
-      // re-saves transferred artifacts under its own session anyway.
-      if (payload.options?.sessionId) {
-        payload.options.sessionId = `${payload.options.sessionId}-${runId.slice(0, 8)}`;
-      }
+      const clientSession =
+        typeof payload.options.sessionId === "string"
+          ? payload.options.sessionId.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 32)
+          : "remote";
+      payload.options.sessionId = `${clientSession || "remote"}-${runId}`;
+      if (browserTabCap !== undefined) payload.browserConfig.maxConcurrentTabs = browserTabCap;
+      signal?.throwIfAborted();
 
       // Enforce manual-login profile when cookie sync is unavailable (e.g., Windows/WSL).
       if (options.manualLoginDefault) {
@@ -480,15 +420,13 @@ export async function createRemoteServer(
         attachments,
         fallbackSubmission,
         config: payload.browserConfig,
-        // A disconnected client's run is finished being useful. Without this it
-        // keeps the browser tab and its slot until it happens to complete, so a
-        // service that outlives its callers hands capacity to nobody.
-        signal: controller.signal,
+        signal,
         // `keepBrowser` above preserves the authenticated shared Chrome
         // process. This separate service policy closes only a successfully
         // captured tab owned by this run, preventing one renderer leak per
         // request while incomplete/reattachable tabs remain untouched.
         closeOwnedTabOnComplete: Boolean(options.manualLoginDefault && !clientRequestedKeepBrowser),
+        closeOwnedTabOnCancel: !clientRequestedKeepBrowser,
         log: automationLogger,
         heartbeatIntervalMs: payload.options.heartbeatIntervalMs,
         verbose: payload.options.verbose,
@@ -496,6 +434,7 @@ export async function createRemoteServer(
         followUpPrompts: payload.options.followUpPrompts,
       });
 
+      signal?.throwIfAborted();
       const artifactRegistration = await registerRemoteArtifacts({
         runId,
         result,
@@ -526,16 +465,25 @@ export async function createRemoteServer(
         }`,
       );
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const cancelled = signal?.aborted === true;
+      const message = cancelled
+        ? "Browser run cancelled."
+        : error instanceof Error
+          ? error.message
+          : String(error);
       sendEvent({ type: "error", message });
-      logger(`[serve] Run ${runId} failed after ${Date.now() - runStartedAt}ms: ${message}`);
+      logger(
+        `[serve] Run ${runId} ${cancelled ? "cancelled" : "failed"} after ${Date.now() - runStartedAt}ms: ${message}`,
+      );
     } finally {
       res.off("close", onClientGone);
       req.off("aborted", onClientGone);
+      controllers.delete(controller);
+      legacyBusy = false;
       release();
-      res.end();
+      if (!res.destroyed) res.end();
       try {
-        await rm(runDir, { recursive: true, force: true });
+        if (runDir) await rm(runDir, { recursive: true, force: true });
       } catch {
         // ignore cleanup errors
       }
@@ -562,6 +510,7 @@ export async function createRemoteServer(
     port: address.port,
     token: authToken,
     async close() {
+      for (const controller of controllers) controller.abort();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
       });
@@ -570,6 +519,7 @@ export async function createRemoteServer(
 }
 
 export async function serveRemote(options: RemoteServerOptions = {}): Promise<void> {
+  validateAdmissionOptions(options);
   const manualProfileDir =
     options.manualLoginProfileDir ?? path.join(os.homedir(), ".oracle", "browser-profile");
   const preferManualLogin =
@@ -905,8 +855,86 @@ async function readRequestBody(req: http.IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function sanitizeName(raw: string): string {
-  return raw.replace(/[^a-zA-Z0-9._-]/g, "_");
+/**
+ * Fields a remote caller may set: they describe the conversation and its time
+ * budgets. Everything else on BrowserSessionConfig — executable paths, profile
+ * directories, debugger endpoints, tab selection, window mode, cookie policy,
+ * and the shared-profile concurrency limits — is the host's to decide.
+ */
+const CLIENT_BROWSER_CONFIG_FIELDS = [
+  "chatgptUrl",
+  "url",
+  "desiredModel",
+  "modelStrategy",
+  "thinkingTime",
+  "researchMode",
+  "archiveConversations",
+  "resumeConversationUrl",
+  "timeoutMs",
+  "inputTimeoutMs",
+  "attachmentTimeoutMs",
+  "assistantRecheckDelayMs",
+  "assistantRecheckTimeoutMs",
+  "autoReattachDelayMs",
+  "autoReattachIntervalMs",
+  "autoReattachTimeoutMs",
+  "keepBrowser",
+  "debug",
+] as const satisfies readonly (keyof BrowserSessionConfig)[];
+
+export function pickClientBrowserConfig(
+  requested: BrowserSessionConfig | undefined | null,
+): BrowserSessionConfig {
+  const accepted: BrowserSessionConfig = {};
+  if (!requested) {
+    return accepted;
+  }
+  for (const field of CLIENT_BROWSER_CONFIG_FIELDS) {
+    const value = requested[field];
+    if (value !== undefined) {
+      (accepted as Record<string, unknown>)[field] = value;
+    }
+  }
+  return accepted;
+}
+
+async function stageRemoteAttachments(
+  payload: RemoteAttachmentPayload[],
+  directory: string,
+  defaultPrefix: string,
+): Promise<BrowserAttachment[]> {
+  await mkdir(directory, { recursive: true });
+  const names = payload.map((attachment, index) => {
+    const fallback = `${defaultPrefix}-${index + 1}`;
+    const sanitized = (attachment.fileName ?? fallback).replace(/[^a-zA-Z0-9._-]/g, "_");
+    return !sanitized || sanitized === "." || sanitized === ".." ? fallback : sanitized;
+  });
+  // Reserve future names too, and honor case-insensitive host filesystems.
+  const reserved = new Set(names.map((name) => name.toLowerCase()));
+  const used = new Set<string>();
+  const attachments: BrowserAttachment[] = [];
+  for (const [index, attachment] of payload.entries()) {
+    const original = names[index]!;
+    let name = original;
+    if (used.has(name.toLowerCase())) {
+      const extension = path.extname(original);
+      const stem = original.slice(0, original.length - extension.length);
+      let suffix = 2;
+      do {
+        name = `${stem}-${suffix++}${extension}`;
+      } while (reserved.has(name.toLowerCase()));
+    }
+    used.add(name.toLowerCase());
+    reserved.add(name.toLowerCase());
+    const filePath = path.join(directory, name);
+    await writeFile(filePath, Buffer.from(attachment.contentBase64, "base64"), { flag: "wx" });
+    attachments.push({
+      path: filePath,
+      displayPath: attachment.displayPath,
+      sizeBytes: attachment.sizeBytes,
+    });
+  }
+  return attachments;
 }
 
 function sanitizeResult(
@@ -934,7 +962,34 @@ function formatSocket(req: http.IncomingMessage): string {
   return `${host}:${port}`;
 }
 
+/**
+ * Addresses a client could actually reach this service on.
+ *
+ * A loopback bind is reachable only from this machine, so listing the host's LAN
+ * and tailnet addresses there is not merely noisy — it tells an operator the
+ * service is exposed when it is not, which is the wrong direction for a mistake
+ * about a token that grants browser automation.
+ */
 function formatReachableAddresses(bindAddress: string, port: number): string[] {
+  if (isLoopbackAddress(bindAddress)) {
+    return [`${formatHostPort(bindAddress, port)}`];
+  }
+  return formatAllInterfaceAddresses(bindAddress, port);
+}
+
+function isLoopbackAddress(address: string): boolean {
+  const normalized = address
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
+function formatHostPort(address: string, port: number): string {
+  return address.includes(":") ? `[${address}]:${port}` : `${address}:${port}`;
+}
+
+function formatAllInterfaceAddresses(bindAddress: string, port: number): string[] {
   const ipv4: string[] = [];
   const ipv6: string[] = [];
   if (bindAddress && bindAddress !== "::" && bindAddress !== "0.0.0.0") {
