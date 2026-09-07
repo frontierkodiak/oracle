@@ -9,11 +9,14 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdtemp, rm, mkdir, writeFile, stat, realpath } from "node:fs/promises";
 import chalk from "chalk";
 import type { BrowserAttachment, BrowserLogger, CookieParam } from "../browser/types.js";
+import { materializeStagedFallbackBundle } from "../browser/prompt.js";
+import type { BrowserSessionConfig } from "../sessionManager.js";
 import { runBrowserMode } from "../browserMode.js";
 import type { BrowserRunResult } from "../browserMode.js";
 import type {
   RemoteArtifactCapabilities,
   RemoteArtifactDescriptor,
+  RemoteAttachmentPayload,
   RemoteRunPayload,
   RemoteRunEvent,
 } from "./types.js";
@@ -68,6 +71,7 @@ const ARTIFACT_PROTOCOL_VERSION = 1;
 const REMOTE_ARTIFACT_TTL_MS = 30 * 60 * 1000;
 
 const ARTIFACT_CAPABILITIES: RemoteArtifactCapabilities = {
+  deferredFallbackBundling: true,
   artifactTransfer: true,
   artifactProtocolVersion: ARTIFACT_PROTOCOL_VERSION,
   maxArtifactBytes: MAX_REMOTE_ARTIFACT_BYTES,
@@ -212,53 +216,63 @@ export async function createRemoteServer(
     // Each run gets an isolated temp dir so attachments/logs don't collide.
     const runDir = await mkdtemp(path.join(os.tmpdir(), `oracle-serve-${runId}-`));
     const attachmentDir = path.join(runDir, "attachments");
-    await mkdir(attachmentDir, { recursive: true });
 
     const sendEvent = (event: RemoteRunEvent) => {
       res.write(`${JSON.stringify(event)}\n`);
     };
 
-    const attachments: BrowserAttachment[] = [];
     let fallbackSubmission:
       | {
           prompt: string;
           attachments: BrowserAttachment[];
+          prepare?: () => Promise<void>;
         }
       | undefined;
     try {
       const attachmentsPayload = Array.isArray(payload.attachments) ? payload.attachments : [];
-      for (const [index, attachment] of attachmentsPayload.entries()) {
-        const safeName = sanitizeName(attachment.fileName ?? `attachment-${index + 1}`);
-        const filePath = path.join(attachmentDir, safeName);
-        await writeFile(filePath, Buffer.from(attachment.contentBase64, "base64"));
-        attachments.push({
-          path: filePath,
-          displayPath: attachment.displayPath,
-          sizeBytes: attachment.sizeBytes,
-        });
-      }
+      const attachments = await stageRemoteAttachments(
+        attachmentsPayload,
+        attachmentDir,
+        "attachment",
+      );
 
       if (payload.fallbackSubmission) {
         const fallbackAttachmentDir = path.join(runDir, "fallback-attachments");
-        await mkdir(fallbackAttachmentDir, { recursive: true });
-        const fallbackAttachments: BrowserAttachment[] = [];
         const fallbackPayload = Array.isArray(payload.fallbackSubmission.attachments)
           ? payload.fallbackSubmission.attachments
           : [];
-        for (const [index, attachment] of fallbackPayload.entries()) {
-          const safeName = sanitizeName(attachment.fileName ?? `fallback-attachment-${index + 1}`);
-          const filePath = path.join(fallbackAttachmentDir, safeName);
-          await writeFile(filePath, Buffer.from(attachment.contentBase64, "base64"));
-          fallbackAttachments.push({
-            path: filePath,
-            displayPath: attachment.displayPath,
-            sizeBytes: attachment.sizeBytes,
-          });
-        }
+        const fallbackAttachments = await stageRemoteAttachments(
+          fallbackPayload,
+          fallbackAttachmentDir,
+          "fallback-attachment",
+        );
         fallbackSubmission = {
           prompt: payload.fallbackSubmission.prompt,
           attachments: fallbackAttachments,
         };
+        const pendingBundle = payload.fallbackSubmission.bundle;
+        if (pendingBundle) {
+          if (
+            !["text", "zip"].includes(pendingBundle.format) ||
+            !["all", "text-only"].includes(pendingBundle.scope)
+          ) {
+            throw new Error("Invalid fallback bundle format or scope.");
+          }
+          let preparation: Promise<void> | undefined;
+          const prepare = async () => {
+            if (!fallbackSubmission) return;
+            const prepared = await materializeStagedFallbackBundle({
+              composerText: fallbackSubmission.prompt,
+              attachments: fallbackSubmission.attachments,
+              format: pendingBundle.format,
+              scope: pendingBundle.scope,
+              bundleParentDir: runDir,
+            });
+            fallbackSubmission.prompt = prepared.composerText;
+            fallbackSubmission.attachments = prepared.attachments;
+          };
+          fallbackSubmission.prepare = () => (preparation ??= prepare());
+        }
       }
 
       // Reuse the existing browser logger surface so clients see the same log stream.
@@ -273,15 +287,23 @@ export async function createRemoteServer(
       // open before the service forces `keepBrowser` for process lifetime.
       const clientRequestedKeepBrowser = payload.browserConfig?.keepBrowser === true;
 
+      // A client may describe the conversation it wants; it may not describe this
+      // machine. Rebuilding the config from an allowlist rather than deleting
+      // known-bad keys makes that the default: a field added to
+      // BrowserSessionConfig later is host-owned until someone decides otherwise,
+      // instead of reaching Chrome the moment it exists.
+      //
+      // The distinction is not stylistic. `chromePath` names an executable this
+      // process spawns, `remoteChrome` names a debugger to attach to,
+      // `copyProfileSource` names a directory to copy credentials out of, and
+      // `browserTabRef`/`attachRunning` select a tab that may belong to somebody
+      // else's run. With those reachable, a bridge token is not a permission to
+      // ask ChatGPT a question — it is a permission to run code here.
+      payload.browserConfig = pickClientBrowserConfig(payload.browserConfig);
       // Remote runs rely on the host's authentication policy; never accept cookie payloads from clients.
-      if (payload.browserConfig) {
-        payload.browserConfig.inlineCookies = null;
-        payload.browserConfig.inlineCookiesSource = null;
-        payload.browserConfig.cookieSync = options.cookieSyncDefault === true;
-      } else {
-        payload.browserConfig = {} as typeof payload.browserConfig;
-        payload.browserConfig.cookieSync = options.cookieSyncDefault === true;
-      }
+      payload.browserConfig.inlineCookies = null;
+      payload.browserConfig.inlineCookiesSource = null;
+      payload.browserConfig.cookieSync = options.cookieSyncDefault === true;
 
       // Enforce manual-login profile when cookie sync is unavailable (e.g., Windows/WSL).
       if (options.manualLoginDefault) {
@@ -719,21 +741,89 @@ async function readRequestBody(req: http.IncomingMessage): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function sanitizeName(raw: string): string {
-  return raw.replace(/[^a-zA-Z0-9._-]/g, "_");
+/**
+ * Fields a remote caller may set: they describe the conversation and its time
+ * budgets. Everything else on BrowserSessionConfig — executable paths, profile
+ * directories, debugger endpoints, tab selection, window mode, cookie policy,
+ * and the shared-profile concurrency limits — is the host's to decide.
+ */
+const CLIENT_BROWSER_CONFIG_FIELDS = [
+  "chatgptUrl",
+  "url",
+  "desiredModel",
+  "modelStrategy",
+  "thinkingTime",
+  "researchMode",
+  "archiveConversations",
+  "resumeConversationUrl",
+  "timeoutMs",
+  "inputTimeoutMs",
+  "attachmentTimeoutMs",
+  "assistantRecheckDelayMs",
+  "assistantRecheckTimeoutMs",
+  "autoReattachDelayMs",
+  "autoReattachIntervalMs",
+  "autoReattachTimeoutMs",
+  "keepBrowser",
+  "debug",
+] as const satisfies readonly (keyof BrowserSessionConfig)[];
+
+export function pickClientBrowserConfig(
+  requested: BrowserSessionConfig | undefined | null,
+): BrowserSessionConfig {
+  const accepted: BrowserSessionConfig = {};
+  if (!requested) {
+    return accepted;
+  }
+  for (const field of CLIENT_BROWSER_CONFIG_FIELDS) {
+    const value = requested[field];
+    if (value !== undefined) {
+      (accepted as Record<string, unknown>)[field] = value;
+    }
+  }
+  return accepted;
 }
 
-/**
- * Whitelist rather than blacklist: a bridged result must never carry host detail
- * (pids, ports, profile paths) to a client on another machine.
- *
- * The fields below are on the safe side of that line and are load-bearing for the
- * caller. Selection evidence is the caller's only proof of WHICH model and effort
- * answered their prompt — dropping it left a remote run indistinguishable from one
- * that silently inherited whatever the composer had selected. The conversation
- * identity is what binds an answer to a durable ChatGPT URL the caller can revisit;
- * without it a bridged answer is unattributable. None of it describes the host.
- */
+async function stageRemoteAttachments(
+  payload: RemoteAttachmentPayload[],
+  directory: string,
+  defaultPrefix: string,
+): Promise<BrowserAttachment[]> {
+  await mkdir(directory, { recursive: true });
+  const names = payload.map((attachment, index) => {
+    const fallback = `${defaultPrefix}-${index + 1}`;
+    const sanitized = (attachment.fileName ?? fallback).replace(/[^a-zA-Z0-9._-]/g, "_");
+    return !sanitized || sanitized === "." || sanitized === ".." ? fallback : sanitized;
+  });
+  // Reserve future names too, and honor case-insensitive host filesystems.
+  const reserved = new Set(names.map((name) => name.toLowerCase()));
+  const used = new Set<string>();
+  const attachments: BrowserAttachment[] = [];
+  for (const [index, attachment] of payload.entries()) {
+    const original = names[index]!;
+    let name = original;
+    if (used.has(name.toLowerCase())) {
+      const extension = path.extname(original);
+      const stem = original.slice(0, original.length - extension.length);
+      let suffix = 2;
+      do {
+        name = `${stem}-${suffix++}${extension}`;
+      } while (reserved.has(name.toLowerCase()));
+    }
+    used.add(name.toLowerCase());
+    reserved.add(name.toLowerCase());
+    const filePath = path.join(directory, name);
+    await writeFile(filePath, Buffer.from(attachment.contentBase64, "base64"), { flag: "wx" });
+    attachments.push({
+      path: filePath,
+      displayPath: attachment.displayPath,
+      sizeBytes: attachment.sizeBytes,
+    });
+  }
+  return attachments;
+}
+
+// Return conversation identity and observed selection; keep process/profile details on the host.
 function sanitizeResult(
   result: BrowserRunResult,
   warnings: BrowserRunWarning[] = [],
@@ -765,7 +855,34 @@ function formatSocket(req: http.IncomingMessage): string {
   return `${host}:${port}`;
 }
 
+/**
+ * Addresses a client could actually reach this service on.
+ *
+ * A loopback bind is reachable only from this machine, so listing the host's LAN
+ * and tailnet addresses there is not merely noisy — it tells an operator the
+ * service is exposed when it is not, which is the wrong direction for a mistake
+ * about a token that grants browser automation.
+ */
 function formatReachableAddresses(bindAddress: string, port: number): string[] {
+  if (isLoopbackAddress(bindAddress)) {
+    return [`${formatHostPort(bindAddress, port)}`];
+  }
+  return formatAllInterfaceAddresses(bindAddress, port);
+}
+
+function isLoopbackAddress(address: string): boolean {
+  const normalized = address
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
+function formatHostPort(address: string, port: number): string {
+  return address.includes(":") ? `[${address}]:${port}` : `${address}:${port}`;
+}
+
+function formatAllInterfaceAddresses(bindAddress: string, port: number): string[] {
   const ipv4: string[] = [];
   const ipv6: string[] = [];
   if (bindAddress && bindAddress !== "::" && bindAddress !== "0.0.0.0") {

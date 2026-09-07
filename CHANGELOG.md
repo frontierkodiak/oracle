@@ -2,13 +2,32 @@
 
 ## Unreleased
 
-### Added
+- Release: attach the npm tarball and its checksums to the GitHub Release and verify them before the Homebrew tap updates, so the formula no longer points at a missing asset. Fixes #443.
 
-- Browser: persist thinking-effort selection evidence as `browser.thinkingSelection`, parallel to `browser.modelSelection`, and render it in `oracle status`. `ensureThinkingTime` verified the requested tier and then discarded the result, and the model evidence cannot stand in: for a Pro-capable target the picker reports the requested model string as the resolved label, so `resolvedLabel === requestedModel; verified: true` is byte-identical whether or not the Pro row was ever selected. `verified` is true only for the two statuses that positively observed the option's selected state, and strict (fail-closed) requests still throw before submit on every other outcome, so a persisted strict record is proof by refusal that no degraded tier was used.
+## 0.18.1 - 2026-09-05
 
-### Fixed
+**Highlights:** More reliable browser uploads, strict remote-tab isolation, and broader support for ChatGPT's current thinking controls.
 
-- Remote: stop stripping run identity and selection evidence from bridged results. `sanitizeResult` correctly keeps host detail (pids, ports, profile paths) from crossing to a client on another machine, but the whitelist had drifted narrower than that rule and also dropped `modelSelection`, `thinkingSelection`, `archive`, `tabUrl`, `conversationId`, and `promptSubmitted` — so a remote caller could not tell which model or effort answered their prompt, nor bind the answer to a durable ChatGPT URL. The fields are optional, so nothing failed; the answer simply arrived unattributable.
+- Browser: wait for explicit upload state to clear before completing attachments or sending; ignore unrelated activity, hidden indicators, and filenames that resemble status text. Fixes #446; thanks @HJC704.
+- Browser: retain per-file attachment evidence, including filename-less images, and stabilize the send target without replaying a dispatched prompt. Fixes #418; thanks @hubofvalley.
+- Browser: refuse default-tab fallback when an ordinary remote run cannot create or attach its dedicated tab; thanks @ShunmeiCho.
+- **Breaking — Remote:** accept only conversation-scoped client settings; executable paths, profiles, debugging endpoints, cookie selection, existing-tab selection, and other host settings remain controlled by the service host. Thanks @frontierkodiak.
+- Azure: ignore generic base URLs during model-metadata resolution, preventing OpenRouter catalog requests with Azure credentials.
+- Browser: select and verify thinking effort in ChatGPT's direct slider while keeping explicit Pro requests fail-closed. Fixes #422.
+- Browser: recognize Korean picker labels and localized effort-label punctuation, including Japanese, without confusing High, Extra High, or Unicode word continuations. Fixes #423 and #440; thanks @Gabrielgvl and @kiyo-e.
+- Browser: recognize the Japanese 思考量 effort label and Japanese archive controls.
+- Browser: honor the requested thinking time during Deep Research.
+- CLI: inherit browser.remoteChrome from user configuration while preserving explicit endpoints, attach-running destinations, and copy-profile choices; thanks @ShunmeiCho.
+- Browser: attach to running Chrome without DevToolsActivePort metadata, with IPv6 support and bounded endpoint retries. Fixes #414; thanks @devYRPauli.
+- Remote: preserve every attachment when upload basenames collide after sanitization. Fixes #387; thanks @postoso.
+- Browser: recognize collision-renamed attachment chips while keeping filenames, extensions, and Unicode boundaries distinct. Fixes #393; thanks @devYRPauli.
+- Browser: report ChatGPT rate limiting directly instead of presenting the modal's dismissal button as an available model.
+- Browser: retire dead running-session records when only the controller PID is available. Fixes #391; thanks @OfficialAbhinavSingh.
+- Browser: bound prompt preparation by the configured input timeout. Fixes #381.
+- Browser: restore visible macOS Chrome windows to their prior placement only when Oracle recorded that placement before hiding them.
+- CLI: keep dry-run previews free of session side effects.
+- Remote: advertise only addresses on which the service is listening.
+- Dependencies: refresh provider SDKs, browser and terminal utilities, schema/query tooling, development dependencies, pnpm, and Pages actions; update OpenAI to 7.10, Google GenAI to 2.21, Inquirer to 14.2.1, Puppeteer to 25.10, Fast URI to 4.1.4, and Vitest to 5 while retaining Node >=24 and the two-day release-age policy.
 
 ## 0.18.0 — 2026-08-14
 
@@ -20,6 +39,7 @@
 ### Fixed
 
 - Browser: detect a disabled ChatGPT effort tier (e.g. an exhausted Pro allotment) before clicking it, and report the account's own reset notice instead of a misleading "selection unverified" failure. Thanks @enieuwy!
+
 ## 0.17.3 — 2026-08-13
 
 **Highlight:** browser-mode answers and recovery are reliable again — no more

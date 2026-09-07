@@ -106,6 +106,15 @@ export interface BrowserRuntimeMetadata {
 
 export type BrowserHarvestState = "running" | "completed" | "stalled" | "detached";
 
+export interface BrowserHarvestIntegrity {
+  status: "matched" | "mismatch" | "unverified";
+  observedConversationId?: string;
+  captured: Array<{ source: string; conversationId: string }>;
+  unverifiedSources: string[];
+  explicitTarget: boolean;
+  previousHarvestConversationId?: string;
+}
+
 export interface BrowserHarvestMetadata {
   targetId?: string;
   url?: string;
@@ -118,6 +127,7 @@ export interface BrowserHarvestMetadata {
   assistantCount?: number;
   currentModelLabel?: string;
   lastAssistantSnippet?: string;
+  integrity?: BrowserHarvestIntegrity;
 }
 
 export type BrowserModelSelectionEvidenceStatus =
@@ -140,20 +150,9 @@ export interface BrowserModelSelectionEvidence {
 export type BrowserThinkingSelectionStatus = "already-selected" | "switched" | "unverified";
 
 /**
- * Machine-checkable evidence that a requested thinking-effort tier was actually
- * confirmed in ChatGPT's composer before the prompt was submitted.
- *
- * This exists because {@link BrowserModelSelectionEvidence} cannot carry it: for
- * a Pro-capable model the picker deliberately reports the requested model string
- * as the resolved label, so `resolvedLabel === requestedModel; verified: true` is
- * byte-identical whether or not the Pro effort row was selected. Without a
- * separate record, "this run answered at Pro effort" is unprovable after the fact.
- *
- * `verified` is true only for statuses that positively observed the option's
- * selected state (aria-checked/aria-selected/data-state, or a composer pill whose
- * label matches the target tier). `strictFailClosed` records that the run was in
- * the fail-closed regime, where every non-confirming outcome throws before submit
- * — so a submitted strict run is itself evidence that no degraded tier was used.
+ * Selection-time UI evidence, separate from the model picker record.
+ * `verified` confirms the observed selected state at `capturedAt`; it does not
+ * attest backend effort or later UI changes. Strict requests throw if unconfirmed.
  */
 export interface BrowserThinkingSelectionEvidence {
   requestedLevel: ThinkingTimeLevel;
@@ -292,6 +291,7 @@ export interface StoredRunOptions {
   browserResumeConversationUrl?: string;
   aspectRatio?: string;
   geminiShowThoughts?: boolean;
+  geminiAllowModelFallback?: boolean;
 }
 
 export interface SessionMetadata {
@@ -524,9 +524,41 @@ async function writeSessionMetadataFile(
       encoding: "utf8",
       mode: 0o600,
     });
-    await fs.rename(temporaryPath, targetPath);
+    await renameSessionMetadataFile(temporaryPath, targetPath);
   } finally {
     await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+}
+
+const METADATA_RENAME_RETRY_DELAYS_MS = [10, 25, 50, 100, 200, 400, 800] as const;
+const RETRIABLE_METADATA_RENAME_CODES = new Set(["EACCES", "EBUSY", "EPERM"]);
+
+function isRetriableMetadataRenameError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    RETRIABLE_METADATA_RENAME_CODES.has(error.code)
+  );
+}
+
+async function renameSessionMetadataFile(temporaryPath: string, targetPath: string): Promise<void> {
+  for (const delayMs of [0, ...METADATA_RENAME_RETRY_DELAYS_MS]) {
+    if (delayMs > 0) {
+      await wait(delayMs);
+    }
+    try {
+      await fs.rename(temporaryPath, targetPath);
+      return;
+    } catch (error) {
+      if (
+        !isRetriableMetadataRenameError(error) ||
+        delayMs === METADATA_RENAME_RETRY_DELAYS_MS.at(-1)
+      ) {
+        throw error;
+      }
+    }
   }
 }
 
@@ -736,6 +768,7 @@ export async function initializeSession(
       browserResumeConversationUrl: options.browserResumeConversationUrl,
       aspectRatio: options.aspectRatio,
       geminiShowThoughts: options.geminiShowThoughts,
+      geminiAllowModelFallback: options.geminiAllowModelFallback,
     },
   };
   await ensureDir(modelsDir(sessionId));
@@ -1107,6 +1140,13 @@ async function markDeadBrowser(meta: SessionMetadata): Promise<SessionMetadata> 
   if (runtime.chromePort) {
     const host = runtime.chromeHost ?? "127.0.0.1";
     signals.push(await isPortOpen(host, runtime.chromePort));
+  }
+  // controllerPid: the foreground process that launched this browser run.
+  // When neither chromePid nor chromePort are recorded (common on Linux),
+  // signals[] is empty and the early-return below would skip the reap.
+  // Use the same isProcessAlive() primitive to fill that gap.
+  if (signals.length === 0 && runtime.controllerPid) {
+    signals.push(isProcessAlive(runtime.controllerPid));
   }
   if (signals.length === 0 || signals.some(Boolean)) {
     return meta;

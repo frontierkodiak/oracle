@@ -105,14 +105,7 @@ export function formatBrowserModelSelectionEvidence(
   return `requestedKey=${requestedKey}; target=${target}; resolvedLabel=${resolvedLabel}; status=${evidence.status}; strategy=${strategy}; verified=${verified}; source=${evidence.source}; capturedAt=${evidence.capturedAt}`;
 }
 
-/**
- * Renders thinking-effort evidence. Kept beside the model-selection formatter
- * because the two answer different questions: the model formatter says WHICH
- * model the picker resolved, this one says whether the requested effort tier was
- * actually confirmed before submit. For Pro-capable models the model evidence
- * cannot answer the second question — its resolvedLabel is the requested model
- * string either way.
- */
+/** Renders the observed effort selection independently of the model picker. */
 export function formatBrowserThinkingSelectionEvidence(
   evidence: BrowserThinkingSelectionEvidence,
 ): string {

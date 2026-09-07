@@ -17,6 +17,7 @@ import {
   launchChrome,
   registerTerminationHooks,
   positionChromeWindowOffscreen,
+  positionChromeWindowOnscreen,
   connectToRemoteChrome,
   connectWithNewTab,
   closeTab,
@@ -47,6 +48,7 @@ import {
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
 import { ensureThinkingTime } from "./actions/thinkingTime.js";
+import { throwIfAssistantUiError } from "./actions/assistantResponse.js";
 import { startThinkingStatusMonitor } from "./actions/thinkingStatus.js";
 import {
   activateDeepResearch,
@@ -63,6 +65,11 @@ import type {
 import { CHATGPT_URL, DEFAULT_MODEL_STRATEGY } from "./constants.js";
 import type { LaunchedChrome } from "chrome-launcher";
 import { BrowserAutomationError } from "../oracle/errors.js";
+import {
+  buildAttachmentBasenameCollisionDetails,
+  findAttachmentBasenameCollisions,
+  formatAttachmentBasenameCollisionMessage,
+} from "./attachmentValidation.js";
 import { alignPromptEchoPair, buildPromptEchoMatcher } from "./reattachHelpers.js";
 import { buildConversationTurnCountExpression } from "./conversationTurns.js";
 import type { ProfileRunLock } from "./profileState.js";
@@ -83,11 +90,7 @@ import {
   isRecoverableChromeDisconnect,
   probeChromeTargetLiveness,
 } from "./cdpLiveness.js";
-import {
-  acquireBrowserTabLease,
-  hasOtherActiveBrowserTabLeases,
-  type BrowserTabLease,
-} from "./tabLeaseRegistry.js";
+import { acquireBrowserTabLease, type BrowserTabLease } from "./tabLeaseRegistry.js";
 import {
   appendArtifacts,
   saveBrowserTranscriptArtifact,
@@ -157,7 +160,9 @@ function isCloudflareChallengeError(error: unknown): error is BrowserAutomationE
 function isReattachableCaptureError(error: unknown): error is BrowserAutomationError {
   if (!(error instanceof BrowserAutomationError)) return false;
   const stage = (error.details as { stage?: string } | undefined)?.stage;
-  return stage === "assistant-timeout" || stage === "assistant-recheck";
+  return (
+    stage === "assistant-timeout" || stage === "assistant-recheck" || stage === "assistant-ui-error"
+  );
 }
 
 type PreservedBrowserErrorKind = "cloudflare-challenge" | "reattachable-capture";
@@ -206,6 +211,21 @@ export function classifyPreservedBrowserErrorForTest(
 // effort. This is wrong for lower-tier plans ($100/mo Pro) where selecting "Pro"
 // defaults to Standard effort. ensureThinkingTime() already handles the
 // "already-selected" case as a no-op, so always attempting it is safe.
+
+type BrowserConfigWithThinkingTime = Pick<
+  ResolvedBrowserConfig,
+  "researchMode" | "thinkingTime"
+> & {
+  thinkingTime: NonNullable<ResolvedBrowserConfig["thinkingTime"]>;
+};
+
+function shouldApplyThinkingTimeSelection(
+  config: Pick<ResolvedBrowserConfig, "researchMode" | "thinkingTime">,
+): config is BrowserConfigWithThinkingTime {
+  // Deep Research uses the same effort picker, so research mode must not
+  // suppress an explicitly configured thinking-time selection.
+  return config.thinkingTime !== undefined;
+}
 
 type ChatGptUiWarningType = "rate_limit" | "temporary_unavailable" | "auth_or_challenge";
 
@@ -512,6 +532,27 @@ function hasBrowserErrorCode(error: unknown, code: string): boolean {
   );
 }
 
+function assertUniqueAttachmentBasenames(
+  attachments: BrowserAttachment[],
+  options: { stage: string; subject: string },
+): void {
+  const collisions = findAttachmentBasenameCollisions(attachments);
+  if (collisions.length === 0) return;
+
+  const collisionDetails = buildAttachmentBasenameCollisionDetails(
+    collisions,
+    (attachment) => attachment.displayPath || attachment.path,
+  );
+  throw new BrowserAutomationError(
+    formatAttachmentBasenameCollisionMessage(options.subject, collisionDetails.collisions),
+    {
+      stage: options.stage,
+      code: "attachment-basename-collision",
+      ...collisionDetails,
+    },
+  );
+}
+
 async function saveOptionalArtifact<T>(
   operation: () => Promise<T | null>,
   logger: BrowserLogger,
@@ -585,6 +626,7 @@ async function pollGeneratedImageOrTextAssistantResponse(
     let snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId).catch(
       () => null,
     );
+    throwIfAssistantUiError(snapshot);
     if (!snapshot && typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex)) {
       const relaxedSnapshot = await readAssistantSnapshot(
         Runtime,
@@ -592,7 +634,10 @@ async function pollGeneratedImageOrTextAssistantResponse(
         expectedConversationId,
       ).catch(() => null);
       const relaxedHtml = typeof relaxedSnapshot?.html === "string" ? relaxedSnapshot.html : "";
-      if (relaxedHtml.includes("/backend-api/estuary/content?id=file_")) {
+      if (
+        !relaxedSnapshot?.uiError &&
+        relaxedHtml.includes("/backend-api/estuary/content?id=file_")
+      ) {
         snapshot = relaxedSnapshot;
       }
     }
@@ -756,6 +801,7 @@ async function captureDeepResearchTargetBaseline(
 type BrowserSubmissionFallback = {
   prompt: string;
   attachments: BrowserAttachment[];
+  prepare?: () => Promise<void>;
 };
 
 async function runSubmissionWithRecovery({
@@ -795,6 +841,13 @@ async function runSubmissionWithRecovery({
       if (fallbackSubmission && isPromptTooLarge && !usedFallbackSubmission) {
         usedFallbackSubmission = true;
         logger("[browser] Inline prompt too large; retrying with file uploads.");
+        if (fallbackSubmission.prepare) {
+          await fallbackSubmission.prepare();
+        }
+        assertUniqueAttachmentBasenames(fallbackSubmission.attachments, {
+          stage: "upload-fallback",
+          subject: "The inline prompt was too large, but its upload fallback",
+        });
         await prepareFallbackSubmission();
         currentPrompt = fallbackSubmission.prompt;
         currentAttachments = fallbackSubmission.attachments;
@@ -899,6 +952,111 @@ function shouldCleanupBlankTabsAfterLastLease(options: {
   );
 }
 
+async function releaseLocalBrowserTabLease(options: {
+  lease: BrowserTabLease;
+  closeOwnedRunTarget: () => Promise<void>;
+  cleanupBlankTabs: () => Promise<void>;
+  terminateSharedChrome?: () => Promise<boolean>;
+  sessionId?: string;
+  chromePid?: number;
+  chromePort?: number;
+  chromeTargetId?: string | null;
+  launchDisposition?: "launched" | "reused";
+  logger: BrowserLogger;
+}): Promise<{
+  keepBrowserOpen: boolean;
+  terminationHandled: boolean;
+  releaseError?: Error;
+}> {
+  let decisionObserved = false;
+  let keepBrowserOpen = false;
+  let terminationHandled = false;
+  let otherLeasesRemain = false;
+  let releaseError: Error | undefined;
+
+  try {
+    await options.lease.release({
+      onRelease: async ({ isLastLease }) => {
+        decisionObserved = true;
+        if (!isLastLease) {
+          // Record this before any best-effort tab cleanup so a cleanup failure can
+          // never fall through into terminating Chrome used by another lease.
+          keepBrowserOpen = true;
+          otherLeasesRemain = true;
+        }
+        await options.closeOwnedRunTarget().catch(() => undefined);
+        if (!isLastLease) {
+          return;
+        }
+        await options.cleanupBlankTabs().catch(() => undefined);
+        if (options.terminateSharedChrome) {
+          options.logger(
+            `[browser] ChatGPT browser slot ${options.lease.id.slice(0, 8)} is final; ` +
+              `terminating shared Chrome (${formatBrowserLeaseDiagnostics(options)}).`,
+          );
+          const terminated = await options.terminateSharedChrome().catch(() => false);
+          if (terminated) {
+            terminationHandled = true;
+          } else {
+            // A reused Chrome handle may have a no-op kill implementation. Never
+            // claim cleanup or fall through into an unverified lock-free kill.
+            keepBrowserOpen = true;
+            options.logger(
+              "[browser] Could not verify shared Chrome termination; leaving it available for reuse.",
+            );
+          }
+        }
+      },
+    });
+  } catch (error) {
+    releaseError = error instanceof Error ? error : new Error(String(error));
+    if (!terminationHandled) keepBrowserOpen = true;
+    options.logger(
+      `[browser] Failed to release the ChatGPT browser slot registry lock; restart Oracle/Codex MCP before another browser run: ${releaseError.message}`,
+    );
+  }
+
+  if (!decisionObserved) {
+    options.logger(
+      "[browser] Could not verify final ChatGPT tab lease; leaving shared Chrome running.",
+    );
+    return {
+      keepBrowserOpen: true,
+      terminationHandled: false,
+      ...(releaseError ? { releaseError } : {}),
+    };
+  }
+  if (otherLeasesRemain) {
+    options.logger(
+      `[browser] Other ChatGPT tab leases still active; leaving shared Chrome running; ` +
+        `browser slot ${options.lease.id.slice(0, 8)} is non-final ` +
+        `(${formatBrowserLeaseDiagnostics(options)}).`,
+    );
+  }
+  return {
+    keepBrowserOpen,
+    terminationHandled,
+    ...(releaseError ? { releaseError } : {}),
+  };
+}
+
+function formatBrowserLeaseDiagnostics(options: {
+  sessionId?: string;
+  chromePid?: number;
+  chromePort?: number;
+  chromeTargetId?: string | null;
+  launchDisposition?: "launched" | "reused";
+}): string {
+  return [
+    `session=${options.sessionId ?? "unknown"}`,
+    `controllerPid=${process.pid}`,
+    `chromePid=${options.chromePid ?? "unknown"}`,
+    `chromePort=${options.chromePort ?? "unknown"}`,
+    `target=${options.chromeTargetId ?? "unknown"}`,
+    `launch=${options.launchDisposition ?? "unknown"}`,
+  ].join("; ");
+}
+
 function buildSkippedModelSelectionEvidence(
   desiredModel: string | null | undefined,
   strategy: BrowserModelSelectionEvidence["strategy"],
@@ -915,12 +1073,17 @@ function buildSkippedModelSelectionEvidence(
 }
 
 export async function runBrowserMode(options: BrowserRunOptions): Promise<BrowserRunResult> {
+  const attachments: BrowserAttachment[] = options.attachments ?? [];
+  assertUniqueAttachmentBasenames(attachments, {
+    stage: "upload",
+    subject: "Browser upload",
+  });
+
   const promptText = options.prompt?.trim();
   if (!promptText) {
     throw new Error("Prompt text is required when using browser mode.");
   }
 
-  const attachments: BrowserAttachment[] = options.attachments ?? [];
   const fallbackSubmission = options.fallbackSubmission;
 
   let config = resolveBrowserConfig(options.config);
@@ -1131,6 +1294,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         isInFlight: () => runStatus !== "complete",
         emitRuntimeHint,
         preserveUserDataDir: manualLogin,
+        preserveSharedChromeOnSignal: manualLogin,
         // copy-profile is a throwaway copy of a signed-in profile; never leave it on disk.
         forceProfileCleanup: usingCopiedProfile,
       },
@@ -1246,7 +1410,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     }
     await Promise.all(domainEnablers);
     if (!config.headless && config.hideWindow) {
-      await positionChromeWindowOffscreen(client, logger);
+      await positionChromeWindowOffscreen(client, userDataDir, logger);
+    } else if (!config.headless) {
+      // Persistent profiles can retain bounds from a prior hidden run. Visible
+      // local runs must actively restore the Oracle-owned Chrome window.
+      await positionChromeWindowOnscreen(client, userDataDir, logger);
     }
     // The send button is clicked with trusted CDP input events at viewport
     // coordinates, which ChatGPT silently drops when the window is hidden or
@@ -1507,22 +1675,23 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       );
     }
     const deepResearch = config.researchMode === "deep";
-    // Handle thinking time selection if specified. Deep Research owns its own effort flow.
-    const thinkingTime = config.thinkingTime;
-    if (thinkingTime && !deepResearch) {
+    if (shouldApplyThinkingTimeSelection(config)) {
       const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
       thinkingSelectionEvidence = await raceWithDisconnect(
-        withRetries(() => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel), {
-          retries: 2,
-          delayMs: 300,
-          onRetry: (attempt, error) => {
-            if (options.verbose) {
-              logger(
-                `[retry] Thinking time (${thinkingTime}) attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
-              );
-            }
+        withRetries(
+          () => ensureThinkingTime(Runtime, config.thinkingTime, logger, thinkingTargetModel),
+          {
+            retries: 2,
+            delayMs: 300,
+            onRetry: (attempt, error) => {
+              if (options.verbose) {
+                logger(
+                  `[retry] Thinking time (${config.thinkingTime}) attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
+                );
+              }
+            },
           },
-        }),
+        ),
       );
     }
     const profileLockTimeoutMs = manualLogin ? (config.profileLockTimeoutMs ?? 0) : 0;
@@ -1608,6 +1777,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       const providerState: Record<string, unknown> = {
         runtime: Runtime,
         input: Input,
+        page: Page,
         logger,
         timeoutMs: config.timeoutMs,
         inputTimeoutMs: config.inputTimeoutMs ?? undefined,
@@ -1788,6 +1958,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           baselineTurns ?? undefined,
           expectedConversationId(),
         ).catch(() => null);
+        throwIfAssistantUiError(snapshot);
         const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
         if (text) {
           const normalized = normalizeForComparison(text);
@@ -2079,6 +2250,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             baselineTurns ?? undefined,
             expectedConversationId(),
           ).catch(() => null);
+          throwIfAssistantUiError(snapshot);
           const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
           const isStillEcho = !text || Boolean(promptEchoMatcher?.isEcho(text));
           if (!isStillEcho) {
@@ -2111,6 +2283,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
             baselineTurns ?? undefined,
             expectedConversationId(),
           ).catch(() => null);
+          throwIfAssistantUiError(snapshot);
           const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
           if (text && text.length > bestText.length) {
             bestText = text;
@@ -2417,20 +2590,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       usingCopiedProfile,
     });
     let cleanupProfileLock: ProfileRunLock | null = null;
-    let terminatedRecordedChrome = false;
-    let otherActiveBrowserTabLeases: boolean | null = null;
-    const hasOtherActiveLeases = async () => {
-      if (!manualLogin || !tabLease) {
-        return false;
-      }
-      if (otherActiveBrowserTabLeases === null) {
-        otherActiveBrowserTabLeases = await hasOtherActiveBrowserTabLeases(
-          userDataDir,
-          tabLease.id,
-        );
-      }
-      return otherActiveBrowserTabLeases;
-    };
+    let browserTerminationHandledByLease = false;
+    let tabLeaseReleaseError: Error | undefined;
     if (!keepBrowserOpen && manualLogin && tabLease) {
       const cleanupLockTimeoutMs = Math.max(0, config.profileLockTimeoutMs ?? 0);
       if (cleanupLockTimeoutMs > 0) {
@@ -2439,15 +2600,6 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger,
           sessionId: options.sessionId,
         }).catch(() => null);
-      }
-      keepBrowserOpen = await hasOtherActiveLeases().catch(() => false);
-      if (keepBrowserOpen) {
-        logger("[browser] Other ChatGPT tab leases still active; leaving shared Chrome running.");
-      } else if (reusedChrome && !connectionClosedUnexpectedly) {
-        terminatedRecordedChrome = await terminateRecordedChromeForProfile(
-          userDataDir,
-          logger,
-        ).catch(() => false);
       }
     }
     const closeOwnedRunTarget = async () => {
@@ -2497,13 +2649,25 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     if (tabLease) {
       const handle = tabLease;
       tabLease = null;
-      const onRelease = async ({ isLastLease }: { isLastLease: boolean }) => {
-        await closeOwnedRunTarget();
-        if (isLastLease) {
-          await cleanupBlankTabs();
-        }
-      };
-      await handle.release({ onRelease }).catch(() => undefined);
+      const terminateSharedChrome =
+        !keepBrowserOpen && manualLogin && !connectionClosedUnexpectedly
+          ? async () => terminateRecordedChromeForProfile(userDataDir, logger).catch(() => false)
+          : undefined;
+      const releaseResult = await releaseLocalBrowserTabLease({
+        lease: handle,
+        closeOwnedRunTarget,
+        cleanupBlankTabs,
+        terminateSharedChrome,
+        sessionId: options.sessionId,
+        chromePid: chrome.pid,
+        chromePort: chrome.port,
+        chromeTargetId: isolatedTargetId,
+        launchDisposition: reusedChrome ? "reused" : "launched",
+        logger,
+      });
+      keepBrowserOpen ||= releaseResult.keepBrowserOpen;
+      browserTerminationHandledByLease = releaseResult.terminationHandled;
+      tabLeaseReleaseError = releaseResult.releaseError;
     } else {
       await closeOwnedRunTarget();
       await cleanupBlankTabs();
@@ -2513,7 +2677,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     if (!keepBrowserOpen) {
       if (!connectionClosedUnexpectedly) {
         try {
-          if (!terminatedRecordedChrome) {
+          if (!browserTerminationHandledByLease) {
             await chrome.kill();
           }
         } catch {
@@ -2552,6 +2716,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       const handle = cleanupProfileLock;
       cleanupProfileLock = null;
       await handle.release().catch(() => undefined);
+    }
+    if (tabLeaseReleaseError) {
+      // oxlint-disable-next-line eslint/no-unsafe-finally -- This cleanup failure must override a successful browser result or a live MCP owner can remain locked.
+      throw new Error(
+        "Failed to release the ChatGPT browser slot registry lock; restart Oracle/Codex MCP before another browser run.",
+        { cause: tabLeaseReleaseError },
+      );
     }
   }
 }
@@ -2986,6 +3157,7 @@ async function runRemoteBrowserMode(
         browserWSEndpoint,
         {
           approvalWaitMs: config.attachRunning && browserWSEndpoint ? 20_000 : undefined,
+          fallbackToDefault: false,
         },
       );
       client = connection.client;
@@ -3114,19 +3286,17 @@ async function runRemoteBrowserMode(
       );
     }
     const deepResearch = config.researchMode === "deep";
-    // Handle thinking time selection if specified. Deep Research owns its own effort flow.
-    const thinkingTime = config.thinkingTime;
-    if (thinkingTime && !deepResearch) {
+    if (shouldApplyThinkingTimeSelection(config)) {
       const thinkingTargetModel = modelStrategy === "select" ? config.desiredModel : null;
       thinkingSelectionEvidence = await withRetries(
-        () => ensureThinkingTime(Runtime, thinkingTime, logger, thinkingTargetModel),
+        () => ensureThinkingTime(Runtime, config.thinkingTime, logger, thinkingTargetModel),
         {
           retries: 2,
           delayMs: 300,
           onRetry: (attempt, error) => {
             if (options.verbose) {
               logger(
-                `[retry] Thinking time (${thinkingTime}) attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
+                `[retry] Thinking time (${config.thinkingTime}) attempt ${attempt + 1}: ${error instanceof Error ? error.message : error}`,
               );
             }
           },
@@ -3185,6 +3355,7 @@ async function runRemoteBrowserMode(
       const providerState: Record<string, unknown> = {
         runtime: Runtime,
         input: Input,
+        page: Page,
         logger,
         timeoutMs: config.timeoutMs,
         inputTimeoutMs: config.inputTimeoutMs ?? undefined,
@@ -3329,6 +3500,7 @@ async function runRemoteBrowserMode(
           baselineTurns ?? undefined,
           expectedConversationId(),
         ).catch(() => null);
+        throwIfAssistantUiError(snapshot);
         const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
         if (text) {
           const normalized = normalizeForComparison(text);
@@ -3608,6 +3780,7 @@ async function runRemoteBrowserMode(
             baselineTurns ?? undefined,
             expectedConversationId(),
           ).catch(() => null);
+          throwIfAssistantUiError(snapshot);
           const text = typeof snapshot?.text === "string" ? snapshot.text.trim() : "";
           const isStillEcho = !text || Boolean(promptEchoMatcher?.isEcho(text));
           if (!isStillEcho) {
@@ -3897,10 +4070,13 @@ export const __test__ = {
   isImageOnlyUiChromeText,
   listIgnoredRemoteChromeFlags,
   normalizeAuthenticatedModelSelectionError,
+  pollGeneratedImageOrTextAssistantResponse,
   resolveManualLoginWaitMs,
+  shouldApplyThinkingTimeSelection,
   shouldCleanupBlankTabsAfterLastLease,
   shouldCloseOwnedRunTargetAfterRun,
   shouldKeepLocalBrowserOpen,
+  releaseLocalBrowserTabLease,
   waitForAssistantResponseWithReload,
 };
 export { syncCookies } from "./cookies.js";
