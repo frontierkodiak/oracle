@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Browser: port upstream GPT-6 `Latest` selection and verified direct-slider Pro effort support. `--engine browser --model gpt-6-pro --browser-thinking-time pro` now selects the new model without changing the default model or adding API support. Preserve strict refusal when model or effort selection is unconfirmed.
+
 - Serve: honor `browser.hideWindow` for the shared manual-login Chrome, add explicit `--browser-hide-window` / `--browser-show-window` overrides and health metadata, and reveal a hidden window whenever interactive login is required.
 
 ## 0.18.0 — 2026-08-14

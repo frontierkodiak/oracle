@@ -105,13 +105,8 @@ function logPickerDiagnostic(result: ThinkingTimeOutcome | undefined, logger: Br
 /**
  * Selects a thinking-time level in ChatGPT's composer.
  *
- * Missing controls remain best-effort except Pro Extended, which fails closed
- * unless the selected option is confirmed.
- *
- * Returns the evidence record for what was actually confirmed in the picker, so
- * a caller can persist proof that a run submitted at the requested effort rather
- * than inheriting whatever tier the composer already had. Strict (fail-closed)
- * requests never return an unverified record — they throw before submit.
+ * Returns the UI selection observed at capturedAt, not backend attestation.
+ * Explicit Pro and Pro Extended requests still fail closed when unconfirmed.
  */
 export async function ensureThinkingTime(
   Runtime: ChromeClient["Runtime"],
@@ -171,7 +166,7 @@ export async function ensureThinkingTime(
           `${result.label ?? capitalizedLevel} is unavailable on this account (${result.notice ?? "no reason given"}); keeping the effort already selected in ChatGPT.`,
         ),
       );
-      return evidence("unverified", result.label ?? null);
+      return evidence("unverified", null);
     }
     case "chip-not-found":
     case "menu-not-found":
@@ -304,6 +299,12 @@ function buildThinkingTimeExpression(
   const targetIsGpt56ModelLiteral = JSON.stringify(
     /(?:^|[^0-9])5[._ -]6(?:[^0-9]|$)/i.test(desiredModel ?? ""),
   );
+  // Astra resolves the gpt-6-pro request to this exact model-picker alias. Keep
+  // this deliberately narrow: a generic unknown model must not claim its
+  // version-prefixed effort pill whose ownership we cannot establish.
+  const targetIsAstraLatestLiteral = JSON.stringify(
+    (desiredModel ?? "").trim().toLowerCase() === "latest",
+  );
 
   return `(async () => {
     ${buildClickDispatcher()}
@@ -314,13 +315,14 @@ function buildThinkingTimeExpression(
     const TARGET_LEVEL = ${targetLevelLiteral};
     const TARGET_MODEL_KIND = ${targetModelKindLiteral};
     const TARGET_IS_GPT56_MODEL = ${targetIsGpt56ModelLiteral};
+    const TARGET_IS_ASTRA_LATEST = ${targetIsAstraLatestLiteral};
 
-    // Multilingual matchers: English level token + observed German/Japanese/Chinese variants.
+    // Multilingual matchers: English level token + observed localized variants.
     const LEVEL_TOKENS = {
-      light: ['light', 'instant', 'sofort', 'leicht', '最速', '轻', '极速'],
-      standard: ['standard', 'medium', 'mittel', '中程度', '标准', '中'],
-      extended: ['extended', 'high', 'hoch', 'erweitert', '高い', '扩展', '深度', '加强', '高'],
-      'extra-high': ['extra high', 'sehr hoch', '非常に高い', '极高'],
+      light: ['light', 'instant', 'sofort', 'leicht', '最速', '轻', '极速', '즉시'],
+      standard: ['standard', 'medium', 'mittel', '中程度', '标准', '中', '중간'],
+      extended: ['extended', 'high', 'hoch', 'erweitert', '高い', '扩展', '深度', '加强', '高', '높음'],
+      'extra-high': ['extra high', 'sehr hoch', '非常に高い', '極高', '极高', '매우 높음'],
       heavy: ['heavy', 'schwer', '重度', '加重'],
     };
     // Pro is a tier you can request, but it is also a MODEL name, so it must never
@@ -329,6 +331,29 @@ function buildThinkingTimeExpression(
     // "Instant"/"Pro" would look like a tier list. Keep it to target matching only.
     const TARGET_LEVEL_TOKENS = { ...LEVEL_TOKENS, pro: ['pro'] };
     const targetTokens = TARGET_LEVEL_TOKENS[TARGET_LEVEL] || [TARGET_LEVEL];
+    const normalizeAstraLabel = (value) =>
+      String(value ?? '')
+        .normalize('NFC')
+        .toLowerCase()
+        .split(String.fromCharCode(9)).join(' ')
+        .split(String.fromCharCode(10)).join(' ')
+        .split(String.fromCharCode(13)).join(' ')
+        .split(String.fromCharCode(12)).join(' ')
+        .split(' ').filter(Boolean).join(' ');
+    const isAstraLatestEffortPill = (label) =>
+      TARGET_IS_ASTRA_LATEST &&
+      Object.values(TARGET_LEVEL_TOKENS).some((tokens) =>
+        tokens.some((token) => {
+          // Do not use the generic matcher here: ownership needs an exact
+          // version prefix plus a known localized tier, not token containment.
+          const tier = normalizeAstraLabel(token);
+          const observed = normalizeAstraLabel(label);
+          return observed === '6 ' + tier || observed === '6' + tier;
+        }),
+      );
+    const isSolModelPillForLatest = (label) =>
+      TARGET_IS_ASTRA_LATEST &&
+      ['5.6 pro', '5.6pro', '5 6 pro'].includes(normalizeAstraLabel(label));
 
     const INITIAL_WAIT_MS = 150;
     const STEP_WAIT_MS = 200;
@@ -339,7 +364,7 @@ function buildThinkingTimeExpression(
     const INTELLIGENCE_WAIT_MS = 2500;
 
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-    // Keep CJK characters, including Japanese kana, so localized labels survive
+    // Keep CJK characters, including Japanese kana and Hangul, so labels survive
     // normalization before being matched against LEVEL_TOKENS and picker controls.
     const normalize = (value) => (value || '')
       // Compose first so NFD umlauts fold too, then map them onto ASCII before
@@ -350,7 +375,7 @@ function buildThinkingTimeExpression(
       .replace(/ö/g, 'o')
       .replace(/ü/g, 'u')
       .replace(/ß/g, 'ss')
-      .replace(/[^a-z0-9\\u3040-\\u30ff\\u4e00-\\u9fff]+/g, ' ')
+      .replace(/[^a-z0-9\\u3040-\\u30ff\\u4e00-\\u9fff\\uac00-\\ud7af]+/g, ' ')
       .replace(/\\s+/g, ' ')
       .trim();
     const hasToken = (text, token) => normalize(text).split(' ').includes(token);
@@ -379,6 +404,8 @@ function buildThinkingTimeExpression(
         if (token === 'extra high') return hasPhrase(t, 'extra high');
         if (token === 'hoch') return hasPhrase(t, 'hoch') && !hasPhrase(t, 'sehr hoch');
         if (token === 'sehr hoch') return hasPhrase(t, 'sehr hoch');
+        if (token === '높음') return hasPhrase(t, '높음') && !hasPhrase(t, '매우 높음');
+        if (token === '매우 높음') return hasPhrase(t, '매우 높음');
         if (token === '高い' || token === '非常に高い') {
           return t === token || hasToken(t, token);
         }
@@ -966,11 +993,11 @@ function buildThinkingTimeExpression(
     // token matching cannot be used here — substring is deliberate, as in
     // countEffortLevels above.
     const ADVANCED_WORDS = [
-      'advanced', 'erweitert', '高级', '詳細設定', '詳細表示',
+      'advanced', 'erweitert', '高级', '詳細設定', '詳細表示', '고급',
       'avanzado', 'avancado', 'avance',
     ];
     const EFFORT_WORDS = [
-      'effort', 'aufwand', '强度', '努力', '推論レベル',
+      'effort', 'aufwand', '强度', '努力', '推論レベル', '思考量', '추론 수준',
       'esfuerzo', 'esforco', 'sforzo', 'inspanning', 'wysilek',
     ];
     const containsAny = (label, words) => words.some((word) => label.includes(word));
@@ -1069,6 +1096,94 @@ function buildThinkingTimeExpression(
       return null;
     };
 
+    // The direct-slider rollout removes the Effort submenu entirely. Its keyboard
+    // owner announces the actual tier via aria-describedby; neither the pill nor
+    // the slider's maximum position alone proves that Pro was selected.
+    const selectDirectEffortSlider = async (menu) => {
+      const view = menu.querySelector?.('[data-model-selection-view="true"]');
+      const simple = view?.querySelector?.('[data-testid="composer-model-picker-slider-simple-view"]');
+      if (!simple || simple.getAttribute('data-active') !== 'true' || !isVisible(simple)) return null;
+      const resolve = () => {
+        const currentView = menu.querySelector?.('[data-model-selection-view="true"]');
+        const currentSimple = currentView?.querySelector?.('[data-testid="composer-model-picker-slider-simple-view"]');
+        if (currentSimple?.getAttribute('data-active') !== 'true') return null;
+        const slider = currentSimple.querySelector('[data-model-reasoning-effort-slider]');
+        const control = slider?.closest?.('[role="menuitem"]');
+        const thumb = slider?.querySelector?.('[role="slider"]');
+        if (!control || !thumb || !isVisible(control)) return null;
+        const levels = ['light', 'standard', 'extended', 'extra-high', 'pro'];
+        // The selected label leads localized aria-describedby prose, while punctuation
+        // and ordinal grammar vary by locale. Match only that leading label and let
+        // the thumb's numeric ARIA state independently prove its position.
+        const readLeadingLevel = (description) => {
+          const value = (description ?? '').normalize('NFC').trim();
+          if (!value) return null;
+          const matches = levels.flatMap((level, index) => {
+            const token = [...TARGET_LEVEL_TOKENS[level]]
+              .sort((left, right) => right.length - left.length)
+              .find((candidate) => {
+                const normalizedCandidate = candidate.normalize('NFC');
+                const prefix = value.slice(0, normalizedCandidate.length);
+                if (normalize(prefix) !== normalize(normalizedCandidate)) return false;
+                // normalize() erases Unicode letters and marks; inspect the boundary intact.
+                const suffix = value.slice(prefix.length);
+                return !suffix || /^[\\s\\p{P}]/u.test(suffix);
+              });
+            return token
+              ? [{ level, index, label: value.slice(0, token.normalize('NFC').length) }]
+              : [];
+          });
+          return matches.length === 1 ? matches[0] : null;
+        };
+        const selections = describedIds(control)
+          .map((id) => readLeadingLevel(document.getElementById?.(id)?.textContent ?? ''))
+          .filter(Boolean);
+        if (selections.length !== 1) return null;
+        const { label, index, level } = selections[0];
+        // This adapter owns the observed five-tier layout only. A different range
+        // or contradictory announcement must not turn a numeric guess into proof.
+        if (thumb.getAttribute('aria-valuemin') !== '0' || thumb.getAttribute('aria-valuemax') !== '4' ||
+            thumb.getAttribute('aria-valuenow') !== String(index)) return null;
+        return { control, label, index, level };
+      };
+      let current = resolve();
+      const finish = (result) => { closeOpenMenus(); return result; };
+      // The picker can expose its simple view before the keyboard owner is mounted or visible.
+      const readyDeadline = performance.now() + MAX_WAIT_MS;
+      while (!current && performance.now() < readyDeadline) {
+        await sleep(100);
+        current = resolve();
+      }
+      if (!current) return finish(failure('selection-unverified'));
+      // Preserve the legacy Pro-model + extended contract on unified pickers.
+      const target = TARGET_MODEL_KIND === 'pro' && TARGET_LEVEL === 'extended' ? 'pro' : TARGET_LEVEL;
+      const targetIndex = ['light', 'standard', 'extended', 'extra-high', 'pro'].indexOf(target);
+      if (targetIndex < 0) {
+        if (TARGET_IS_GPT56_MODEL && TARGET_LEVEL === 'heavy' && current.level === 'pro') {
+          return finish({ status: 'already-selected', label: current.label });
+        }
+        return finish(failure('option-not-found'));
+      }
+      if (current.level === target) return finish({ status: 'already-selected', label: current.label });
+      const deadline = performance.now() + MAX_WAIT_MS;
+      for (let attempt = 0; attempt < 4 && performance.now() < deadline; attempt += 1) {
+        if (isOptionDisabled(current.control)) return finish(failure('option-disabled', { label: current.label }));
+        const previousIndex = current.index;
+        const key = targetIndex > previousIndex ? 'ArrowRight' : 'ArrowLeft';
+        current.control.focus?.();
+        current.control.dispatchEvent(new KeyboardEvent('keydown', { key, code: key, bubbles: true, cancelable: true }));
+        current = null;
+        while (performance.now() < deadline) {
+          await sleep(100);
+          const next = resolve();
+          if (next && next.index !== previousIndex) { current = next; break; }
+        }
+        if (!current) return finish(failure('selection-unverified'));
+        if (current.level === target) return finish({ status: 'switched', label: current.label });
+      }
+      return finish(failure('selection-unverified'));
+    };
+
     // Current ChatGPT exposes a standalone Pro or Thinking composer pill whose
     // controlled menu contains the effort levels. Prefer this ownership boundary
     // before probing older model-picker layouts.
@@ -1085,6 +1200,9 @@ function buildThinkingTimeExpression(
           if (seen.has(button) || !isVisible(button)) continue;
           seen.add(button);
           if (button.getAttribute?.('data-testid') === 'model-switcher-dropdown-button') continue;
+          // A 5.6 Pro model pill is not Astra Latest's 6-prefixed effort owner.
+          // Keep this rejection ahead of the generic compatibility matcher.
+          if (isSolModelPillForLatest(button.textContent ?? '')) continue;
           const label = normalize(
             (button.getAttribute?.('aria-label') ?? '') + ' ' +
             (button.getAttribute?.('data-testid') ?? '') + ' ' +
@@ -1094,6 +1212,11 @@ function buildThinkingTimeExpression(
             (TARGET_MODEL_KIND === 'pro' && hasToken(label, 'pro') && !hasToken(label, 'thinking')) ||
             (TARGET_MODEL_KIND === 'thinking' && hasToken(label, 'thinking') && !hasToken(label, 'pro')) ||
             (!TARGET_MODEL_KIND && hasToken(label, 'thinking')) ||
+            // Astra Latest prefixes a supported effort label with "6" (for
+            // example, "6 Pro" or textContent-concatenated "6Pro"). This is
+            // recognized only for the exact Latest target; selection still
+            // requires the direct slider's leading label and numeric ARIA proof.
+            isAstraLatestEffortPill(button.textContent ?? '') ||
             (button.matches?.('button.__composer-pill') && matchesAnyEffortLevel(label))
           ) {
             return button;
@@ -1180,6 +1303,7 @@ function buildThinkingTimeExpression(
         tokens.some((token) => normalize(token) === pillLabel),
       );
       const pillNamesEffortNotModel =
+        TARGET_IS_ASTRA_LATEST ||
         TARGET_IS_GPT56_MODEL ||
         (pillIsBareEffortTier && Boolean(document.querySelector(INTELLIGENCE_MENU_SELECTOR)));
       const composerModelKind =
@@ -1193,6 +1317,8 @@ function buildThinkingTimeExpression(
       while (performance.now() < deadline) {
         const menu = findVisibleEffortMenu(composerEffortPill);
         if (menu) {
+          const sliderResult = await selectDirectEffortSlider(menu);
+          if (sliderResult) return sliderResult;
           const proEffortResult = await selectProEffortFromSubmenu();
           if (proEffortResult) {
             return proEffortResult;

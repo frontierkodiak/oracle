@@ -1,5 +1,6 @@
 import type { EngineMode } from "./engine.js";
 import type { ModelName, ReasoningMode } from "../oracle.js";
+import { isGpt6ProAlias } from "./browserConfig.js";
 import { isProModel } from "../oracle/modelResolver.js";
 
 export function shouldDetachSession({
@@ -20,7 +21,7 @@ export function shouldDetachSession({
   // Keep long local browser Pro work in a separate process even while the CLI
   // stays attached to its session log. If the foreground stream is interrupted,
   // the worker can still finish the browser run and persist the answer.
-  if (engine === "browser" && isProModel(model)) return true;
+  if (engine === "browser" && (isProModel(model) || isGpt6ProAlias(model))) return true;
   // For API runs, explicit --wait keeps execution in the foreground.
   if (waitPreference) return false;
   // Pro-tier API runs start detached by default.
