@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Serve: collect interrupted runs through the durable queue with bounded read-only retries and immutable, idempotent transcript observations. `oracle remote reconcile` / `collect` exposes a separate receipt; successful collection remains `captured_unattributed` and preserves the original transport outcome.
+
 ### Fixed
 
 - Browser: port upstream GPT-6 `Latest` selection and verified direct-slider Pro effort support. `--engine browser --model gpt-6-pro --browser-thinking-time pro` now selects the new model without changing the default model or adding API support. Preserve strict refusal when model or effort selection is unconfirmed.
