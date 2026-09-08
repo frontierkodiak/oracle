@@ -270,6 +270,15 @@ describe("resolveApiModel", () => {
     );
   });
 
+  test("keeps GPT-6 API normalization unchanged while rejecting the browser-only Pro alias", () => {
+    for (const model of ["gpt-6", "gpt-6-astra", "latest"]) {
+      expect(resolveApiModel(model)).toBe(model);
+    }
+    expect(() => resolveApiModel("gpt-6-pro")).toThrow("Use --engine browser --model gpt-6-pro");
+    expect(inferModelFromLabel("GPT-6 Pro")).toBe("gpt-6-pro");
+    expect(inferModelFromLabel("Latest")).toBe("gpt-6-astra");
+  });
+
   test("passes through unknown names (OpenRouter/custom)", () => {
     expect(resolveApiModel("instant")).toBe("instant");
     expect(resolveApiModel("openai/gpt-5.4")).toBe("openai/gpt-5.4");

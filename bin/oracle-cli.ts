@@ -52,6 +52,7 @@ import {
   dedupePathInputs,
 } from "../src/cli/options.js";
 import { copyToClipboard } from "../src/cli/clipboard.js";
+import { isGpt6ProAlias } from "../src/cli/browserConfig.js";
 import { buildMarkdownBundle } from "../src/cli/markdownBundle.js";
 import { shouldDetachSession, stopDetachedWorker } from "../src/cli/detach.js";
 import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
@@ -2291,9 +2292,19 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   const providerMode = resolveApiProviderMode(options);
-  const engineModels = multiModelProvided
-    ? Array.from(new Set(options.models!.map((entry) => resolveApiModel(entry))))
-    : [resolveApiModel(normalizeModelOption(options.model) || DEFAULT_MODEL)];
+  // Engine discovery must not apply API-only validation to browser aliases.
+  const engineModelInputs = multiModelProvided
+    ? options.models!
+    : [normalizeModelOption(options.model) || DEFAULT_MODEL];
+  const engineModels = Array.from(
+    new Set(
+      engineModelInputs.map((entry) =>
+        isGpt6ProAlias(entry) && !options.route && !options.preflight
+          ? ("gpt-6-pro" as ModelName)
+          : resolveApiModel(entry),
+      ),
+    ),
+  );
   if (options.route || options.preflight) {
     const routeAzureEndpoint = firstNonEmpty(
       options.azureEndpoint,
