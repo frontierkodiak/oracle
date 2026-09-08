@@ -102,6 +102,25 @@ async function tempRoot() {
 }
 
 describe("TranscriptLedger", () => {
+  it("replays stable observation identity once and rejects different source bytes", async () => {
+    const dir = await tempRoot();
+    const files = await fixture(dir, "stable");
+    const changed = await fixture(dir, "changed", "different");
+    const ledger = await TranscriptLedger.open({ root: path.join(dir, "ledger") });
+    const input = {
+      provider: "chatgpt",
+      profileId: "profile-a",
+      observationId: "stable-capture",
+      ...files,
+    };
+    const first = await ledger.ingestPair(input);
+    expect((await ledger.ingestPair(input)).observationId).toBe(first.observationId);
+    expect(ledger.list()[0]?.observationCount).toBe(1);
+    await expect(ledger.ingestPair({ ...input, ...changed })).rejects.toThrow(
+      "observation identity conflicts",
+    );
+    ledger.close();
+  });
   it("preserves authoritative raw bytes in immutable content-addressed objects", async () => {
     const dir = await tempRoot();
     const files = await fixture(dir, "one");

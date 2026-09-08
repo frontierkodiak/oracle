@@ -227,6 +227,12 @@ export class DurableQueueStore {
     this.db.exec(
       "CREATE UNIQUE INDEX IF NOT EXISTS capture_grants_issue_key ON capture_grants(drain_id,issue_idempotency_key) WHERE issue_idempotency_key IS NOT NULL",
     );
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS reconciliations(run_id TEXT PRIMARY KEY REFERENCES runs(id),record TEXT NOT NULL)",
+    );
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS run_profiles(run_id TEXT PRIMARY KEY REFERENCES runs(id),profile_id TEXT NOT NULL)",
+    );
     this.reconcile();
   }
   static async open(o: DurableQueueOptions = {}): Promise<DurableQueueStore> {
@@ -254,6 +260,45 @@ export class DurableQueueStore {
       if (await lstat(p).catch(() => undefined)) await chmod(p, 0o600);
     }
     return store;
+  }
+  bindProfile(id: string, profileId: string): void {
+    this.db
+      .prepare("INSERT OR IGNORE INTO run_profiles(run_id,profile_id) VALUES(?,?)")
+      .run(id, profileId);
+    if (this.profileForRun(id) !== profileId) throw new Error("run_profile_mismatch");
+  }
+  profileForRun(id: string): string | undefined {
+    const row = this.db.prepare("SELECT profile_id FROM run_profiles WHERE run_id=?").get(id) as
+      | Row
+      | undefined;
+    return row ? String(row.profile_id) : undefined;
+  }
+  reconciliation<T>(id: string): T | undefined {
+    const row = this.db.prepare("SELECT record FROM reconciliations WHERE run_id=?").get(id) as
+      | Row
+      | undefined;
+    return row ? (JSON.parse(String(row.record)) as T) : undefined;
+  }
+  saveReconciliation(id: string, record: unknown): void {
+    this.db
+      .prepare(
+        "INSERT INTO reconciliations(run_id,record) VALUES(?,?) ON CONFLICT(run_id) DO UPDATE SET record=excluded.record",
+      )
+      .run(id, JSON.stringify(record));
+  }
+  reconciliationCandidates(limit = 32): string[] {
+    return (
+      this.db
+        .prepare(
+          "SELECT id FROM runs WHERE state='unknown' AND id NOT IN (SELECT run_id FROM reconciliations) AND id NOT IN (SELECT run_id FROM capture_grants WHERE run_id IS NOT NULL) ORDER BY admission_seq DESC LIMIT ?",
+        )
+        .all(limit) as Row[]
+    ).map((row) => String(row.id));
+  }
+  reconciliationRecords<T>(): T[] {
+    return (
+      this.db.prepare("SELECT record FROM reconciliations ORDER BY rowid").all() as Row[]
+    ).map((row) => JSON.parse(String(row.record)) as T);
   }
   close(): void {
     if (this.db.isOpen) this.db.close();

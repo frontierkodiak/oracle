@@ -1,3 +1,4 @@
+import type { Reconciliation } from "./reconciliation.js";
 import http from "node:http";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
@@ -265,6 +266,53 @@ export async function submitDurableRemoteRunWithReceipt(p: {
     await writeDurableReceipt(receipt);
   }
   return { receipt, snapshot };
+}
+export async function reconcileDurableRemoteRun(
+  host: string,
+  id: string,
+  token?: string,
+  inspect = false,
+  resume = false,
+  useCurrentProfile = false,
+): Promise<Reconciliation | null> {
+  const result = await requestDurableJson({
+    host,
+    token,
+    method: inspect ? "GET" : "POST",
+    path: `/v1/runs/${encodeURIComponent(id)}/reconciliation`,
+    ...(inspect
+      ? {}
+      : {
+          payload:
+            resume || useCurrentProfile
+              ? { action: "resume", ...(useCurrentProfile ? { useCurrentProfile: true } : {}) }
+              : {},
+        }),
+  });
+  if (result === null && inspect) return null;
+  if (
+    !result ||
+    result.schemaVersion !== 1 ||
+    result.runId !== id ||
+    ![
+      "paused",
+      "profile_unbound",
+      "pending",
+      "collecting",
+      "retry_wait",
+      "auth_unavailable",
+      "challenged",
+      "retry_exhausted",
+      "missing_identity",
+      "profile_mismatch",
+      "ineligible",
+      "captured_unattributed",
+    ].includes(result.state) ||
+    !Number.isInteger(result.attempt) ||
+    result.attempt < 0
+  )
+    throw new Error("Invalid reconciliation response");
+  return result as Reconciliation;
 }
 export async function getDurableRemoteRun(
   host: string,

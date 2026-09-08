@@ -28,6 +28,8 @@ export interface TranscriptLedgerOptions {
 }
 
 export interface IngestPairInput {
+  /** Stable identity of one capture; replay requires identical source bytes. */
+  observationId?: string;
   provider: string;
   profileId: string;
   conversationId?: string;
@@ -1021,7 +1023,9 @@ export class TranscriptLedger {
     const key = conversationKey(input.provider, input.profileId, parsed.id);
     const capturedAt = input.capturedAt ?? now();
     const revisionId = hashText(`${key}\u0000${normalizedSequenceSha256}`);
-    const observationId = randomUUID();
+    const observationId = input.observationId ?? randomUUID();
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(observationId))
+      throw new Error("invalid observation identity");
     const acquiredReleaseTurn = await this.acquirePublicationTurnForOperation();
     this.activePublicationOperations += 1;
     setReleaseTurn(() => {
@@ -1036,6 +1040,30 @@ export class TranscriptLedger {
     try {
       db.exec("BEGIN IMMEDIATE");
       transactionStarted = true;
+      const prior = db
+        .prepare("SELECT * FROM observations WHERE observation_id=?")
+        .get(observationId);
+      if (prior) {
+        if (
+          prior.conversation_key !== key ||
+          prior.raw_sha256 !== rawSha256 ||
+          prior.evidence_sha256 !== evidenceSha256 ||
+          prior.independent_sha256 !== independentSha256 ||
+          prior.status !== "captured"
+        )
+          throw new Error("observation identity conflicts with source bytes");
+        db.exec("COMMIT");
+        return {
+          conversationKey: key,
+          observationId,
+          revisionId: String(prior.revision_id),
+          deduplicated: true,
+          rawSha256,
+          evidenceSha256,
+          independentSha256,
+          normalizedSequenceSha256,
+        };
+      }
       rawObject = await writeObject(this.root, rawBytes, rawSha256);
       evidenceObject = await writeObject(this.root, evidenceBytes, evidenceSha256);
       independentObject = await writeObject(this.root, independentBytes, independentSha256);

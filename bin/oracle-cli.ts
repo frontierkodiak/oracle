@@ -79,6 +79,7 @@ import { resolveRemoteServiceConfig } from "../src/remote/remoteServiceConfig.js
 import { buildBrowserConfig } from "../src/cli/browserConfig.js";
 import {
   cancelDurableRemoteRun,
+  reconcileDurableRemoteRun,
   getDurableRemoteQueueStatus,
   getDurableRemoteRun,
   receiptPath,
@@ -1422,6 +1423,33 @@ remoteCancel.action(async function (this: Command, runId: string) {
   const { host, token } = remoteHostAndToken(this);
   const snapshot = await cancelDurableRemoteRun(host, runId, token);
   printRemoteValue(snapshot, Boolean(options.json), `${snapshot.id}: ${snapshot.state}`);
+});
+
+const remoteReconcile = addRemoteConnectionOptions(
+  remoteCommand
+    .command("reconcile <run-id>")
+    .alias("collect")
+    .description("Schedule read-only collection for an interrupted run; never resend its prompt.")
+    .option("--inspect", "Read the persisted collection receipt without scheduling work.", false)
+    .option("--resume", "Resume attention with another bounded retry budget.", false)
+    .option(
+      "--use-current-profile",
+      "Explicitly bind a historical run with unknown profile to this host profile.",
+      false,
+    ),
+);
+remoteReconcile.action(async function (this: Command, runId: string) {
+  const options = this.opts<Record<string, unknown>>();
+  const { host, token } = remoteHostAndToken(this);
+  const value = await reconcileDurableRemoteRun(
+    host,
+    runId,
+    token,
+    Boolean(options.inspect),
+    Boolean(options.resume),
+    Boolean(options.useCurrentProfile),
+  );
+  printRemoteValue(value, Boolean(options.json), `${runId}: ${value?.state ?? "not scheduled"}`);
 });
 
 const remoteStatus = addRemoteConnectionOptions(
