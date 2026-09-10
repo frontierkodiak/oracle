@@ -84,6 +84,50 @@ describe("browser follow-up resolution", () => {
     await expect(resolveBrowserFollowupReference("api-slug", store)).resolves.toBeNull();
   });
 
+  test("converts capture-only parents to unasserted ordinary follow-ups", async () => {
+    const metadata: SessionMetadata = {
+      ...baseMetadata,
+      id: "capture-parent",
+      mode: "browser",
+      model: "gpt-5.5-pro",
+      options: {
+        browserConfig: {
+          captureOnly: true,
+          desiredModel: "GPT-5.5",
+          modelStrategy: "select",
+          thinkingTime: "pro",
+          resumeConversationUrl: "https://chatgpt.com/c/observed",
+        },
+      },
+      browser: {
+        config: {
+          captureOnly: true,
+          desiredModel: "GPT-5.5",
+          modelStrategy: "select",
+          thinkingTime: "pro",
+        },
+        runtime: { tabUrl: "https://chatgpt.com/c/observed" },
+      },
+    };
+    const store = { readSession: vi.fn(async () => metadata) };
+
+    await expect(resolveBrowserFollowupReference("capture-parent", store)).resolves.toEqual({
+      sessionId: "capture-parent",
+      resumeConversationUrl: "https://chatgpt.com/c/observed",
+      model: "gpt-5.5-pro",
+      browserConfig: {
+        browserTabRef: null,
+        researchMode: "off",
+        archiveConversations: "never",
+        captureOnly: false,
+        desiredModel: undefined,
+        modelStrategy: "ignore",
+        thinkingTime: undefined,
+        resumeConversationUrl: "https://chatgpt.com/c/observed",
+      },
+    });
+  });
+
   test("errors clearly when a browser session has no conversation URL", async () => {
     const metadata: SessionMetadata = {
       ...baseMetadata,
