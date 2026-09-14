@@ -43,6 +43,8 @@ jobs:
       - run: pnpm run test:coverage
         if: matrix.os == 'ubuntu-latest' && matrix.node == 24
       - run: pnpm run build
+      - name: Prove provider-native conversation evidence with recorded fixtures
+        run: node scripts/provider-native-capture-proof.mjs
       - name: Prove browser transport reuse and idle process exit
         run: node scripts/browser-connection-proof.mjs
       - name: Prove shared Chrome controller lifetime on Windows

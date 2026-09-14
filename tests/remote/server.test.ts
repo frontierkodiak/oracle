@@ -1566,6 +1566,7 @@ describe("client browser-config allowlist", () => {
       inlineCookies: [],
       inlineCookiesSource: "somewhere",
       allowCookieErrors: true,
+      captureProviderNative: true,
       maxConcurrentTabs: 99,
       profileLockTimeoutMs: 0,
       reuseChromeWaitMs: 0,

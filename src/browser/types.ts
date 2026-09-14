@@ -1,3 +1,4 @@
+import type { ProviderNativeCaptureSummary } from "./chatgptConversation.js";
 import type CDP from "chrome-remote-interface";
 import type Protocol from "devtools-protocol";
 import type {
@@ -212,6 +213,7 @@ export interface BrowserRunResult {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   thinkingSelection?: BrowserThinkingSelectionEvidence;
+  providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
   tookMs: number;
   answerTokens: number;

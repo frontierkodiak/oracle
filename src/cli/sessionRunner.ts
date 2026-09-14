@@ -244,6 +244,7 @@ export async function performSessionRun({
           archive: result.archive,
           modelSelection: result.modelSelection,
           thinkingSelection: result.thinkingSelection,
+          providerNativeCapture: result.providerNativeCapture,
           warnings: browserWarnings.length > 0 ? browserWarnings : undefined,
         },
         artifacts: mergeArtifacts(

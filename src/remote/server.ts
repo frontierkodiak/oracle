@@ -1078,6 +1078,7 @@ function sanitizeResult(
     answerChars: result.answerChars,
     modelSelection: result.modelSelection,
     thinkingSelection: result.thinkingSelection,
+    providerNativeCapture: result.providerNativeCapture,
     researchPlan: result.researchPlan,
     archive: result.archive,
     tabUrl: result.tabUrl,

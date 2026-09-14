@@ -153,3 +153,5 @@ See [Browser Mode](browser-mode.md) for usage.
 - `oracle --help` — short usage.
 - `oracle --help --verbose` — every flag, including hidden ones.
 - [Configuration](configuration.md) — `~/.oracle/config.json` and project `.oracle/config.json` defaults.
+
+Provider-native evidence: `--browser-capture-provider-native` saves the full ChatGPT conversation record and independent text digests with session artifacts. It is opt-in; `--no-browser-capture-provider-native` overrides a saved preference. See [provider-native evidence](browser-mode.md#provider-native-conversation-evidence) for retained data, fidelity, and fallback behavior.

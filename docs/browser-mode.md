@@ -458,3 +458,45 @@ Restart all browser controllers together after upgrading: older live controllers
 used a different lock-timeout recovery rule. Existing stored lease records remain
 readable. Native Windows shared-profile Chrome is detached from its launching
 controller; this does not change temporary or copied-profile launch policy.
+
+### Provider-native conversation evidence
+
+`--browser-capture-provider-native` additionally saves ChatGPT's full conversation
+JSON, verbatim, and an evidence JSON file in the session's `artifacts/` directory.
+It is off by default. Set `browser.captureProviderNative: true` in your user
+config to enable it; `--no-browser-capture-provider-native` overrides that preference.
+Project configs and remote bridge clients cannot enable this export. Direct
+remote-Chrome runs use the same capture path as local Chrome.
+
+The raw record may include prior turns, alternate branches, attachments, and
+provider metadata, beyond the current answer. Files use owner-only permissions
+on POSIX and follow normal session retention/cleanup. `--write-artifacts` can
+export them with other session artifacts; copies have their own retention.
+Treat the full raw record as conversation data when sharing it.
+
+Capture uses ChatGPT's undocumented conversation endpoint from the authenticated
+page and reuses Oracle's existing Chrome connection. Two independent fetches
+produce the raw record and in-page SHA-256 digests. The second body never crosses
+the browser boundary. Document hashes may differ because provider metadata
+changes; this alone is not an answer-fidelity failure.
+
+The evidence format is `oracle.provider-native-capture-evidence/v1`, with
+`text-fields-v1` normalization: string-only text parts and thought contents join
+with two newlines; code/execution output use `text`; reasoning recaps use
+`content`. Mixed multimodal and unknown content have null digests, while their
+original bytes remain in the raw record. This format does not claim compatibility
+with external Python JSON normalization.
+
+`browser.providerNativeCapture` in session metadata records `matched`, `divergent`,
+or `unknown`. A match requires the captured assistant's message ID on the active
+provider branch and exact UTF-8 text, optionally trimming Oracle's surrounding
+whitespace. User turns, earlier answers, and alternate branches cannot substitute
+for that message. Deep Research reports without an assistant message ID, unsupported
+content, missing IDs, and failed evidence fetches report `unknown`.
+
+The existing copy-button/DOM answer is still returned. Capture is optional evidence
+and never fails the answer: temporary chats, bot challenges, invalid responses,
+disconnects, and write failures record a typed reason. Fetching/draining has a
+30-second total budget and an 8 MiB limit per document. Tokens stay in the page;
+logs and failure summaries contain fixed reasons rather than response bodies or
+exception details. The raw artifact is unchanged provider data, not a redacted transcript.

@@ -1165,6 +1165,11 @@ describe("performSessionRun", () => {
       answerText: "sandbox:/mnt/data/report.md",
       artifacts: [savedFile],
       savedFiles: [savedFile],
+      providerNativeCapture: {
+        status: "unavailable",
+        answerFidelity: "unknown",
+        failure: { reason: "challenged" },
+      },
       thinkingSelection: {
         requestedLevel: "pro",
         status: "switched",
@@ -1224,7 +1229,14 @@ describe("performSessionRun", () => {
       const successUpdate = sessionStoreMock.updateSession.mock.calls.at(-1)?.[1];
       expect(successUpdate).toMatchObject({
         status: "completed",
-        browser: { thinkingSelection: { requestedLevel: "pro", verified: true } },
+        browser: {
+          thinkingSelection: { requestedLevel: "pro", verified: true },
+          providerNativeCapture: {
+            status: "unavailable",
+            answerFidelity: "unknown",
+            failure: { reason: "challenged" },
+          },
+        },
         artifacts: expect.arrayContaining([
           expect.objectContaining({ path: canonicalPath, sha256 }),
           expect.objectContaining({ path: adjacentPath, sha256, sizeBytes: canonicalBytes.length }),

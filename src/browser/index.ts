@@ -806,6 +806,7 @@ async function runProviderNativeCapture(params: {
   conversationUrl?: string | null;
   sessionId?: string;
   answerMarkdown?: string;
+  answerMessageId?: string;
   logger: BrowserLogger;
 }): Promise<{ summary?: ProviderNativeCaptureSummary; artifacts: SessionArtifact[] }> {
   if (!params.config.captureProviderNative) {
@@ -820,6 +821,7 @@ async function runProviderNativeCapture(params: {
     conversationUrl: params.conversationUrl,
     sessionId: params.sessionId,
     answerMarkdown: params.answerMarkdown,
+    answerMessageId: params.answerMessageId,
     logger: params.logger,
   });
 }
@@ -1119,6 +1121,7 @@ async function runBrowserModeInternal(
   const startedAt = Date.now();
   let answerText = "";
   let answerMarkdown = "";
+  let answerMessageId: string | undefined;
   let answerHtml = "";
   let runStatus: "attempted" | "complete" | "cancelled" = "attempted";
   let connectionClosedUnexpectedly = false;
@@ -1815,6 +1818,7 @@ async function runBrowserModeInternal(
         answerMarkdown: researchResult.text,
         answerHtml: researchResult.html,
         artifacts: savedArtifacts,
+        providerNativeCapture: providerCapture.summary,
         archive,
         modelSelection: modelSelectionEvidence,
         thinkingSelection: thinkingSelectionEvidence,
@@ -2200,6 +2204,7 @@ async function runBrowserModeInternal(
           turnAnswerMarkdown = bestText;
         }
       }
+      answerMessageId = turnAnswer.meta.messageId ?? undefined;
       return {
         label,
         answerText: turnAnswerText,
@@ -2313,6 +2318,7 @@ async function runBrowserModeInternal(
       conversationUrl: lastUrl,
       sessionId: options.sessionId,
       answerMarkdown,
+      answerMessageId,
       logger,
     });
     const browserArtifactsWithCapture = appendArtifacts(
@@ -2352,6 +2358,7 @@ async function runBrowserModeInternal(
       answerMarkdown,
       answerHtml: answerHtml.length > 0 ? answerHtml : undefined,
       artifacts: savedArtifacts,
+      providerNativeCapture: providerCapture.summary,
       generatedImages: imageArtifacts.generatedImages,
       savedImages: imageArtifacts.savedImages,
       downloadableFiles: fileArtifacts.files,
@@ -3025,6 +3032,7 @@ async function runRemoteBrowserMode(
   const startedAt = Date.now();
   let answerText = "";
   let answerMarkdown = "";
+  let answerMessageId: string | undefined;
   let answerHtml = "";
   let connectionClosedUnexpectedly = false;
   let runStatus: "attempted" | "complete" | "cancelled" = "attempted";
@@ -3449,6 +3457,7 @@ async function runRemoteBrowserMode(
         answerMarkdown: researchResult.text,
         answerHtml: researchResult.html,
         artifacts: savedArtifacts,
+        providerNativeCapture: providerCapture.summary,
         archive,
         modelSelection: modelSelectionEvidence,
         thinkingSelection: thinkingSelectionEvidence,
@@ -3790,6 +3799,7 @@ async function runRemoteBrowserMode(
           turnAnswerMarkdown = bestText;
         }
       }
+      answerMessageId = turnAnswer.meta.messageId ?? undefined;
       return {
         label,
         answerText: turnAnswerText,
@@ -3895,6 +3905,7 @@ async function runRemoteBrowserMode(
       conversationUrl: lastUrl,
       sessionId: options.sessionId,
       answerMarkdown,
+      answerMessageId,
       logger,
     });
     const browserArtifactsWithCapture = appendArtifacts(
@@ -3951,6 +3962,7 @@ async function runRemoteBrowserMode(
       submittedPromptHash,
       ownedRecoveryTarget,
       artifacts: savedArtifacts,
+      providerNativeCapture: providerCapture.summary,
       generatedImages: imageArtifacts.generatedImages,
       savedImages: imageArtifacts.savedImages,
       downloadableFiles: fileArtifacts.files,

@@ -10,6 +10,29 @@ import { buildBrowserConfig } from "../../src/cli/browserConfig.js";
 const source = (_key: keyof BrowserDefaultsOptions) => undefined;
 
 describe("applyBrowserDefaultsFromConfig", () => {
+  test("applies provider evidence preference while respecting explicit opt-out", async () => {
+    const options: BrowserDefaultsOptions = {};
+    const config: UserConfig = { browser: { captureProviderNative: true } };
+    applyBrowserDefaultsFromConfig(options, config, source);
+    expect(
+      (
+        await buildBrowserConfig({
+          browserCaptureProviderNative: options.browserCaptureProviderNative,
+          model: "gpt-5.6-sol",
+        })
+      ).captureProviderNative,
+    ).toBe(true);
+    options.browserCaptureProviderNative = false;
+    applyBrowserDefaultsFromConfig(options, config, () => "cli");
+    expect(
+      (
+        await buildBrowserConfig({
+          browserCaptureProviderNative: options.browserCaptureProviderNative,
+          model: "gpt-5.6-sol",
+        })
+      ).captureProviderNative,
+    ).toBe(false);
+  });
   test("uses the same configured remote Chrome as MCP unless CLI overrides it", () => {
     const options: BrowserDefaultsOptions = {};
     const config: UserConfig = { browser: { remoteChrome: { host: "127.0.0.1", port: 9222 } } };

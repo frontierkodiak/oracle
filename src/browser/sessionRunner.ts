@@ -1,3 +1,4 @@
+import type { ProviderNativeCaptureSummary } from "./chatgptConversation.js";
 import chalk from "chalk";
 import type { RunOracleOptions } from "../oracle.js";
 import { formatTokenCount } from "../oracle/runUtils.js";
@@ -45,6 +46,7 @@ export interface BrowserExecutionResult {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   thinkingSelection?: BrowserThinkingSelectionEvidence;
+  providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
   answerText: string;
   artifacts?: SessionArtifact[];
@@ -437,6 +439,7 @@ async function executeAssembledBrowserSession({
     archive: browserResult.archive,
     modelSelection,
     thinkingSelection,
+    providerNativeCapture: browserResult.providerNativeCapture,
     warnings,
     answerText,
     artifacts: savedArtifacts,

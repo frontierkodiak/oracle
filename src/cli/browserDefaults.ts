@@ -41,6 +41,7 @@ export interface BrowserDefaultsOptions {
   browserModelStrategy?: BrowserModelStrategy;
   browserThinkingTime?: ThinkingTimeLevel;
   browserResearch?: BrowserResearchMode;
+  browserCaptureProviderNative?: boolean;
   browserArchive?: BrowserArchiveMode;
   browserManualLogin?: boolean;
   browserManualLoginProfileDir?: string | null;
@@ -178,6 +179,12 @@ export function applyBrowserDefaultsFromConfig(
     browser.thinkingTime !== undefined
   ) {
     options.browserThinkingTime = normalizeThinkingTimeLevel(browser.thinkingTime) ?? undefined;
+  }
+  if (
+    isUnset("browserCaptureProviderNative") &&
+    typeof browser.captureProviderNative === "boolean"
+  ) {
+    options.browserCaptureProviderNative = browser.captureProviderNative;
   }
   if (isUnset("browserResearch") && browser.researchMode !== undefined) {
     options.browserResearch = browser.researchMode;

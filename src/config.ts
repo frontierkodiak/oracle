@@ -290,6 +290,7 @@ function sanitizeProjectConfig(config: UserConfig): UserConfig {
   if (config.browser) {
     sanitized.browser = {};
     const browser = config.browser;
+    // Full-conversation retention is user-owned; never allow captureProviderNative here.
     const allowedBrowserKeys: Array<keyof BrowserConfigDefaults> = [
       "attachRunning",
       "timeoutMs",

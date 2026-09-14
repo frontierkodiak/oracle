@@ -402,6 +402,11 @@ describe("runBrowserSessionExecution", () => {
           tookMs: 1000,
           answerTokens: 12,
           answerChars: 20,
+          providerNativeCapture: {
+            status: "unavailable" as const,
+            answerFidelity: "unknown" as const,
+            failure: { reason: "no-conversation-id" as const },
+          },
           modelSelection: {
             requestedModel: "GPT-5.5 Pro",
             resolvedLabel: "Pro",
@@ -415,6 +420,10 @@ describe("runBrowserSessionExecution", () => {
       },
     );
 
+    expect(result.providerNativeCapture).toMatchObject({
+      status: "unavailable",
+      failure: { reason: "no-conversation-id" },
+    });
     expect(result.modelSelection).toMatchObject({
       requestedModel: "GPT-5.5 Pro",
       resolvedLabel: "Pro",

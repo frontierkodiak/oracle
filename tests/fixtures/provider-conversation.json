@@ -1,0 +1,93 @@
+{
+  "title": "Fidelity fixture",
+  "conversation_id": "fixture-0001",
+  "current_node": "n5",
+  "mapping": {
+    "root": { "id": "root", "parent": null, "children": ["n0"], "message": null },
+    "n0": {
+      "id": "n0",
+      "parent": "root",
+      "children": ["n1"],
+      "message": {
+        "author": { "role": "system" },
+        "content": { "content_type": "text", "parts": ["ignored"] }
+      }
+    },
+    "n1": {
+      "id": "n1",
+      "parent": "n0",
+      "children": ["n2"],
+      "message": {
+        "author": { "role": "user" },
+        "content": {
+          "content_type": "multimodal_text",
+          "parts": [
+            {
+              "content_type": "image_asset_pointer",
+              "asset_pointer": "file-service://file-abc",
+              "size_bytes": 123456,
+              "width": 1024,
+              "height": 768,
+              "fovea": null,
+              "metadata": { "dalle": null, "gizmo": null },
+              "downsampled": 1.0,
+              "ratio": 0.75,
+              "huge": 1e30
+            },
+            "Compare $\\Delta(G)$ against $\\chi'(G)$ — see attachment ≤ ∞."
+          ]
+        }
+      }
+    },
+    "n2": {
+      "id": "n2",
+      "parent": "n1",
+      "children": ["n3"],
+      "message": {
+        "author": { "role": "assistant" },
+        "content": {
+          "content_type": "thoughts",
+          "thoughts": [
+            { "summary": "s", "content": "First thought ∀ε>0" },
+            { "summary": "t", "content": "Second thought" }
+          ]
+        }
+      }
+    },
+    "n3": {
+      "id": "n3",
+      "parent": "n2",
+      "children": ["n4"],
+      "message": {
+        "author": { "role": "assistant" },
+        "content": {
+          "content_type": "code",
+          "language": "python",
+          "text": "def f(x):\n    return x ** 2  # $ and \\ and `"
+        }
+      }
+    },
+    "n4": {
+      "id": "n4",
+      "parent": "n3",
+      "children": ["n5"],
+      "message": {
+        "author": { "role": "assistant" },
+        "content": { "content_type": "reasoning_recap", "content": "Recapped ⌈n⌉" }
+      }
+    },
+    "n5": {
+      "id": "n5",
+      "parent": "n4",
+      "children": [],
+      "message": {
+        "author": { "role": "assistant" },
+        "content": {
+          "content_type": "some_future_type",
+          "payload": { "z": 1, "a": [1, 2.0, true, null], "m": "unicode ≡ ok" },
+          "n": 7
+        }
+      }
+    }
+  }
+}

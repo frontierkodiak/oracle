@@ -1,3 +1,4 @@
+import type { ProviderNativeCaptureSummary } from "./browser/chatgptConversation.js";
 import path from "node:path";
 import fs from "node:fs/promises";
 import { createWriteStream, mkdirSync } from "node:fs";
@@ -201,6 +202,7 @@ export interface BrowserMetadata {
   archive?: BrowserArchiveResult;
   modelSelection?: BrowserModelSelectionEvidence;
   thinkingSelection?: BrowserThinkingSelectionEvidence;
+  providerNativeCapture?: ProviderNativeCaptureSummary;
   warnings?: BrowserRunWarning[];
 }
 

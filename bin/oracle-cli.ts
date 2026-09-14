@@ -839,8 +839,9 @@ program
   )
   .option(
     "--browser-capture-provider-native",
-    "Also save ChatGPT's own conversation document plus an independent set of per-turn digests alongside the run's artifacts, for runs whose transcript must be evidence rather than an answer.",
+    "Save ChatGPT’s full conversation record and independent text digests as private session artifacts (opt-in; includes prior turns).",
   )
+  .option("--no-browser-capture-provider-native", "Disable provider-native evidence capture.")
   .addOption(
     new Option(
       "--browser-archive <mode>",
