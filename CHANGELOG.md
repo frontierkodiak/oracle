@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Browser: anchor new-turn capture on document order (the answer follows the user prompt just submitted), not only a positional baseline index. ChatGPT culls off-screen turns, which shifts that index and can leave a completed answer permanently below the baseline, hanging the run until the response timeout.
+
 ## 0.18.0 — 2026-08-14
 
 ### Changed
