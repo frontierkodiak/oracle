@@ -43,6 +43,7 @@ import {
   waitForAttachmentCompletion,
   waitForUserTurnAttachments,
   readAssistantSnapshot,
+  readHighestConversationTurnNumber,
 } from "./pageActions.js";
 import { INPUT_SELECTORS } from "./constants.js";
 import { uploadAttachmentViaDataTransfer } from "./actions/remoteFileTransfer.js";
@@ -1610,6 +1611,10 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       // Culling-proof baseline: the submitted prompt's own turn ordinal, captured by the provider
       // right after send while the prompt is still mounted. Stable under later turn unmounting.
       let baselineTurnNumber: number | null = null;
+      // Floor for the anchor: the highest ordinal mounted before submit. A resumed conversation
+      // opens on its last turn, so a commit that races ahead of the new user turn still cannot let
+      // a previous answer pass.
+      const preSubmitTurnNumber = await readHighestConversationTurnNumber(Runtime);
       // Learned: return baselineTurns so assistant polling can ignore earlier content.
       const providerState: Record<string, unknown> = {
         runtime: Runtime,
@@ -1639,11 +1644,16 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         baselineTurns = providerBaselineTurns;
       }
       const providerBaselineTurnNumber = providerState.baselineTurnNumber;
-      if (
-        typeof providerBaselineTurnNumber === "number" &&
-        Number.isFinite(providerBaselineTurnNumber)
-      ) {
-        baselineTurnNumber = providerBaselineTurnNumber;
+      const anchoredTurnNumber =
+        typeof providerBaselineTurnNumber === "number" && Number.isFinite(providerBaselineTurnNumber)
+          ? providerBaselineTurnNumber
+          : -1;
+      const flooredTurnNumber =
+        preSubmitTurnNumber != null && Number.isFinite(preSubmitTurnNumber)
+          ? Math.max(anchoredTurnNumber, preSubmitTurnNumber)
+          : anchoredTurnNumber;
+      if (flooredTurnNumber >= 0) {
+        baselineTurnNumber = flooredTurnNumber;
       }
       if (attachmentNames.length > 0) {
         if (inputOnlyAttachments) {
@@ -3199,6 +3209,10 @@ async function runRemoteBrowserMode(
         );
       }
       let baselineTurns = await readConversationTurnCount(Runtime, logger);
+      // Culling-proof baseline for the remote path too: the submitted prompt's own turn ordinal,
+      // pinned by the provider right after send while the prompt is still mounted.
+      let baselineTurnNumber: number | null = null;
+      const preSubmitTurnNumber = await readHighestConversationTurnNumber(Runtime);
       const providerState: Record<string, unknown> = {
         runtime: Runtime,
         input: Input,
@@ -3226,8 +3240,21 @@ async function runRemoteBrowserMode(
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
       }
+      const providerBaselineTurnNumber = providerState.baselineTurnNumber;
+      const anchoredTurnNumber =
+        typeof providerBaselineTurnNumber === "number" && Number.isFinite(providerBaselineTurnNumber)
+          ? providerBaselineTurnNumber
+          : -1;
+      const flooredTurnNumber =
+        preSubmitTurnNumber != null && Number.isFinite(preSubmitTurnNumber)
+          ? Math.max(anchoredTurnNumber, preSubmitTurnNumber)
+          : anchoredTurnNumber;
+      if (flooredTurnNumber >= 0) {
+        baselineTurnNumber = flooredTurnNumber;
+      }
       return {
         baselineTurns,
+        baselineTurnNumber,
         baselineAssistantText,
         deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
         deepResearchTargetBaselineCaptured: deepResearchTargetBaseline?.captured,
@@ -3240,6 +3267,7 @@ async function runRemoteBrowserMode(
     };
 
     let baselineTurns: number | null = null;
+    let baselineTurnNumber: number | null = null;
     let baselineAssistantText: string | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
@@ -3256,6 +3284,7 @@ async function runRemoteBrowserMode(
       logger,
     });
     baselineTurns = submission.baselineTurns;
+    baselineTurnNumber = submission.baselineTurnNumber ?? null;
     baselineAssistantText = submission.baselineAssistantText;
     deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
     deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
@@ -3441,11 +3470,13 @@ async function runRemoteBrowserMode(
               logger,
               baselineTurns ?? undefined,
               expectedConversationId(),
+              baselineTurnNumber ?? undefined,
             ),
           timeoutMs,
           logger,
           minTurnIndex: baselineTurns ?? undefined,
           expectedConversationId: expectedConversationId(),
+          minTurnNumber: baselineTurnNumber ?? undefined,
           imageOutputRequested,
         }),
       );
@@ -3475,11 +3506,13 @@ async function runRemoteBrowserMode(
                 logger,
                 baselineTurns ?? undefined,
                 expectedConversationId(),
+                baselineTurnNumber ?? undefined,
               ),
             timeoutMs: config.timeoutMs,
             logger,
             minTurnIndex: baselineTurns ?? undefined,
             expectedConversationId: expectedConversationId(),
+            minTurnNumber: baselineTurnNumber ?? undefined,
             imageOutputRequested,
           }),
         );

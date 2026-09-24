@@ -528,6 +528,35 @@ export async function readSubmittedUserTurnAnchor(
   }
 }
 
+// Highest `conversation-turn-N` ordinal currently mounted. Used as a floor for the commit-time
+// anchor: a resumed conversation opens on its last turn, so the pre-submit last turn is always on
+// the page and an answer to the new prompt is strictly above it. If the anchor read races ahead of
+// the new user turn, the floor still keeps a previous answer from passing.
+export async function readHighestConversationTurnNumber(
+  Runtime: ChromeClient["Runtime"],
+): Promise<number | null> {
+  try {
+    const { result } = await Runtime.evaluate({
+      expression: `(() => {
+        const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
+        let highest = null;
+        for (const turn of turns) {
+          const match = /^conversation-turn-(\\d+)$/.exec(turn.getAttribute('data-testid') || '');
+          if (!match) continue;
+          const value = Number(match[1]);
+          highest = highest == null ? value : Math.max(highest, value);
+        }
+        return highest;
+      })()`,
+      returnByValue: true,
+    });
+    const value = result?.value;
+    return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function buildAssistantExtractorForTest(name: string): string {
   return buildAssistantExtractor(name);
 }

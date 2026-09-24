@@ -5,6 +5,8 @@ import {
   buildCompletionVisibilityExpressionForTest,
   buildResponseObserverExpressionForTest,
   readAssistantSnapshot,
+  readHighestConversationTurnNumber,
+  readSubmittedUserTurnAnchor,
 } from "../../src/browser/actions/assistantResponse.js";
 
 // Fixture derived from the real Carbon live tab (PL-95). ChatGPT virtualizes turns: turn 1 was
@@ -261,5 +263,30 @@ describe("culling-proof turn-ordinal anchor (PL-95 live fixture)", () => {
       "MIN_TURN_NUMBER = 5",
     );
     expect(buildCompletionVisibilityExpressionForTest({}, 5, 5)).toContain("MIN_TURN_NUMBER = 5");
+  });
+
+  test("the commit-time anchor and its floor read the mounted ordinals", async () => {
+    const runtimeFor = (document: ReturnType<typeof makeDocument>) => ({
+      evaluate: async ({ expression }: { expression: string }) => ({
+        result: {
+          value: new Script(expression).runInContext(
+            createContext({ ...baseContext(document), Number, String, Array, RegExp }),
+          ),
+        },
+      }),
+    });
+    const mounted = makeDocument(MOUNTED_TURNS);
+    // Floor: highest mounted ordinal is the new answer (6) here; with only 2 and 4 mounted it is 4.
+    expect(await readHighestConversationTurnNumber(runtimeFor(mounted) as never)).toBe(6);
+    expect(
+      await readHighestConversationTurnNumber(
+        runtimeFor(makeDocument(MOUNTED_TURNS.slice(0, 3))) as never,
+      ),
+    ).toBe(4);
+    // The commit anchor reads the last mounted user turn: turn 5, message m5.
+    expect(await readSubmittedUserTurnAnchor(runtimeFor(mounted) as never)).toEqual({
+      turnNumber: 5,
+      messageId: "m5",
+    });
   });
 });
