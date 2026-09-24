@@ -82,7 +82,9 @@ import {
   reconcileDurableRemoteRun,
   getDurableRemoteQueueStatus,
   getDurableRemoteRun,
+  readDurableReceipt,
   receiptPath,
+  resolveDurableReceipt,
   submitDurableRemoteRunWithReceipt,
   watchDurableRemoteRun,
 } from "../src/remote/client.js";
@@ -1470,6 +1472,47 @@ remoteStatus.action(async function (this: Command, runId: string | undefined) {
       ? `${runId}: ${(value as any).state}`
       : `Queue: ${(value as any).queued} queued / ${(value as any).active} active`,
   );
+});
+
+const remoteRecover = addRemoteConnectionOptions(
+  remoteCommand
+    .command("recover")
+    .description(
+      "Resolve a durable receipt read-only; never resubmits. Reports found, not found, or unreachable.",
+    )
+    .option("--session-id <id>", "Durable session/receipt ID to resolve."),
+);
+remoteRecover.action(async function (this: Command) {
+  const options = this.opts<Record<string, unknown>>();
+  const { host, token } = remoteHostAndToken(this);
+  const sessionId = options.sessionId as string | undefined;
+  if (!sessionId) throw new Error("--session-id is required to resolve a durable receipt");
+  const receipt = await readDurableReceipt(sessionId);
+  if (!receipt) throw new Error(`no durable receipt found for session ${sessionId}`);
+  const result = await resolveDurableReceipt(host, receipt, token);
+  if (result.found) {
+    printRemoteValue(
+      { sessionId, ...result },
+      Boolean(options.json),
+      `${result.runId}: ${result.snapshot.state}`,
+    );
+    return;
+  }
+  printRemoteValue(
+    {
+      found: false,
+      sessionId,
+      reason: result.reason,
+      ...(result.reason === "unreachable" ? { error: result.error } : {}),
+    },
+    Boolean(options.json),
+    result.reason === "unreachable"
+      ? `Remote service unreachable; the submission outcome for ${sessionId} is unknown`
+      : result.reason === "unsupported"
+        ? `Remote service does not support read-only receipt lookup; upgrade the bridge before resolving ${sessionId}`
+        : `No durable run was accepted for session ${sessionId}`,
+  );
+  process.exitCode = result.reason === "unreachable" ? 2 : result.reason === "unsupported" ? 3 : 1;
 });
 
 const projectSourcesCommand = program

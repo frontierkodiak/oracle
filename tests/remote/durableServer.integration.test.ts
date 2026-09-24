@@ -1018,4 +1018,75 @@ describe("durable remote server admission", () => {
     expect(JSON.stringify(failed)).not.toContain(secret);
     expect(JSON.stringify(failed)).not.toContain("bearer-super-secret");
   });
+
+  it("resolves a committed run by idempotency key read-only and reports a definite miss", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-idempotency-lookup-"));
+    let dispatched = 0;
+    server = await createRemoteServer(
+      { host: "127.0.0.1", port: 0, token: "test", logger: () => {}, queueHomeDir: home },
+      {
+        runBrowser: async () => {
+          dispatched += 1;
+          return {
+            answerText: "ok",
+            answerMarkdown: "ok",
+            tookMs: 1,
+            answerTokens: 1,
+            answerChars: 2,
+          };
+        },
+      },
+    );
+    const key = "b".repeat(64);
+    const accepted = await call(server.port, "POST", "/v1/runs", payload("lookup"), key);
+    expect(accepted.status).toBe(202);
+    await waitForRun(server.port, accepted.json.id, (run) => run.state === "completed");
+    const dispatchedBefore = dispatched;
+    const found = await call(server.port, "GET", `/v1/runs/by-idempotency-key/${key}`);
+    expect(found.status).toBe(200);
+    expect(found.json).toMatchObject({
+      id: accepted.json.id,
+      state: "completed",
+      requestHash: accepted.json.requestHash,
+    });
+    const missing = await call(server.port, "GET", `/v1/runs/by-idempotency-key/${"c".repeat(64)}`);
+    expect(missing.status).toBe(404);
+    expect(missing.json).toEqual({ error: "run_not_found" });
+    // Repeated reads never admit or redispatch work.
+    expect((await call(server.port, "GET", `/v1/runs/by-idempotency-key/${key}`)).status).toBe(200);
+    expect(dispatched).toBe(dispatchedBefore);
+    const health = await call(server.port, "GET", "/health");
+    expect(health.json.capabilities.features).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "oracle.remote.idempotency-lookup", version: 1 }),
+      ]),
+    );
+  });
+
+  it("fences idempotency lookup with operator auth and GET only", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-idempotency-lookup-auth-"));
+    server = await createRemoteServer({
+      host: "127.0.0.1",
+      port: 0,
+      token: "test",
+      logger: () => {},
+      queueHomeDir: home,
+    });
+    const key = "d".repeat(64);
+    expect(
+      (
+        await call(
+          server.port,
+          "GET",
+          `/v1/runs/by-idempotency-key/${key}`,
+          undefined,
+          undefined,
+          "wrong",
+        )
+      ).status,
+    ).toBe(401);
+    expect((await call(server.port, "POST", `/v1/runs/by-idempotency-key/${key}`)).status).toBe(
+      405,
+    );
+  });
 });

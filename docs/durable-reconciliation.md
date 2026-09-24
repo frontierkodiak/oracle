@@ -11,14 +11,47 @@ oracle remote reconcile <run-id> --json
 oracle remote collect <run-id> --inspect --json
 oracle remote reconcile <run-id> --resume --json
 oracle remote reconcile <historical-run-id> --use-current-profile --json
+oracle remote recover --session-id <id> --json
 ```
 
-Both aliases use the same scheduler as automatic collection. The authenticated
+Both reconcile aliases use the same scheduler as automatic collection. The authenticated
 `GET /v1/runs/:id/reconciliation` endpoint reads the receipt (or `null` before
 scheduling); `POST` with an empty body or `{}` creates an idempotent intent. A structured `{ "action": "resume" }` requests a new bounded retry budget after
 attention; adding `"useCurrentProfile": true` deliberately binds missing historical
 profile provenance. No conversation, browser-path, or prompt overrides are accepted. Health advertises
 `oracle.remote.reconciliation` version 1. Ordinary v1 run snapshots are unchanged.
+
+## Resolving a receipt with no run ID
+
+A submission that times out before its run ID is recorded leaves a durable receipt
+with a session, an idempotency key, and a payload hash but no run ID. The client
+must not guess whether the service accepted it, and it must not reconstruct and
+repost the payload to find out. Instead it asks the service read-only by
+idempotency key:
+
+```
+GET /v1/runs/by-idempotency-key/:key
+```
+
+The run ID is the queue's unique idempotency key, so this returns the ordinary run
+snapshot, or `404 { "error": "run_not_found" }` when no run was committed under
+that key. It is operator-authenticated and `GET`-only; it never admits, dispatches,
+or cancels work. Health advertises `oracle.remote.idempotency-lookup` version 1.
+
+`oracle remote recover --session-id <id>` reads a local receipt and reports one of:
+
+- **found** — a run exists; its state and run ID are printed, and nothing is sent.
+- **not found** — the key was never committed; the payload may safely be resubmitted.
+- **unreachable** — the service could not be reached, so the outcome stays unknown.
+- **unsupported** — the service predates the lookup capability; upgrade the bridge.
+
+Recovery of an ambiguous receipt (`submission: "unknown"`) uses the same lookup
+first: a committed run is adopted, an unreachable service raises the unknown-outcome
+error without resubmitting, and only a definite not-found permits the same-key
+idempotent POST. Messaging distinguishes "not found" from "unreachable" so an
+operator never treats a network failure as proof the work was never accepted.
+
+## Collection semantics
 
 Collection only uses `runtimeHint.conversationId` stored by the original browser
 run. A URL in the submitted request is not evidence of the resulting conversation.

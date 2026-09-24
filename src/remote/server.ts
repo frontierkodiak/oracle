@@ -43,6 +43,7 @@ import {
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
   CAPTURE_ONLY_FEATURE_ID,
+  IDEMPOTENCY_LOOKUP_FEATURE_ID,
   MAX_REMOTE_ARTIFACT_BYTES,
   REMOTE_HEALTH_SCHEMA_VERSION,
 } from "./types.js";
@@ -161,6 +162,10 @@ function artifactCapabilities(
       id: DURABLE_QUEUE_CAPABILITY_ID,
       version: DURABLE_QUEUE_CAPABILITY_VERSION,
       limits: { maxQueued: queue.backlog, maxConcurrentRuns: queue.capacity },
+    },
+    {
+      id: IDEMPOTENCY_LOOKUP_FEATURE_ID,
+      version: 1,
     },
     {
       id: MAINTENANCE_DRAIN_CAPABILITY_ID,
@@ -767,6 +772,42 @@ export async function createRemoteServer(
           admission: durableQueue.admission(),
         }),
       );
+      return;
+    }
+    const idempotencyLookupMatch = /^\/v1\/runs\/by-idempotency-key\/([^/]+)$/.exec(
+      (req.url ?? "").split("?")[0]!,
+    );
+    if (idempotencyLookupMatch) {
+      if (!operatorAuthorized) {
+        denyAuthorization(res, captureAuthorization !== undefined);
+        return;
+      }
+      if (req.method !== "GET") {
+        res.writeHead(405);
+        res.end();
+        return;
+      }
+      let key: string;
+      try {
+        key = decodeURIComponent(idempotencyLookupMatch[1]!);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_idempotency_key" }));
+        return;
+      }
+      if (!key) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "idempotency_key_required" }));
+        return;
+      }
+      const snapshot = durableQueue.getByIdempotencyKey(key);
+      if (!snapshot) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "run_not_found" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(publicDurableSnapshot(snapshot)));
       return;
     }
     const reconciliationMatch = /^\/v1\/runs\/([^/]+)\/reconciliation$/.exec(

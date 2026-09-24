@@ -4,6 +4,8 @@
 
 ### Added
 
+- Serve: resolve a durable receipt that has no run ID through a read-only, operator-authenticated idempotency-key lookup (`GET /v1/runs/by-idempotency-key/:key`, capability `oracle.remote.idempotency-lookup`). `oracle remote recover --session-id` reports found, not found, unreachable, or unsupported without resubmitting, and an ambiguous submission is adopted from the lookup instead of reposting its payload.
+
 - Serve: collect interrupted runs through the durable queue with bounded read-only retries and immutable, idempotent transcript observations. `oracle remote reconcile` / `collect` exposes a separate receipt; successful collection remains `captured_unattributed` and preserves the original transport outcome.
 
 ### Fixed
