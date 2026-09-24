@@ -175,6 +175,41 @@ function runSync(expression: string, document: ReturnType<typeof makeDocument>):
   return new Script(expression).runInContext(createContext(baseContext(document)));
 }
 
+// Run the production observer expression over a fake DOM through the real in-page path
+// (MutationObserver + timers + Date are stubbed so the settle loop terminates). Resolves with the
+// captured snapshot, or `{ timeout: true }` when nothing is accepted within `raceMs`.
+async function runObserver(
+  expression: string,
+  document: ReturnType<typeof makeDocument>,
+  raceMs = 250,
+): Promise<unknown> {
+  let now = 0;
+  const context = createContext({
+    ...baseContext(document),
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    // Fire short settle timers immediately, but never the expression's long watchdog timeout, so
+    // the "nothing accepted" case stays pending for the host-side race.
+    setTimeout: (callback: () => void, ms?: number) => {
+      if ((ms ?? 0) <= 1_000) callback();
+      return 1;
+    },
+    clearTimeout: () => {},
+    Date: { now: () => (now += 1_000) },
+    window: {
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+      innerHeight: 900,
+      innerWidth: 1440,
+    },
+  });
+  return Promise.race([
+    new Script(expression).runInContext(context, { timeout: 1_500 }) as Promise<unknown>,
+    new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), raceMs)),
+  ]);
+}
+
 const MOUNTED_TURNS = [
   makeTurn(2, "assistant", "answer one", 0, "m2", true),
   makeTurn(3, "user", "prompt two", 1, "m3"),
@@ -197,33 +232,14 @@ describe("culling-proof turn-ordinal anchor (PL-95 live fixture)", () => {
   });
 
   test("the response observer accepts the answer even though its positional index fell below the baseline", async () => {
-    let now = 0;
     const observer = buildResponseObserverExpressionForTest(1_500, 5, CONVERSATION_ID, 5);
-    const context = createContext({
-      ...baseContext(makeDocument(MOUNTED_TURNS)),
-      MutationObserver: class {
-        observe() {}
-        disconnect() {}
-      },
-      setTimeout: (callback: () => void) => {
-        callback();
-        return 1;
-      },
-      clearTimeout: () => {},
-      Date: { now: () => (now += 1_000) },
-      window: {
-        getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
-        innerHeight: 900,
-        innerWidth: 1440,
-      },
-    });
-    const result = (await Promise.race([
-      new Script(observer).runInContext(context, { timeout: 1_500 }) as Promise<unknown>,
-      new Promise((resolve) => setTimeout(() => resolve({ timeout: true }), 250)),
-    ])) as { text?: string; turnNumber?: number } | { timeout?: boolean };
+    const result = (await runObserver(observer, makeDocument(MOUNTED_TURNS))) as {
+      text?: string;
+      turnNumber?: number;
+    };
     expect(result).not.toHaveProperty("timeout");
-    expect((result as { text?: string }).text).toBe("answer three");
-    expect((result as { turnNumber?: number }).turnNumber).toBe(6);
+    expect(result.text).toBe("answer three");
+    expect(result.turnNumber).toBe(6);
   });
 
   test("completion correlation accepts the higher-ordinal answer and rejects the older one", () => {
@@ -288,5 +304,33 @@ describe("culling-proof turn-ordinal anchor (PL-95 live fixture)", () => {
       turnNumber: 5,
       messageId: "m5",
     });
+  });
+
+  // Regression for the follow-up anchoring gap (Opus Deep reproduction). With an in-run follow-up
+  // pending, the previous answer is the last mounted assistant turn. If the follow-up is bounded by
+  // the FIRST prompt's ordinal, that previous answer passes; re-anchoring on the follow-up prompt's
+  // own ordinal rejects it.
+  test("a stale first-prompt anchor accepts the previous follow-up answer; the re-anchored one rejects it", async () => {
+    const followUpFixture = makeDocument([
+      makeTurn(1, "user", "first prompt", 0, "m1"),
+      makeTurn(2, "assistant", "answer one", 1, "m2", true),
+      makeTurn(3, "user", "follow-up prompt", 2, "m3"),
+    ]);
+
+    // First prompt's anchor (ordinal 1): the previous answer (turn 2) is accepted.
+    const stale = (await runObserver(
+      buildResponseObserverExpressionForTest(1_500, 3, CONVERSATION_ID, 1),
+      followUpFixture,
+    )) as { text?: string; turnNumber?: number };
+    expect(stale.text).toBe("answer one");
+    expect(stale.turnNumber).toBe(2);
+
+    // Re-anchored on the follow-up prompt (ordinal 3): no accepted snapshot until a new answer
+    // with a larger ordinal streams in.
+    const reanchored = (await runObserver(
+      buildResponseObserverExpressionForTest(1_500, 3, CONVERSATION_ID, 3),
+      followUpFixture,
+    )) as { timeout?: boolean };
+    expect(reanchored).toEqual({ timeout: true });
   });
 });

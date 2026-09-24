@@ -2193,6 +2193,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           logger,
         });
         baselineTurns = submission.baselineTurns;
+        // Re-anchor the follow-up: the new prompt has its own turn ordinal, and leaving the first
+        // prompt's number here would let the previous answer pass while the new one is still empty.
+        baselineTurnNumber = submission.baselineTurnNumber ?? null;
         baselineAssistantText = submission.baselineAssistantText;
       } finally {
         await releaseProfileLockIfHeld();
@@ -3711,6 +3714,8 @@ async function runRemoteBrowserMode(
         logger,
       });
       baselineTurns = submission.baselineTurns;
+      // Re-anchor the follow-up (remote path): same reason as the local loop above.
+      baselineTurnNumber = submission.baselineTurnNumber ?? null;
       baselineAssistantText = submission.baselineAssistantText;
       const turn = await captureAssistantTurn(followUpPrompt, `Follow-up ${index + 1}`);
       turns.push({ ...turn, prompt: followUpPrompt });
