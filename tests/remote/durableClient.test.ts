@@ -1421,4 +1421,104 @@ describe("durable receipt read-only resolution", () => {
       setOracleHomeDirOverrideForTest(null);
     }
   });
+
+  it("keeps a legacy identity-less receipt unverified on another queue and never POSTs", async () => {
+    const dispatched = { a: 0, b: 0 };
+    const runBrowser = (key: "a" | "b") => async () => {
+      dispatched[key] += 1;
+      return {
+        answerText: "ok",
+        answerMarkdown: "ok",
+        tookMs: 1,
+        answerTokens: 1,
+        answerChars: 2,
+      };
+    };
+    const serverA = await createRemoteServer(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        token: "test",
+        logger: () => {},
+        queueHomeDir: await mkdtemp(path.join(os.tmpdir(), "oracle-legacy-a-")),
+      },
+      { runBrowser: runBrowser("a") },
+    );
+    const serverB = await createRemoteServer(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        token: "test",
+        logger: () => {},
+        queueHomeDir: await mkdtemp(path.join(os.tmpdir(), "oracle-legacy-b-")),
+      },
+      { runBrowser: runBrowser("b") },
+    );
+    const hostA = `127.0.0.1:${serverA.port}`;
+    const hostB = `127.0.0.1:${serverB.port}`;
+    setOracleHomeDirOverrideForTest(await mkdtemp(path.join(os.tmpdir(), "oracle-legacy-home-")));
+    const key = "7".repeat(64);
+    const payload = { prompt: "x", attachments: [], browserConfig: {}, options: {} } as any;
+    try {
+      await submitDurableRemoteRun({
+        host: hostA,
+        token: "test",
+        idempotencyKey: key,
+        payload,
+      });
+      // This is the receipt shape written by the fae08a7 client: no identity.
+      await writeDurableReceipt({
+        sessionId: "legacy-identity",
+        idempotencyKey: key,
+        submission: "unknown",
+      });
+      const receipt = await readDurableReceipt("legacy-identity");
+      await expect(resolveDurableReceipt(hostB, receipt!, "test")).resolves.toEqual({
+        found: false,
+        reason: "identity_unverified",
+      });
+      await expect(
+        submitDurableRemoteRunWithReceipt({
+          host: hostB,
+          token: "test",
+          sessionId: "legacy-identity",
+          payload,
+        }),
+      ).rejects.toMatchObject({ reason: "identity_unverified" });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(dispatched.a).toBe(1);
+      expect(dispatched.b).toBe(0);
+    } finally {
+      await serverA.close();
+      await serverB.close();
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
+  it("leaves a legacy receipt unmodified when the automatic retry fails", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-unmodified-"));
+    setOracleHomeDirOverrideForTest(home);
+    const sessionId = "legacy-unmodified";
+    await writeDurableReceipt({ sessionId, idempotencyKey: "8".repeat(64), submission: "unknown" });
+    const { server, host } = await listen((req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(legacyHealth("queue-B")));
+      res.statusCode = 404;
+      res.end();
+    });
+    const payload = { prompt: "x", attachments: [], browserConfig: {}, options: {} } as any;
+    try {
+      await expect(
+        submitDurableRemoteRunWithReceipt({ host, sessionId, payload }),
+      ).rejects.toMatchObject({ reason: "unsupported" });
+      const after = await readDurableReceipt(sessionId);
+      expect({ queueId: after?.queueId, host: after?.host }).toEqual({
+        queueId: undefined,
+        host: undefined,
+      });
+      expect(after).toMatchObject({ sessionId, submission: "unknown" });
+    } finally {
+      await close(server);
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
 });

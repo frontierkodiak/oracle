@@ -39,14 +39,16 @@ that key. Only that documented body is a definite miss. It is operator-authentic
 and `GET`-only; it never admits, dispatches, or cancels work. Health advertises
 `oracle.remote.idempotency-lookup` version 1 and a stable `queueId`.
 
-Identity matters: before the first POST, the client records the accepting queue's
-`queueId` (and the host as a minimum) in the receipt. A 404 is definite only when
-the responding service's `queueId` matches the record; a different queue returns
-`identity_mismatch`, and a receipt with no recorded identity returns
-`identity_unverified`. Both are non-definite and never permit a resubmit, so a
-receipt pointed at the wrong queue — for example `~/.oracle` on 9473 versus
-`~/.disprove/oracle` on 9483 — can never dispatch the prompt twice. A `queueId`
-survives restarts; the host:port fallback does not, so prefer the advertised ID.
+Identity matters: a fresh receipt records the accepting queue's `queueId` (and the
+host as a minimum) before its first POST. A 404 is definite only when the responding
+service's `queueId` matches the record. The actual guarantee is that a non-definite
+miss never resubmits: a receipt pointed at the wrong queue returns
+`identity_mismatch`, and a receipt from an older client with no recorded identity
+returns `identity_unverified` — both leave the prompt unsent, so a 404 from a queue
+that did not accept the run cannot trigger a second dispatch. (An identity-less
+receipt therefore resolves to `found` only if the run is actually present; it is
+never resubmitted on a miss, even against its own queue.) A `queueId` survives
+restarts; the host:port fallback does not, so prefer the advertised ID.
 
 Health classification is deliberate. Only a _healthy_ service that lacks the
 capability is `unsupported`; a timeout, 401, 5xx, or refused connection is

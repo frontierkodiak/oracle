@@ -281,30 +281,29 @@ export async function submitDurableRemoteRunWithReceipt(p: {
   const payloadHash = createHash("sha256").update(JSON.stringify(p.payload)).digest("hex");
   if (receipt.payloadHash && receipt.payloadHash !== payloadHash)
     throw new Error("durable receipt payload does not match the current request");
-  // Record the accepting queue's identity before the first POST so a later 404
-  // from a different queue is never read as a definite not-found.
-  const queued: DurableReceipt = {
-    ...receipt,
-    ...(receipt.payloadHash ? {} : { payloadHash }),
-    ...(receipt.queueId || !health.queueId ? {} : { queueId: health.queueId }),
-    ...(receipt.host ? {} : { host: p.host }),
-  };
-  if (
-    !existing ||
-    queued.payloadHash !== receipt.payloadHash ||
-    queued.queueId !== receipt.queueId ||
-    queued.host !== receipt.host
-  )
-    await writeDurableReceipt(queued);
-  receipt = queued;
+  if (!existing) {
+    // Only a fresh receipt records the accepting queue's identity, and only
+    // before its first POST. An existing receipt may already have been POSTed by
+    // an older client that recorded no identity; stamping this queue onto it
+    // could turn a foreign 404 into a definite miss, so it stays untouched
+    // (and `identity_unverified`) until the read-only lookup resolves.
+    receipt = {
+      ...receipt,
+      payloadHash,
+      ...(health.queueId ? { queueId: health.queueId } : {}),
+      host: p.host,
+    };
+    await writeDurableReceipt(receipt);
+  }
   p.onReceiptReady?.(receipt);
   let snapshot: DurableRunSnapshot;
   if (receipt.runId) {
     snapshot = await getDurableRemoteRun(p.host, receipt.runId, p.token);
   } else if (existing) {
     // A prior process may have POSTed before a run ID was recorded (timeout,
-    // crash, or the explicit unknown flag). Resolve read-only; only a definite
-    // not-found permits the same-key POST, and every other outcome fails closed.
+    // crash, or the explicit unknown flag). Resolve read-only before touching
+    // disk; only a definite not-found permits the same-key POST, and every other
+    // outcome fails closed with the receipt unmodified.
     const lookup = await resolveDurableReceipt(p.host, receipt, p.token);
     if (lookup.found) snapshot = lookup.snapshot;
     else if (lookup.reason === "not_found")
@@ -347,7 +346,12 @@ export async function submitDurableRemoteRunWithReceipt(p: {
     }
   }
   if (!receipt.runId) {
-    receipt = { ...receipt, runId: snapshot.id, submission: undefined };
+    receipt = {
+      ...receipt,
+      ...(receipt.payloadHash ? {} : { payloadHash }),
+      runId: snapshot.id,
+      submission: undefined,
+    };
     await writeDurableReceipt(receipt);
   }
   return { receipt, snapshot };
@@ -519,7 +523,14 @@ function compareQueueIdentity(
   host: string,
   queueId: string | undefined,
 ): "match" | "mismatch" | "unverified" {
-  if (receipt.queueId && queueId) return receipt.queueId === queueId ? "match" : "mismatch";
+  // A recorded queue ID is authoritative: if the service advertises none, the
+  // identity cannot be confirmed (never fall back to a host comparison).
+  if (receipt.queueId)
+    return queueId === undefined
+      ? "unverified"
+      : receipt.queueId === queueId
+        ? "match"
+        : "mismatch";
   if (receipt.host) return receipt.host === host ? "match" : "mismatch";
   return "unverified";
 }
@@ -733,26 +744,24 @@ export function createRemoteBrowserExecutor({
     const payloadHash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
     if (receipt.payloadHash && receipt.payloadHash !== payloadHash)
       throw new Error("durable receipt payload does not match the current request");
-    const queued: DurableReceipt = {
-      ...receipt,
-      ...(receipt.payloadHash ? {} : { payloadHash }),
-      ...(receipt.queueId || !health.queueId ? {} : { queueId: health.queueId }),
-      ...(receipt.host ? {} : { host }),
-    };
-    if (
-      !existing ||
-      queued.payloadHash !== receipt.payloadHash ||
-      queued.queueId !== receipt.queueId ||
-      queued.host !== receipt.host
-    )
-      await writeDurableReceipt(queued);
-    receipt = queued;
+    if (!existing) {
+      // Only a fresh receipt records the accepting queue's identity, and only
+      // before its first POST. An existing receipt may already have been POSTed
+      // without identity; it stays untouched until the lookup resolves.
+      receipt = {
+        ...receipt,
+        payloadHash,
+        ...(health.queueId ? { queueId: health.queueId } : {}),
+        host,
+      };
+      await writeDurableReceipt(receipt);
+    }
     let accepted: DurableRunSnapshot;
     if (receipt.runId) {
       accepted = await getDurableRemoteRun(host, receipt.runId, token);
     } else if (existing) {
       // A prior process may have POSTed before a run ID was recorded. Resolve
-      // read-only; only a definite not-found permits the same-key POST.
+      // read-only before writing; only a definite not-found permits the POST.
       const lookup = await resolveDurableReceipt(host, receipt, token);
       if (lookup.found) {
         accepted = lookup.snapshot;
