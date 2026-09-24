@@ -428,7 +428,11 @@ export async function readAssistantSnapshot(
       if (turnIndex === null) {
         return snapshot;
       }
-      if (turnIndex < minTurnIndex) {
+      // A positional turnIndex is only meaningful while the pre-submit turns are still mounted.
+      // ChatGPT culls off-screen turns, so the index of a new answer can fall below the baseline
+      // even though the answer is genuinely new. Document order (the answer follows the user
+      // prompt we just submitted) is the culling-proof signal; without it, reject as before.
+      if (turnIndex < minTurnIndex && snapshot.afterLastUser !== true) {
         return null;
       }
     }
@@ -804,6 +808,20 @@ function buildCompletionVisibilityExpression(
     }
     if (!lastAssistantTurn) return false;
 
+    // Culling-proof anchor: a turn after the last mounted user turn cannot be a stale pre-submit
+    // turn, even when ChatGPT culled earlier turns and shifted the positional baseline below the
+    // answer's index.
+    const lastUserTurn = (() => {
+      const users = Array.from(
+        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
+      );
+      return users[users.length - 1] ?? null;
+    })();
+    const isAfterLastUser = (node) => {
+      if (!lastUserTurn || typeof lastUserTurn.compareDocumentPosition !== 'function') return false;
+      return Boolean(lastUserTurn.compareDocumentPosition(node) & 4);
+    };
+
     const hasExpectedIdentity = Boolean(EXPECTED_MESSAGE_ID || EXPECTED_TURN_ID);
     if (hasExpectedIdentity) {
       const identityNodes = [
@@ -815,9 +833,13 @@ function buildCompletionVisibilityExpression(
         (EXPECTED_TURN_ID && node.getAttribute?.('data-testid') === EXPECTED_TURN_ID),
       );
       if (!identityMatches) return false;
-    } else if (MIN_TURN_INDEX < 0 || lastAssistantIndex < MIN_TURN_INDEX) {
+    } else if (MIN_TURN_INDEX < 0) {
       // Fallback/project snapshots without an identity may use the new-turn baseline, but an
       // uncorrelated persistent action bar from an older turn must never prove completion.
+      return false;
+    } else if (lastAssistantIndex < MIN_TURN_INDEX && !isAfterLastUser(lastAssistantTurn)) {
+      // A shifted index is fine when the turn follows the user prompt we just submitted; an
+      // older assistant turn precedes that prompt and must still be rejected.
       return false;
     }
 
@@ -1013,7 +1035,11 @@ function buildResponseObserverExpression(
       if (!snapshot) return null;
       if (!matchesExpectedConversation()) return null;
       const index = typeof snapshot.turnIndex === 'number' ? snapshot.turnIndex : -1;
-      if (MIN_TURN_INDEX >= 0) {
+      // The baseline index is positional and drifts when ChatGPT culls off-screen turns. A turn
+      // that follows the last mounted user turn is still the new answer, so accept it even if its
+      // (shifted) index sits below the baseline; older assistant turns precede that user turn and
+      // keep being rejected.
+      if (MIN_TURN_INDEX >= 0 && snapshot.afterLastUser !== true) {
         if (index < 0 || index < MIN_TURN_INDEX) {
           return null;
         }
@@ -1219,6 +1245,20 @@ function buildAssistantExtractor(functionName: string): string {
       return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
     };
 
+    // Culling-proof new-turn anchor: the answer we want follows the last user turn currently in
+    // the DOM. ChatGPT culls off-screen turns, so positional indexes drift; document order does
+    // not, and it also excludes an older assistant answer that precedes the newest user prompt.
+    const lastUserTurn = (() => {
+      const users = Array.from(
+        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
+      );
+      return users[users.length - 1] ?? null;
+    })();
+    const isAfterLastUser = (node) => {
+      if (!lastUserTurn || typeof lastUserTurn.compareDocumentPosition !== 'function') return false;
+      return Boolean(lastUserTurn.compareDocumentPosition(node) & 4);
+    };
+
     const expandCollapsibles = (root) => {
       const buttons = Array.from(root.querySelectorAll('button'));
       for (const button of buttons) {
@@ -1274,10 +1314,10 @@ function buildAssistantExtractor(functionName: string): string {
         /^(?:reasoning\\s+|pro thinking\\s+)?thought for \\d+(?:\\.\\d+)?\\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\\s+edit$/.test(normalizedText);
       if (generatedImages.length > 0 && imageOnlyChrome) {
         const label = generatedImages.length === 1 ? 'Generated image.' : \`Generated \${generatedImages.length} images.\`;
-        return { text: label, html: messageRoot?.innerHTML ?? html, messageId, turnId, turnIndex: index };
+        return { text: label, html: messageRoot?.innerHTML ?? html, messageId, turnId, turnIndex: index, afterLastUser: isAfterLastUser(turn) };
       }
       if (text.trim()) {
-        return { text, html, messageId, turnId, turnIndex: index };
+        return { text, html, messageId, turnId, turnIndex: index, afterLastUser: isAfterLastUser(turn) };
       }
     }
     return null;
@@ -1424,6 +1464,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
         turnId: null,
         turnIndex,
         completionVisible: actionMarkdowns.includes(node),
+        afterLastUser: isAfterCurrentUser(node),
       };
     }
     return null;
@@ -1611,6 +1652,10 @@ interface AssistantSnapshot {
   turnId?: string | null;
   turnIndex?: number | null;
   completionVisible?: boolean;
+  // True when the turn follows the last user turn currently mounted in the DOM. ChatGPT culls
+  // off-screen turns, which shifts every positional turnIndex; this document-order anchor stays
+  // valid under culling and is what keeps a new answer from being rejected by a stale baseline.
+  afterLastUser?: boolean;
 }
 
 const LANGUAGE_TAGS = new Set(
