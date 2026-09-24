@@ -534,6 +534,7 @@ async function waitForAssistantOrGeneratedImageResponse(params: {
   timeoutMs: number;
   minTurnIndex?: number;
   expectedConversationId?: string;
+  minTurnNumber?: number;
   imageOutputRequested: boolean;
   logger: BrowserLogger;
 }): Promise<AssistantAnswer> {
@@ -547,6 +548,7 @@ async function waitForAssistantOrGeneratedImageResponse(params: {
     params.timeoutMs,
     params.minTurnIndex,
     params.expectedConversationId,
+    params.minTurnNumber,
   );
   if (response) {
     if (response.html?.includes("/backend-api/estuary/content?id=file_")) {
@@ -576,12 +578,16 @@ async function pollGeneratedImageOrTextAssistantResponse(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  minTurnNumber?: number,
 ): Promise<AssistantAnswer | null> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    let snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId).catch(
-      () => null,
-    );
+    let snapshot = await readAssistantSnapshot(
+      Runtime,
+      minTurnIndex,
+      expectedConversationId,
+      minTurnNumber,
+    ).catch(() => null);
     if (!snapshot && typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex)) {
       const relaxedSnapshot = await readAssistantSnapshot(
         Runtime,
@@ -731,6 +737,7 @@ export function maybeArchiveCompletedConversationForTest(
 
 type BrowserSubmissionResult = {
   baselineTurns: number | null;
+  baselineTurnNumber?: number | null;
   baselineAssistantText: string | null;
   deepResearchTargetKeys?: string[];
   deepResearchTargetBaselineCaptured?: boolean;
@@ -1600,6 +1607,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         );
       }
       let baselineTurns = await readConversationTurnCount(Runtime, logger);
+      // Culling-proof baseline: the submitted prompt's own turn ordinal, captured by the provider
+      // right after send while the prompt is still mounted. Stable under later turn unmounting.
+      let baselineTurnNumber: number | null = null;
       // Learned: return baselineTurns so assistant polling can ignore earlier content.
       const providerState: Record<string, unknown> = {
         runtime: Runtime,
@@ -1627,6 +1637,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       const providerBaselineTurns = providerState.baselineTurns;
       if (typeof providerBaselineTurns === "number" && Number.isFinite(providerBaselineTurns)) {
         baselineTurns = providerBaselineTurns;
+      }
+      const providerBaselineTurnNumber = providerState.baselineTurnNumber;
+      if (
+        typeof providerBaselineTurnNumber === "number" &&
+        Number.isFinite(providerBaselineTurnNumber)
+      ) {
+        baselineTurnNumber = providerBaselineTurnNumber;
       }
       if (attachmentNames.length > 0) {
         if (inputOnlyAttachments) {
@@ -1656,6 +1673,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       }
       return {
         baselineTurns,
+        baselineTurnNumber,
         baselineAssistantText,
         deepResearchTargetKeys: deepResearchTargetBaseline?.targetKeys,
         deepResearchTargetBaselineCaptured: deepResearchTargetBaseline?.captured,
@@ -1668,6 +1686,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     };
 
     let baselineTurns: number | null = null;
+    let baselineTurnNumber: number | null = null;
     let baselineAssistantText: string | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
@@ -1687,6 +1706,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         logger,
       });
       baselineTurns = submission.baselineTurns;
+      baselineTurnNumber = submission.baselineTurnNumber ?? null;
       baselineAssistantText = submission.baselineAssistantText;
       deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
       deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
@@ -1882,11 +1902,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                 logger,
                 baselineTurns ?? undefined,
                 expectedConversationId(),
+                baselineTurnNumber ?? undefined,
               ),
             timeoutMs,
             logger,
             minTurnIndex: baselineTurns ?? undefined,
             expectedConversationId: expectedConversationId(),
+            minTurnNumber: baselineTurnNumber ?? undefined,
             imageOutputRequested,
           }),
         ),
@@ -1918,11 +1940,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
                   logger,
                   baselineTurns ?? undefined,
                   expectedConversationId(),
+                  baselineTurnNumber ?? undefined,
                 ),
               timeoutMs: config.timeoutMs,
               logger,
               minTurnIndex: baselineTurns ?? undefined,
               expectedConversationId: expectedConversationId(),
+              minTurnNumber: baselineTurnNumber ?? undefined,
               imageOutputRequested,
             }),
           ),
@@ -3946,6 +3970,7 @@ async function waitForAssistantResponseWithReload(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  minTurnNumber?: number,
 ) {
   try {
     return await waitForAssistantResponse(
@@ -3954,6 +3979,7 @@ async function waitForAssistantResponseWithReload(
       logger,
       minTurnIndex,
       expectedConversationId,
+      minTurnNumber,
     );
   } catch (error) {
     if (!shouldReloadAfterAssistantError(error)) {
@@ -3976,6 +4002,7 @@ async function waitForAssistantResponseWithReload(
       logger,
       minTurnIndex,
       expectedConversationId,
+      minTurnNumber,
     );
   }
 }
