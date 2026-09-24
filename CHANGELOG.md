@@ -14,7 +14,7 @@
 
 - Serve: honor `browser.hideWindow` for the shared manual-login Chrome, add explicit `--browser-hide-window` / `--browser-show-window` overrides and health metadata, and reveal a hidden window whenever interactive login is required.
 
-- Browser: anchor new-turn capture on document order (the answer follows the user prompt just submitted), not only a positional baseline index. ChatGPT culls off-screen turns, which shifts that index and can leave a completed answer permanently below the baseline, hanging the run until the response timeout.
+- Browser: anchor new-turn capture on the submitted prompt's own `conversation-turn-N` ordinal (with document order as a fallback), not a positional baseline index. ChatGPT virtualizes turns, which unmounts earlier turns and shifts that index, so a completed answer could stay below the baseline and hang the run until the response timeout. The stable ordinal cannot drift, and it also rejects an older answer when the viewport has scrolled away from the new prompt.
 
 ## 0.18.0 — 2026-08-14
 
