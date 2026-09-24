@@ -768,6 +768,9 @@ export async function createRemoteServer(
           runtime,
           process: { pid: process.pid },
           browser: { windowMode: browserWindowMode },
+          // Stable identity of this queue; a durable receipt records it so a 404
+          // from a different queue is never read as a definite not-found.
+          queueId: durableQueue.queueId(),
           queue: queueStatus,
           admission: durableQueue.admission(),
         }),

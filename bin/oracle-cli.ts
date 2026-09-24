@@ -1478,7 +1478,7 @@ const remoteRecover = addRemoteConnectionOptions(
   remoteCommand
     .command("recover")
     .description(
-      "Resolve a durable receipt read-only; never resubmits. Reports found, not found, or unreachable.",
+      "Resolve a durable receipt read-only; never resubmits. Exit codes: 0 found, 2 not found, 3 missing run, 4 unreachable, 5 unsupported, 6 queue mismatch, 7 identity unverified, 8 unverified 404.",
     )
     .option("--session-id <id>", "Durable session/receipt ID to resolve."),
 );
@@ -1498,21 +1498,65 @@ remoteRecover.action(async function (this: Command) {
     );
     return;
   }
-  printRemoteValue(
-    {
-      found: false,
-      sessionId,
-      reason: result.reason,
-      ...(result.reason === "unreachable" ? { error: result.error } : {}),
-    },
-    Boolean(options.json),
-    result.reason === "unreachable"
-      ? `Remote service unreachable; the submission outcome for ${sessionId} is unknown`
-      : result.reason === "unsupported"
-        ? `Remote service does not support read-only receipt lookup; upgrade the bridge before resolving ${sessionId}`
-        : `No durable run was accepted for session ${sessionId}`,
-  );
-  process.exitCode = result.reason === "unreachable" ? 2 : result.reason === "unsupported" ? 3 : 1;
+  const json = Boolean(options.json);
+  switch (result.reason) {
+    case "not_found":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `No durable run was accepted for session ${sessionId}`,
+      );
+      process.exitCode = 2;
+      return;
+    case "missing_run":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason, runId: receipt.runId },
+        json,
+        `Session ${sessionId} records run ${receipt.runId}, but that run is absent from this queue`,
+      );
+      process.exitCode = 3;
+      return;
+    case "unreachable":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason, error: result.error },
+        json,
+        `Remote service unreachable; the submission outcome for ${sessionId} is unknown`,
+      );
+      process.exitCode = 4;
+      return;
+    case "unsupported":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `Remote service does not support read-only receipt lookup; upgrade the bridge before resolving ${sessionId}`,
+      );
+      process.exitCode = 5;
+      return;
+    case "identity_mismatch":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `Session ${sessionId} was submitted to a different queue; not treating its absence here as a definite miss`,
+      );
+      process.exitCode = 6;
+      return;
+    case "identity_unverified":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `Session ${sessionId} records no queue identity; not treating its absence here as a definite miss`,
+      );
+      process.exitCode = 7;
+      return;
+    case "not_found_unverified":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `The 404 for session ${sessionId} was not the documented run_not_found response; not treating it as a definite miss`,
+      );
+      process.exitCode = 8;
+      return;
+  }
 });
 
 const projectSourcesCommand = program

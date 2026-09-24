@@ -35,21 +35,44 @@ GET /v1/runs/by-idempotency-key/:key
 
 The run ID is the queue's unique idempotency key, so this returns the ordinary run
 snapshot, or `404 { "error": "run_not_found" }` when no run was committed under
-that key. It is operator-authenticated and `GET`-only; it never admits, dispatches,
-or cancels work. Health advertises `oracle.remote.idempotency-lookup` version 1.
+that key. Only that documented body is a definite miss. It is operator-authenticated
+and `GET`-only; it never admits, dispatches, or cancels work. Health advertises
+`oracle.remote.idempotency-lookup` version 1 and a stable `queueId`.
 
-`oracle remote recover --session-id <id>` reads a local receipt and reports one of:
+Identity matters: before the first POST, the client records the accepting queue's
+`queueId` (and the host as a minimum) in the receipt. A 404 is definite only when
+the responding service's `queueId` matches the record; a different queue returns
+`identity_mismatch`, and a receipt with no recorded identity returns
+`identity_unverified`. Both are non-definite and never permit a resubmit, so a
+receipt pointed at the wrong queue — for example `~/.oracle` on 9473 versus
+`~/.disprove/oracle` on 9483 — can never dispatch the prompt twice. A `queueId`
+survives restarts; the host:port fallback does not, so prefer the advertised ID.
 
-- **found** — a run exists; its state and run ID are printed, and nothing is sent.
-- **not found** — the key was never committed; the payload may safely be resubmitted.
-- **unreachable** — the service could not be reached, so the outcome stays unknown.
-- **unsupported** — the service predates the lookup capability; upgrade the bridge.
+Health classification is deliberate. Only a _healthy_ service that lacks the
+capability is `unsupported`; a timeout, 401, 5xx, or refused connection is
+`unreachable`, never `unsupported`.
 
-Recovery of an ambiguous receipt (`submission: "unknown"`) uses the same lookup
-first: a committed run is adopted, an unreachable service raises the unknown-outcome
-error without resubmitting, and only a definite not-found permits the same-key
-idempotent POST. Messaging distinguishes "not found" from "unreachable" so an
-operator never treats a network failure as proof the work was never accepted.
+`oracle remote recover --session-id <id>` reads a local receipt and reports one of
+(each with its own exit code):
+
+- **found** (0) — a run exists; its state and run ID are printed, and nothing is sent.
+- **not_found** (2) — a documented miss from the same queue; the payload may be resubmitted.
+- **missing_run** (3) — the receipt records a run ID, but that run is absent from this
+  queue. This is never reported as "never accepted".
+- **unreachable** (4) — the service could not be reached, so the outcome stays unknown.
+- **unsupported** (5) — a healthy service predates the lookup capability; upgrade the bridge.
+- **identity_mismatch** (6) — the receipt belongs to a different queue.
+- **identity_unverified** (7) — the receipt records no queue identity.
+- **not_found_unverified** (8) — a 404 that was not the documented run_not_found body.
+
+Recovery of any pre-existing receipt without a run ID — a timeout, a crash mid-POST,
+or the explicit `submission: "unknown"` flag — uses the same lookup first: a committed
+run is adopted, every non-definite outcome (unreachable, unsupported, mismatch,
+unverified) fails closed without resubmitting, and only a definite not-found from the
+same queue permits the same-key idempotent POST. A brand-new receipt whose first POST
+has not happened is submitted directly, so an older service keeps accepting new work.
+Messaging distinguishes "not found" from "unreachable" so an operator never treats a
+network failure as proof the work was never accepted.
 
 ## Collection semantics
 

@@ -1061,6 +1061,7 @@ describe("durable remote server admission", () => {
         expect.objectContaining({ id: "oracle.remote.idempotency-lookup", version: 1 }),
       ]),
     );
+    expect(typeof health.json.queueId).toBe("string");
   });
 
   it("fences idempotency lookup with operator auth and GET only", async () => {

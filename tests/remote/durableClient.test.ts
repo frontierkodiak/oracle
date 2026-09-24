@@ -4,6 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { setOracleHomeDirOverrideForTest } from "../../src/oracleHome.js";
+import { createRemoteServer } from "../../src/remote/server.js";
 import {
   cancelDurableRemoteRun,
   createRemoteBrowserExecutor,
@@ -44,10 +45,11 @@ const runSnapshot = (id: string, state: "queued" | "completed" = "completed") =>
     : {}),
 });
 
-const health = () => ({
+const health = (queueId = "queue-1") => ({
   ok: true,
   version: "1",
   runtime: { name: "node", version: "25.1.0", major: 25, minimumMajor: 24 },
+  queueId,
   capabilities: {
     schemaVersion: 1,
     features: [
@@ -61,6 +63,49 @@ const health = () => ({
     ],
   },
 });
+
+const legacyHealth = (queueId = "queue-1") => {
+  const envelope = health(queueId);
+  return {
+    ...envelope,
+    capabilities: {
+      ...envelope.capabilities,
+      features: envelope.capabilities.features.filter(
+        (feature) => feature.id !== "oracle.remote.idempotency-lookup",
+      ),
+    },
+  };
+};
+
+function jsonGet(
+  host: string,
+  route: string,
+  token?: string,
+): Promise<{ status: number; json: any }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: host.split(":")[0],
+        port: Number(host.split(":")[1]),
+        method: "GET",
+        path: route,
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            json: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"),
+          }),
+        );
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+}
 
 async function listen(handler: (req: http.IncomingMessage, res: http.ServerResponse) => void) {
   const server = http.createServer(handler);
@@ -128,6 +173,10 @@ describe("durable remote client receipts", () => {
     const keys: string[] = [];
     const { server, host } = await listen(async (req, res) => {
       if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      if (req.method === "GET" && req.url?.startsWith("/v1/runs/by-idempotency-key/")) {
+        res.statusCode = 404;
+        return void res.end(JSON.stringify({ error: "run_not_found" }));
+      }
       if (req.method === "POST" && req.url === "/v1/runs") {
         posts += 1;
         keys.push(String(req.headers["idempotency-key"]));
@@ -177,6 +226,10 @@ describe("durable remote client receipts", () => {
       const keys: string[] = [];
       const { server, host } = await listen(async (req, res) => {
         if (req.url === "/health") return void res.end(JSON.stringify(health()));
+        if (req.method === "GET" && req.url?.startsWith("/v1/runs/by-idempotency-key/")) {
+          res.statusCode = 404;
+          return void res.end(JSON.stringify({ error: "run_not_found" }));
+        }
         if (req.method === "POST" && req.url === "/v1/runs") {
           posts += 1;
           keys.push(String(req.headers["idempotency-key"]));
@@ -679,6 +732,10 @@ describe("durable remote client receipts", () => {
     const keys: string[] = [];
     const { server, host } = await listen(async (req, res) => {
       if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      if (req.method === "GET" && req.url?.startsWith("/v1/runs/by-idempotency-key/")) {
+        res.statusCode = 404;
+        return void res.end(JSON.stringify({ error: "run_not_found" }));
+      }
       if (req.method === "POST" && req.url === "/v1/runs") {
         posts++;
         keys.push(String(req.headers["idempotency-key"]));
@@ -844,7 +901,7 @@ describe("durable remote client receipts", () => {
 });
 
 describe("durable receipt read-only resolution", () => {
-  it("looks up a run by idempotency key, maps 404 to null, and throws on server errors", async () => {
+  it("looks up a run by key, maps a documented 404 to null, and throws otherwise", async () => {
     const key = "a".repeat(64);
     const { server, host } = await listen((req, res) => {
       if (req.method === "GET" && req.url === `/v1/runs/by-idempotency-key/${key}`)
@@ -852,6 +909,10 @@ describe("durable receipt read-only resolution", () => {
       if (req.method === "GET" && req.url === `/v1/runs/by-idempotency-key/${"c".repeat(64)}`) {
         res.statusCode = 404;
         return void res.end(JSON.stringify({ error: "run_not_found" }));
+      }
+      if (req.method === "GET" && req.url === `/v1/runs/by-idempotency-key/${"d".repeat(64)}`) {
+        res.statusCode = 404;
+        return void res.end();
       }
       res.statusCode = 500;
       res.end(JSON.stringify({ error: "boom" }));
@@ -865,6 +926,9 @@ describe("durable receipt read-only resolution", () => {
       await expect(lookupDurableRemoteRun(host, "d".repeat(64))).rejects.toBeInstanceOf(
         RemoteHttpError,
       );
+      await expect(lookupDurableRemoteRun(host, "f".repeat(64))).rejects.toBeInstanceOf(
+        RemoteHttpError,
+      );
     } finally {
       await close(server);
     }
@@ -875,7 +939,12 @@ describe("durable receipt read-only resolution", () => {
     setOracleHomeDirOverrideForTest(home);
     const sessionId = "timeout-before-run-id";
     const key = "e".repeat(64);
-    await writeDurableReceipt({ sessionId, idempotencyKey: key, submission: "unknown" });
+    await writeDurableReceipt({
+      sessionId,
+      idempotencyKey: key,
+      submission: "unknown",
+      queueId: "queue-1",
+    });
     let posts = 0;
     const { server, host } = await listen((req, res) => {
       if (req.url === "/health") return void res.end(JSON.stringify(health()));
@@ -901,20 +970,103 @@ describe("durable receipt read-only resolution", () => {
       });
       expect(result.snapshot.id).toBe("recovered-run");
       expect(posts).toBe(0);
-      expect(await readDurableReceipt(sessionId)).toMatchObject({ runId: "recovered-run" });
-      expect((await readDurableReceipt(sessionId))?.submission).toBeUndefined();
+      const receipt = await readDurableReceipt(sessionId);
+      expect(receipt).toMatchObject({ runId: "recovered-run" });
+      expect(receipt?.submission).toBeUndefined();
     } finally {
       await close(server);
       setOracleHomeDirOverrideForTest(null);
     }
   });
 
-  it("reports a definite miss and only then permits an idempotent repost", async () => {
+  it("runs the lookup for a crash-mid-POST receipt that has no submission flag", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-recover-crash-"));
+    setOracleHomeDirOverrideForTest(home);
+    const sessionId = "crash-mid-post";
+    const key = "3".repeat(64);
+    await writeDurableReceipt({ sessionId, idempotencyKey: key, queueId: "queue-1" });
+    let posts = 0;
+    const { server, host } = await listen((req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      if (req.method === "GET" && req.url === `/v1/runs/by-idempotency-key/${key}`)
+        return void res.end(JSON.stringify(runSnapshot("committed", "completed")));
+      if (req.method === "POST" && req.url === "/v1/runs") {
+        posts += 1;
+        return void res.end(JSON.stringify(runSnapshot("must-not-submit", "completed")));
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    try {
+      const result = await submitDurableRemoteRunWithReceipt({
+        host,
+        sessionId,
+        payload: {
+          prompt: "hello",
+          attachments: [],
+          browserConfig: {} as any,
+          options: { sessionId },
+        },
+      });
+      expect(result.snapshot.id).toBe("committed");
+      expect(posts).toBe(0);
+    } finally {
+      await close(server);
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
+  it("adopts the committed run from the executor recovery path without resubmitting", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-recover-executor-"));
+    setOracleHomeDirOverrideForTest(home);
+    const sessionId = "executor-recovery";
+    const key = "4".repeat(64);
+    await writeDurableReceipt({
+      sessionId,
+      idempotencyKey: key,
+      submission: "unknown",
+      queueId: "queue-1",
+    });
+    let posts = 0;
+    const { server, host } = await listen((req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      if (req.method === "GET" && req.url === `/v1/runs/by-idempotency-key/${key}`)
+        return void res.end(JSON.stringify(runSnapshot("recovered-exec", "completed")));
+      if (req.method === "GET" && req.url?.startsWith("/v1/runs/recovered-exec/events"))
+        return void res.end(JSON.stringify({ events: [] }));
+      if (req.method === "GET" && req.url === "/v1/runs/recovered-exec")
+        return void res.end(JSON.stringify(runSnapshot("recovered-exec", "completed")));
+      if (req.method === "POST" && req.url === "/v1/runs") {
+        posts += 1;
+        return void res.end(JSON.stringify(runSnapshot("must-not-submit", "completed")));
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    try {
+      const result = await createRemoteBrowserExecutor({ host })({
+        prompt: "hello",
+        sessionId,
+      });
+      expect(result.answerText).toBe("ok");
+      expect(posts).toBe(0);
+    } finally {
+      await close(server);
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
+  it("permits a same-key repost only on a documented miss from the same queue", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "oracle-recover-miss-"));
     setOracleHomeDirOverrideForTest(home);
     const sessionId = "definite-miss";
     const key = "f".repeat(64);
-    await writeDurableReceipt({ sessionId, idempotencyKey: key, submission: "unknown" });
+    await writeDurableReceipt({
+      sessionId,
+      idempotencyKey: key,
+      submission: "unknown",
+      queueId: "queue-1",
+    });
     let posts = 0;
     const { server, host } = await listen((req, res) => {
       if (req.url === "/health") return void res.end(JSON.stringify(health()));
@@ -949,12 +1101,67 @@ describe("durable receipt read-only resolution", () => {
     }
   });
 
+  it("does not treat a same-queue 404 without the documented body as definite", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-recover-body-"));
+    setOracleHomeDirOverrideForTest(home);
+    const sessionId = "unverified-404";
+    const key = "5".repeat(64);
+    await writeDurableReceipt({
+      sessionId,
+      idempotencyKey: key,
+      submission: "unknown",
+      queueId: "queue-1",
+    });
+    let posts = 0;
+    const { server, host } = await listen((req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(health()));
+      if (req.method === "GET" && req.url === `/v1/runs/by-idempotency-key/${key}`) {
+        res.statusCode = 404;
+        return void res.end();
+      }
+      if (req.method === "POST" && req.url === "/v1/runs") {
+        posts += 1;
+        return void res.end(JSON.stringify(runSnapshot("must-not-submit", "queued")));
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    try {
+      const receipt = await readDurableReceipt(sessionId);
+      await expect(resolveDurableReceipt(host, receipt!)).resolves.toEqual({
+        found: false,
+        reason: "not_found_unverified",
+      });
+      await expect(
+        submitDurableRemoteRunWithReceipt({
+          host,
+          sessionId,
+          payload: {
+            prompt: "hello",
+            attachments: [],
+            browserConfig: {} as any,
+            options: { sessionId },
+          },
+        }),
+      ).rejects.toMatchObject({ reason: "not_found_unverified" });
+      expect(posts).toBe(0);
+    } finally {
+      await close(server);
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
   it("reports an unreachable lookup distinctly and never resubmits", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "oracle-recover-unreachable-"));
     setOracleHomeDirOverrideForTest(home);
     const sessionId = "unreachable-lookup";
     const key = "1".repeat(64);
-    await writeDurableReceipt({ sessionId, idempotencyKey: key, submission: "unknown" });
+    await writeDurableReceipt({
+      sessionId,
+      idempotencyKey: key,
+      submission: "unknown",
+      queueId: "queue-1",
+    });
     let posts = 0;
     const { server, host } = await listen((req, res) => {
       if (req.url === "/health") return void res.end(JSON.stringify(health()));
@@ -992,24 +1199,62 @@ describe("durable receipt read-only resolution", () => {
     }
   });
 
-  it("reports a service without the lookup capability distinctly and reposts idempotently", async () => {
+  it("classifies a hung /health as unreachable, not unsupported", async () => {
+    const { server, host } = await listen(() => {
+      /* never respond */
+    });
+    try {
+      await expect(
+        resolveDurableReceipt(host, { idempotencyKey: "a".repeat(64), queueId: "queue-1" }),
+      ).resolves.toMatchObject({ found: false, reason: "unreachable" });
+    } finally {
+      await close(server);
+    }
+  }, 15000);
+
+  it("classifies a 401 /health as unreachable", async () => {
+    const { server, host } = await listen((_req, res) => {
+      res.statusCode = 401;
+      res.end(JSON.stringify({ error: "unauthorized" }));
+    });
+    try {
+      await expect(
+        resolveDurableReceipt(
+          host,
+          { idempotencyKey: "a".repeat(64), queueId: "queue-1" },
+          "wrong",
+        ),
+      ).resolves.toMatchObject({ found: false, reason: "unreachable" });
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("classifies a 5xx /health as unreachable", async () => {
+    const { server, host } = await listen((_req, res) => {
+      res.statusCode = 503;
+      res.end(JSON.stringify({ error: "maintenance" }));
+    });
+    try {
+      await expect(
+        resolveDurableReceipt(host, { idempotencyKey: "a".repeat(64), queueId: "queue-1" }),
+      ).resolves.toMatchObject({ found: false, reason: "unreachable" });
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("fails closed on a healthy service without the lookup capability", async () => {
     const home = await mkdtemp(path.join(os.tmpdir(), "oracle-recover-unsupported-"));
     setOracleHomeDirOverrideForTest(home);
     const sessionId = "unsupported-lookup";
     const key = "2".repeat(64);
-    await writeDurableReceipt({ sessionId, idempotencyKey: key, submission: "unknown" });
-    const legacyHealth = () => {
-      const envelope = health();
-      return {
-        ...envelope,
-        capabilities: {
-          ...envelope.capabilities,
-          features: envelope.capabilities.features.filter(
-            (feature) => feature.id !== "oracle.remote.idempotency-lookup",
-          ),
-        },
-      };
-    };
+    await writeDurableReceipt({
+      sessionId,
+      idempotencyKey: key,
+      submission: "unknown",
+      queueId: "queue-1",
+    });
     let posts = 0;
     const { server, host } = await listen((req, res) => {
       if (req.url === "/health") return void res.end(JSON.stringify(legacyHealth()));
@@ -1019,7 +1264,7 @@ describe("durable receipt read-only resolution", () => {
       }
       if (req.method === "POST" && req.url === "/v1/runs") {
         posts += 1;
-        return void res.end(JSON.stringify(runSnapshot("legacy-repost", "queued")));
+        return void res.end(JSON.stringify(runSnapshot("must-not-submit", "queued")));
       }
       res.statusCode = 404;
       res.end();
@@ -1030,20 +1275,149 @@ describe("durable receipt read-only resolution", () => {
         found: false,
         reason: "unsupported",
       });
+      await expect(
+        submitDurableRemoteRunWithReceipt({
+          host,
+          sessionId,
+          payload: {
+            prompt: "hello",
+            attachments: [],
+            browserConfig: {} as any,
+            options: { sessionId },
+          },
+        }),
+      ).rejects.toMatchObject({ reason: "unsupported" });
+      expect(posts).toBe(0);
+    } finally {
+      await close(server);
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
+  it("still submits a fresh receipt to a service without the lookup capability", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-fresh-legacy-"));
+    setOracleHomeDirOverrideForTest(home);
+    let posts = 0;
+    const { server, host } = await listen((req, res) => {
+      if (req.url === "/health") return void res.end(JSON.stringify(legacyHealth()));
+      if (req.method === "POST" && req.url === "/v1/runs") {
+        posts += 1;
+        return void res.end(JSON.stringify(runSnapshot("fresh-legacy", "queued")));
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    try {
       const result = await submitDurableRemoteRunWithReceipt({
         host,
-        sessionId,
+        sessionId: "fresh-legacy-session",
         payload: {
           prompt: "hello",
           attachments: [],
           browserConfig: {} as any,
-          options: { sessionId },
+          options: { sessionId: "fresh-legacy-session" },
         },
       });
-      expect(result.snapshot.id).toBe("legacy-repost");
+      expect(result.snapshot.id).toBe("fresh-legacy");
       expect(posts).toBe(1);
     } finally {
       await close(server);
+      setOracleHomeDirOverrideForTest(null);
+    }
+  });
+
+  it("reports a receipt whose recorded run 404s as missing_run, not a fresh miss", async () => {
+    const { server, host } = await listen((_req, res) => {
+      res.statusCode = 404;
+      res.end(JSON.stringify({ error: "run_not_found" }));
+    });
+    try {
+      await expect(
+        resolveDurableReceipt(host, { runId: "ghost-run", idempotencyKey: "a".repeat(64) }),
+      ).resolves.toEqual({ found: false, reason: "missing_run" });
+    } finally {
+      await close(server);
+    }
+  });
+
+  it("never POSTs to a queue whose identity differs from the receipt", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "oracle-identity-mismatch-"));
+    setOracleHomeDirOverrideForTest(home);
+    const dispatched = { a: 0, b: 0 };
+    const runBrowser = (key: "a" | "b") => async () => {
+      dispatched[key] += 1;
+      return {
+        answerText: "ok",
+        answerMarkdown: "ok",
+        tookMs: 1,
+        answerTokens: 1,
+        answerChars: 2,
+      };
+    };
+    const serverA = await createRemoteServer(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        token: "test",
+        logger: () => {},
+        queueHomeDir: await mkdtemp(path.join(os.tmpdir(), "oracle-queue-a-")),
+      },
+      { runBrowser: runBrowser("a") },
+    );
+    const serverB = await createRemoteServer(
+      {
+        host: "127.0.0.1",
+        port: 0,
+        token: "test",
+        logger: () => {},
+        queueHomeDir: await mkdtemp(path.join(os.tmpdir(), "oracle-queue-b-")),
+      },
+      { runBrowser: runBrowser("b") },
+    );
+    const hostA = `127.0.0.1:${serverA.port}`;
+    const hostB = `127.0.0.1:${serverB.port}`;
+    const key = "6".repeat(64);
+    const payload = {
+      prompt: "x",
+      attachments: [],
+      browserConfig: {},
+      options: {},
+    } as any;
+    try {
+      await submitDurableRemoteRun({
+        host: hostA,
+        token: "test",
+        idempotencyKey: key,
+        payload,
+      });
+      const queueA = (await jsonGet(hostA, "/health", "test")).json.queueId;
+      expect(typeof queueA).toBe("string");
+      await writeDurableReceipt({
+        sessionId: "identity-mismatch",
+        idempotencyKey: key,
+        submission: "unknown",
+        queueId: queueA,
+      });
+      const receipt = await readDurableReceipt("identity-mismatch");
+      await expect(resolveDurableReceipt(hostB, receipt!, "test")).resolves.toEqual({
+        found: false,
+        reason: "identity_mismatch",
+      });
+      await expect(
+        submitDurableRemoteRunWithReceipt({
+          host: hostB,
+          token: "test",
+          sessionId: "identity-mismatch",
+          payload,
+        }),
+      ).rejects.toMatchObject({ reason: "identity_mismatch" });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Only A ever dispatched; the prompt was never sent twice.
+      expect(dispatched.a).toBe(1);
+      expect(dispatched.b).toBe(0);
+    } finally {
+      await serverA.close();
+      await serverB.close();
       setOracleHomeDirOverrideForTest(null);
     }
   });

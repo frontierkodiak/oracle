@@ -51,21 +51,47 @@ export interface DurableReceipt {
   runId?: string;
   payloadHash?: string;
   submission?: "unknown";
+  /** Identity of the queue the first POST was sent to (recorded before that POST). */
+  queueId?: string;
+  /** Host:port of that queue, the minimum identity when no stable queue ID exists. */
+  host?: string;
 }
+/** Outcomes where the receipt's run cannot be confirmed; none permits a POST. */
+export type DurableReceiptFailureReason =
+  | "unreachable"
+  | "unsupported"
+  | "identity_mismatch"
+  | "identity_unverified"
+  | "not_found_unverified";
+/** A non-`unreachable` lookup miss; `not_found` alone permits a same-key POST. */
+export type DurableReceiptMissReason =
+  | "not_found"
+  | "missing_run"
+  | "unsupported"
+  | "identity_mismatch"
+  | "identity_unverified"
+  | "not_found_unverified";
 export class DurableSubmissionUnknownError extends Error {
   readonly reconnectable = true;
   constructor(
     readonly sessionId?: string,
-    readonly reason: "unknown" | "unreachable" = "unknown",
+    readonly reason: "unknown" | DurableReceiptFailureReason = "unknown",
   ) {
     const recovery = sessionId
       ? ` rerun with --session-id ${sessionId}; receipt: ${receiptPath(sessionId)}`
       : " retry with the saved key";
-    const prefix =
-      reason === "unreachable"
-        ? "durable run outcome is unknown because the service is unreachable"
-        : "durable run submission outcome is unknown";
-    super(`${prefix};${recovery}`);
+    const prefix: Record<typeof reason, string> = {
+      unknown: "durable run submission outcome is unknown",
+      unreachable: "durable run outcome is unknown because the service is unreachable",
+      unsupported:
+        "durable run outcome is unknown because the service lacks the idempotency lookup",
+      identity_mismatch:
+        "durable run outcome is unknown because the receipt belongs to a different queue",
+      identity_unverified:
+        "durable run outcome is unknown because the receipt records no queue identity",
+      not_found_unverified: "durable run outcome is unknown because the 404 was not verifiable",
+    };
+    super(`${prefix[reason]};${recovery}`);
     this.name = "DurableSubmissionUnknownError";
   }
 }
@@ -78,11 +104,12 @@ class RemoteTransportError extends Error {
     this.name = "RemoteTransportError";
   }
 }
-/** Non-2xx response carrying the HTTP status so callers can treat 404 as data. */
+/** Non-2xx response carrying the HTTP status and parsed body so 404 is data. */
 export class RemoteHttpError extends Error {
   constructor(
     readonly statusCode: number,
     message: string,
+    readonly body?: unknown,
   ) {
     super(message);
     this.name = "RemoteHttpError";
@@ -197,7 +224,16 @@ function validateReceipt(value: unknown, sessionId: string): DurableReceipt {
   if (
     !r ||
     Object.keys(r).some(
-      (key) => !["sessionId", "idempotencyKey", "runId", "payloadHash", "submission"].includes(key),
+      (key) =>
+        ![
+          "sessionId",
+          "idempotencyKey",
+          "runId",
+          "payloadHash",
+          "submission",
+          "queueId",
+          "host",
+        ].includes(key),
     ) ||
     r.sessionId !== sessionId ||
     typeof r.idempotencyKey !== "string" ||
@@ -206,7 +242,9 @@ function validateReceipt(value: unknown, sessionId: string): DurableReceipt {
       (typeof r.runId !== "string" || !/^[a-zA-Z0-9_-]{1,128}$/.test(r.runId))) ||
     (r.payloadHash !== undefined &&
       (typeof r.payloadHash !== "string" || !/^[a-f0-9]{64}$/.test(r.payloadHash))) ||
-    (r.submission !== undefined && r.submission !== "unknown")
+    (r.submission !== undefined && r.submission !== "unknown") ||
+    (r.queueId !== undefined && (typeof r.queueId !== "string" || r.queueId.trim().length === 0)) ||
+    (r.host !== undefined && (typeof r.host !== "string" || r.host.trim().length === 0))
   )
     throw new Error("invalid durable queue receipt");
   return r as unknown as DurableReceipt;
@@ -233,42 +271,54 @@ export async function submitDurableRemoteRunWithReceipt(p: {
   payload: RemoteRunPayload;
   onReceiptReady?: (receipt: DurableReceipt) => void;
 }): Promise<{ receipt: DurableReceipt; snapshot: DurableRunSnapshot }> {
-  assertRemoteCapabilities(await checkRemoteHealth({ host: p.host, token: p.token }), p.host, [
-    { id: DURABLE_QUEUE_FEATURE_ID, version: 1 },
-  ]);
-  let receipt = await readDurableReceipt(p.sessionId);
-  if (!receipt) {
-    receipt = { sessionId: p.sessionId, idempotencyKey: randomBytes(32).toString("hex") };
-    await writeDurableReceipt(receipt);
-  }
+  const health = await checkRemoteHealth({ host: p.host, token: p.token });
+  assertRemoteCapabilities(health, p.host, [{ id: DURABLE_QUEUE_FEATURE_ID, version: 1 }]);
+  const existing = await readDurableReceipt(p.sessionId);
+  let receipt: DurableReceipt = existing ?? {
+    sessionId: p.sessionId,
+    idempotencyKey: randomBytes(32).toString("hex"),
+  };
   const payloadHash = createHash("sha256").update(JSON.stringify(p.payload)).digest("hex");
   if (receipt.payloadHash && receipt.payloadHash !== payloadHash)
     throw new Error("durable receipt payload does not match the current request");
-  if (!receipt.payloadHash) {
-    receipt = { ...receipt, payloadHash };
-    await writeDurableReceipt(receipt);
-  }
+  // Record the accepting queue's identity before the first POST so a later 404
+  // from a different queue is never read as a definite not-found.
+  const queued: DurableReceipt = {
+    ...receipt,
+    ...(receipt.payloadHash ? {} : { payloadHash }),
+    ...(receipt.queueId || !health.queueId ? {} : { queueId: health.queueId }),
+    ...(receipt.host ? {} : { host: p.host }),
+  };
+  if (
+    !existing ||
+    queued.payloadHash !== receipt.payloadHash ||
+    queued.queueId !== receipt.queueId ||
+    queued.host !== receipt.host
+  )
+    await writeDurableReceipt(queued);
+  receipt = queued;
   p.onReceiptReady?.(receipt);
   let snapshot: DurableRunSnapshot;
   if (receipt.runId) {
     snapshot = await getDurableRemoteRun(p.host, receipt.runId, p.token);
-  } else if (receipt.submission === "unknown") {
-    // A prior POST timed out before a run ID was recorded. Resolve it read-only:
-    // a committed run is adopted, a definite not-found proves the key was never
-    // accepted, and an unreachable service leaves the outcome unknown. A service
-    // that predates the lookup capability falls back to the same-key idempotent
-    // POST, which the queue dedupes.
+  } else if (existing) {
+    // A prior process may have POSTed before a run ID was recorded (timeout,
+    // crash, or the explicit unknown flag). Resolve read-only; only a definite
+    // not-found permits the same-key POST, and every other outcome fails closed.
     const lookup = await resolveDurableReceipt(p.host, receipt, p.token);
     if (lookup.found) snapshot = lookup.snapshot;
-    else if (lookup.reason === "unreachable")
-      throw new DurableSubmissionUnknownError(p.sessionId, "unreachable");
-    else
+    else if (lookup.reason === "not_found")
       snapshot = await submitDurableRemoteRun({
         host: p.host,
         token: p.token,
         idempotencyKey: receipt.idempotencyKey,
         payload: p.payload,
       });
+    else
+      throw new DurableSubmissionUnknownError(
+        p.sessionId,
+        lookup.reason === "missing_run" ? "not_found_unverified" : lookup.reason,
+      );
   } else {
     try {
       snapshot = await submitDurableRemoteRun({
@@ -366,8 +416,8 @@ export async function getDurableRemoteRun(
 /**
  * Read-only transport lookup by durable idempotency key. Resolves the run a
  * service may have accepted under a receipt's key without submitting anything.
- * Returns null only on a definite `404 run_not_found`; transport and other
- * failures throw so callers can tell "not found" from "unreachable".
+ * Returns null only on a verified `404 run_not_found`; any other 404, transport,
+ * or server failure throws so callers can tell "not found" from everything else.
  */
 export async function lookupDurableRemoteRun(
   host: string,
@@ -386,55 +436,92 @@ export async function lookupDurableRemoteRun(
     validateSnapshot(s);
     return s;
   } catch (error) {
-    if (error instanceof RemoteHttpError && error.statusCode === 404) return null;
+    if (
+      error instanceof RemoteHttpError &&
+      error.statusCode === 404 &&
+      isRunNotFoundBody(error.body)
+    )
+      return null;
     throw error;
   }
 }
 export type DurableReceiptLookup =
   | { found: true; runId: string; snapshot: DurableRunSnapshot; requestHash: string }
-  | { found: false; reason: "not_found" | "unsupported" }
+  | { found: false; reason: DurableReceiptMissReason }
   | { found: false; reason: "unreachable"; error: string };
 /**
  * Reconcile a receipt to a live run read-only, never resubmitting its prompt.
- * A receipt without a run ID is resolved by idempotency key, but only after the
- * service advertises the lookup capability: an older service answers the unknown
- * route with 404, which must not be mistaken for a definite "not found".
+ *
+ * A receipt with a run ID is fetched directly; if that run 404s it is `missing_run`,
+ * never reported as "never accepted". A receipt without a run ID is resolved by
+ * idempotency key, but only against a healthy service that advertises the lookup
+ * and whose queue identity matches the one recorded in the receipt. Any other
+ * outcome is non-definite and must not permit a same-key POST.
  */
 export async function resolveDurableReceipt(
   host: string,
-  receipt: Pick<DurableReceipt, "runId" | "idempotencyKey">,
+  receipt: Pick<DurableReceipt, "runId" | "idempotencyKey" | "queueId" | "host">,
   token?: string,
 ): Promise<DurableReceiptLookup> {
-  try {
-    if (receipt.runId) {
+  if (receipt.runId) {
+    try {
       const snapshot = await getDurableRemoteRun(host, receipt.runId, token);
       return { found: true, runId: snapshot.id, snapshot, requestHash: snapshot.requestHash };
+    } catch (error) {
+      if (error instanceof RemoteHttpError && error.statusCode === 404)
+        return { found: false, reason: "missing_run" };
+      if (isRetryableTransport(error))
+        return { found: false, reason: "unreachable", error: safeMessage(error) };
+      throw error;
     }
-    const health = await checkRemoteHealth({ host, token });
-    const supported =
-      health.ok === true &&
-      health.manifest?.features.some(
-        (feature) => feature.id === IDEMPOTENCY_LOOKUP_FEATURE_ID && feature.version === 1,
-      ) === true;
-    if (!supported) {
-      if (!health.ok && looksUnreachable(health.error ?? ""))
-        return {
-          found: false,
-          reason: "unreachable",
-          error: health.error ?? "remote health check failed",
-        };
-      return { found: false, reason: "unsupported" };
-    }
-    const snapshot = await lookupDurableRemoteRun(host, receipt.idempotencyKey, token);
-    if (!snapshot) return { found: false, reason: "not_found" };
-    return { found: true, runId: snapshot.id, snapshot, requestHash: snapshot.requestHash };
+  }
+  const health = await checkRemoteHealth({ host, token });
+  if (!health.ok)
+    return {
+      found: false,
+      reason: "unreachable",
+      error: health.error ?? `remote health failed with HTTP ${health.statusCode ?? "unknown"}`,
+    };
+  const supported =
+    health.manifest?.features.some(
+      (feature) => feature.id === IDEMPOTENCY_LOOKUP_FEATURE_ID && feature.version === 1,
+    ) === true;
+  if (!supported) return { found: false, reason: "unsupported" };
+  let snapshot: DurableRunSnapshot | null;
+  try {
+    snapshot = await lookupDurableRemoteRun(host, receipt.idempotencyKey, token);
   } catch (error) {
     if (error instanceof RemoteHttpError && error.statusCode === 404)
-      return { found: false, reason: "not_found" };
+      return { found: false, reason: "not_found_unverified" };
     if (isRetryableTransport(error))
       return { found: false, reason: "unreachable", error: safeMessage(error) };
     throw error;
   }
+  if (snapshot)
+    return { found: true, runId: snapshot.id, snapshot, requestHash: snapshot.requestHash };
+  const identity = compareQueueIdentity(receipt, host, health.queueId);
+  if (identity === "match") return { found: false, reason: "not_found" };
+  return {
+    found: false,
+    reason: identity === "mismatch" ? "identity_mismatch" : "identity_unverified",
+  };
+}
+function isRunNotFoundBody(body: unknown): boolean {
+  return (
+    !!body &&
+    typeof body === "object" &&
+    !Array.isArray(body) &&
+    (body as Record<string, unknown>).error === "run_not_found"
+  );
+}
+function compareQueueIdentity(
+  receipt: Pick<DurableReceipt, "queueId" | "host">,
+  host: string,
+  queueId: string | undefined,
+): "match" | "mismatch" | "unverified" {
+  if (receipt.queueId && queueId) return receipt.queueId === queueId ? "match" : "mismatch";
+  if (receipt.host) return receipt.host === host ? "match" : "mismatch";
+  return "unverified";
 }
 export async function getDurableRemoteRunEvents(
   host: string,
@@ -624,42 +711,52 @@ export function createRemoteBrowserExecutor({
   const ensureHealth = async (required: RemoteCapabilityRequirement[]) => {
     const h = await (healthPromise ??= checkRemoteHealth({ host, token }));
     assertRemoteCapabilities(h, host, required);
+    return h;
   };
   return async (options: BrowserRunOptions): Promise<BrowserRunResult> => {
     if (options.signal?.aborted)
       throw new Error("Remote browser run cancelled before the request was sent.");
     const captureOnly = options.config?.captureOnly === true;
-    await ensureHealth([
+    const health = await ensureHealth([
       { id: DURABLE_QUEUE_FEATURE_ID, version: 1 },
       ...(requiredCapabilities ?? []),
       ...(captureOnly ? [{ id: CAPTURE_ONLY_FEATURE_ID, version: 1 }] : []),
     ]);
     const sessionId = options.sessionId ?? `remote-${randomBytes(12).toString("hex")}`;
-    let receipt = await readDurableReceipt(sessionId);
-    if (!receipt) {
-      receipt = { sessionId, idempotencyKey: randomBytes(32).toString("hex") };
-      await writeDurableReceipt(receipt);
-    }
+    const existing = await readDurableReceipt(sessionId);
+    let receipt: DurableReceipt = existing ?? {
+      sessionId,
+      idempotencyKey: randomBytes(32).toString("hex"),
+    };
     const payload = await serializePayload(options, captureOnly);
     if (options.signal?.aborted) throw new Error("Remote browser run aborted before submission.");
     const payloadHash = createHash("sha256").update(JSON.stringify(payload)).digest("hex");
     if (receipt.payloadHash && receipt.payloadHash !== payloadHash)
       throw new Error("durable receipt payload does not match the current request");
-    if (!receipt.payloadHash) {
-      receipt = { ...receipt, payloadHash };
-      await writeDurableReceipt(receipt);
-    }
+    const queued: DurableReceipt = {
+      ...receipt,
+      ...(receipt.payloadHash ? {} : { payloadHash }),
+      ...(receipt.queueId || !health.queueId ? {} : { queueId: health.queueId }),
+      ...(receipt.host ? {} : { host }),
+    };
+    if (
+      !existing ||
+      queued.payloadHash !== receipt.payloadHash ||
+      queued.queueId !== receipt.queueId ||
+      queued.host !== receipt.host
+    )
+      await writeDurableReceipt(queued);
+    receipt = queued;
     let accepted: DurableRunSnapshot;
     if (receipt.runId) {
       accepted = await getDurableRemoteRun(host, receipt.runId, token);
-    } else if (receipt.submission === "unknown") {
-      // Resolve the ambiguous submission read-only; never reconstruct its payload.
+    } else if (existing) {
+      // A prior process may have POSTed before a run ID was recorded. Resolve
+      // read-only; only a definite not-found permits the same-key POST.
       const lookup = await resolveDurableReceipt(host, receipt, token);
       if (lookup.found) {
         accepted = lookup.snapshot;
-      } else if (lookup.reason === "unreachable") {
-        throw new DurableSubmissionUnknownError(sessionId, "unreachable");
-      } else {
+      } else if (lookup.reason === "not_found") {
         if (options.signal?.aborted)
           throw new Error("Remote browser run aborted before submission.");
         accepted = await submitDurableRemoteRun({
@@ -668,6 +765,11 @@ export function createRemoteBrowserExecutor({
           idempotencyKey: receipt.idempotencyKey,
           payload,
         });
+      } else {
+        throw new DurableSubmissionUnknownError(
+          sessionId,
+          lookup.reason === "missing_run" ? "not_found_unverified" : lookup.reason,
+        );
       }
       await writeDurableReceipt({ ...receipt, runId: accepted.id, submission: undefined });
     } else {
@@ -1163,11 +1265,6 @@ function isRetryableTransport(e: unknown): boolean {
     e instanceof Error ? e.message : String(e),
   );
 }
-function looksUnreachable(message: string): boolean {
-  return /ECONNRESET|ECONNREFUSED|EPIPE|socket hang up|request timeout|ETIMEDOUT|ENOTFOUND|EHOSTUNREACH|network|Could not reach/i.test(
-    message,
-  );
-}
 function isDefinitePreSubmit(e: unknown): boolean {
   return e instanceof RemoteTransportError && e.phase === "pre-submit";
 }
@@ -1269,6 +1366,7 @@ async function requestDurableJson(p: {
               new RemoteHttpError(
                 res.statusCode ?? 0,
                 `remote request failed HTTP ${res.statusCode}: ${safeMessage((v as any)?.error ?? "request failed")}`,
+                v,
               ),
             );
           else resolve(v);
