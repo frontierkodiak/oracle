@@ -233,6 +233,12 @@ export class DurableQueueStore {
     this.db.exec(
       "CREATE TABLE IF NOT EXISTS run_profiles(run_id TEXT PRIMARY KEY REFERENCES runs(id),profile_id TEXT NOT NULL)",
     );
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS queue_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),queue_id TEXT NOT NULL)",
+    );
+    this.db
+      .prepare("INSERT OR IGNORE INTO queue_identity(singleton,queue_id) VALUES(1,?)")
+      .run(randomUUID());
     this.reconcile();
   }
   static async open(o: DurableQueueOptions = {}): Promise<DurableQueueStore> {
@@ -302,6 +308,13 @@ export class DurableQueueStore {
   }
   close(): void {
     if (this.db.isOpen) this.db.close();
+  }
+  /** Stable identity of this queue store; survives restarts, distinct per queue root. */
+  queueId(): string {
+    const row = this.db.prepare("SELECT queue_id FROM queue_identity WHERE singleton=1").get() as
+      | Row
+      | undefined;
+    return String(row!.queue_id);
   }
   private append(id: string, t: number, event: unknown): number {
     const r = this.db.prepare("SELECT seq FROM runs WHERE id=?").get(id) as Row;

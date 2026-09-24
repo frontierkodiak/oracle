@@ -11,14 +11,72 @@ oracle remote reconcile <run-id> --json
 oracle remote collect <run-id> --inspect --json
 oracle remote reconcile <run-id> --resume --json
 oracle remote reconcile <historical-run-id> --use-current-profile --json
+oracle remote recover --session-id <id> --json
 ```
 
-Both aliases use the same scheduler as automatic collection. The authenticated
+Both reconcile aliases use the same scheduler as automatic collection. The authenticated
 `GET /v1/runs/:id/reconciliation` endpoint reads the receipt (or `null` before
 scheduling); `POST` with an empty body or `{}` creates an idempotent intent. A structured `{ "action": "resume" }` requests a new bounded retry budget after
 attention; adding `"useCurrentProfile": true` deliberately binds missing historical
 profile provenance. No conversation, browser-path, or prompt overrides are accepted. Health advertises
 `oracle.remote.reconciliation` version 1. Ordinary v1 run snapshots are unchanged.
+
+## Resolving a receipt with no run ID
+
+A submission that times out before its run ID is recorded leaves a durable receipt
+with a session, an idempotency key, and a payload hash but no run ID. The client
+must not guess whether the service accepted it, and it must not reconstruct and
+repost the payload to find out. Instead it asks the service read-only by
+idempotency key:
+
+```
+GET /v1/runs/by-idempotency-key/:key
+```
+
+The run ID is the queue's unique idempotency key, so this returns the ordinary run
+snapshot, or `404 { "error": "run_not_found" }` when no run was committed under
+that key. Only that documented body is a definite miss. It is operator-authenticated
+and `GET`-only; it never admits, dispatches, or cancels work. Health advertises
+`oracle.remote.idempotency-lookup` version 1 and a stable `queueId`.
+
+Identity matters: a fresh receipt records the accepting queue's `queueId` (and the
+host as a minimum) before its first POST. A 404 is definite only when the responding
+service's `queueId` matches the record. The actual guarantee is that a non-definite
+miss never resubmits: a receipt pointed at the wrong queue returns
+`identity_mismatch`, and a receipt from an older client with no recorded identity
+returns `identity_unverified` — both leave the prompt unsent, so a 404 from a queue
+that did not accept the run cannot trigger a second dispatch. (An identity-less
+receipt therefore resolves to `found` only if the run is actually present; it is
+never resubmitted on a miss, even against its own queue.) A `queueId` survives
+restarts; the host:port fallback does not, so prefer the advertised ID.
+
+Health classification is deliberate. Only a _healthy_ service that lacks the
+capability is `unsupported`; a timeout, 401, 5xx, or refused connection is
+`unreachable`, never `unsupported`.
+
+`oracle remote recover --session-id <id>` reads a local receipt and reports one of
+(each with its own exit code):
+
+- **found** (0) — a run exists; its state and run ID are printed, and nothing is sent.
+- **not_found** (2) — a documented miss from the same queue; the payload may be resubmitted.
+- **missing_run** (3) — the receipt records a run ID, but that run is absent from this
+  queue. This is never reported as "never accepted".
+- **unreachable** (4) — the service could not be reached, so the outcome stays unknown.
+- **unsupported** (5) — a healthy service predates the lookup capability; upgrade the bridge.
+- **identity_mismatch** (6) — the receipt belongs to a different queue.
+- **identity_unverified** (7) — the receipt records no queue identity.
+- **not_found_unverified** (8) — a 404 that was not the documented run_not_found body.
+
+Recovery of any pre-existing receipt without a run ID — a timeout, a crash mid-POST,
+or the explicit `submission: "unknown"` flag — uses the same lookup first: a committed
+run is adopted, every non-definite outcome (unreachable, unsupported, mismatch,
+unverified) fails closed without resubmitting, and only a definite not-found from the
+same queue permits the same-key idempotent POST. A brand-new receipt whose first POST
+has not happened is submitted directly, so an older service keeps accepting new work.
+Messaging distinguishes "not found" from "unreachable" so an operator never treats a
+network failure as proof the work was never accepted.
+
+## Collection semantics
 
 Collection only uses `runtimeHint.conversationId` stored by the original browser
 run. A URL in the submitted request is not evidence of the resulting conversation.
