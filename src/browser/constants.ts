@@ -106,8 +106,11 @@ export const SEND_BUTTON_SELECTORS = [
   'button[aria-label*="Send"]',
 ];
 export const SEND_BUTTON_SELECTOR = SEND_BUTTON_SELECTORS[0];
-export const MODEL_BUTTON_SELECTOR =
-  '[data-testid="model-switcher-dropdown-button"], button.__composer-pill[aria-haspopup="menu"]';
+// View shape (2026-09-25): one trigger owns both model and effort and has no test id. The data
+// attribute survives localization; the English aria-label is a second anchor. See pickerDom.ts.
+export const VIEW_PICKER_TRIGGER_SELECTOR =
+  'button[data-codex-intelligence-trigger], button[aria-label="Select ChatGPT model"]';
+export const MODEL_BUTTON_SELECTOR = `[data-testid="model-switcher-dropdown-button"], button.__composer-pill[aria-haspopup="menu"], ${VIEW_PICKER_TRIGGER_SELECTOR}`;
 export const COMPOSER_MODEL_SIGNAL_SELECTOR = '[data-testid="composer-footer-actions"]';
 export const COPY_BUTTON_SELECTOR = 'button[data-testid="copy-turn-action-button"]';
 // New shape: the turn group's action bar has labelled buttons and no test ids. Code blocks inside

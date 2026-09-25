@@ -11,6 +11,7 @@ import {
   USER_ROLE_SELECTOR,
 } from "./constants.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assistantResponse.js";
+import { buildPickerDomHelpersJs } from "./actions/pickerDom.js";
 import { buildConversationTurnListExpression, buildTurnDomHelpersJs } from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
@@ -186,6 +187,7 @@ function buildTabInspectionExpression(): string {
       const promptNode = firstVisible(INPUT_SELECTORS);
       const promptReady = Boolean(promptNode);
       ${buildTurnDomHelpersJs()}
+      ${buildPickerDomHelpersJs()}
       const turns = ${buildConversationTurnListExpression()};
       const assistantTurns = turns.filter((turn) => {
         const role = turnDom.role(turn);
@@ -205,7 +207,7 @@ function buildTabInspectionExpression(): string {
         .find((matches) => matches && matches.length > 0);
       const currentModelButton = document.querySelector(MODEL_BUTTON_SELECTOR);
       const hasProPill = Boolean(document.querySelector('button.__composer-pill, button[aria-label="Pro, click to remove"]'));
-      let currentModelLabel = normalize(currentModelButton?.textContent || currentModelButton?.getAttribute?.('aria-label') || '');
+      let currentModelLabel = normalize(pickerDom.label(currentModelButton) || currentModelButton?.getAttribute?.('aria-label') || '');
       if (currentModelLabel === 'ChatGPT' && hasProPill) {
         currentModelLabel = 'ChatGPT + Pro';
       }
