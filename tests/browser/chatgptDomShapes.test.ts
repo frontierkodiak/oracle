@@ -5,11 +5,14 @@ import {
   buildCompletionVisibilityExpressionForTest,
   buildCopyExpressionForTest,
   buildMarkdownFallbackExtractorForTest,
+  classifyTurnTerminal,
+  createTerminalGateState,
   readAssistantSnapshot,
   readHighestConversationTurnNumber,
   readSubmittedUserTurnAnchor,
 } from "../../src/browser/actions/assistantResponse.js";
 import { waitForResumedConversationHydration } from "../../src/browser/actions/navigation.js";
+import { readThinkingActivity } from "../../src/browser/actions/thinkingStatus.js";
 import { buildConversationTurnCountExpression } from "../../src/browser/conversationTurns.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 
@@ -287,6 +290,63 @@ describe.each(FIXTURES)("ChatGPT turn DOM, both shapes: %s", { timeout: 60_000 }
 });
 
 describe("new-shape specifics", () => {
+  test("thinking in the reasoning block between the units vetoes completion", async () => {
+    const window = openNew("2026-09-25-project-attachment");
+    // happy-dom lays nothing out; give every element a box so visibility checks can pass.
+    (
+      window.HTMLElement.prototype as unknown as { getBoundingClientRect: () => unknown }
+    ).getBoundingClientRect = () => ({
+      x: 100,
+      y: 100,
+      left: 100,
+      top: 100,
+      right: 300,
+      bottom: 140,
+      width: 200,
+      height: 40,
+    });
+    const floor = units(window).length;
+    // The unfinished turn: partial answer text and a transient action bar are already mounted,
+    // while the reasoning block (between the user and assistant units) still shimmers.
+    appendNewTurn(window, "partial answer");
+    const groups = window.document.querySelectorAll("[data-turn-key]");
+    const block = groups[groups.length - 1].querySelector(
+      "[data-chatgpt-agent-turn-start]",
+    )!.parentElement!;
+    const shimmer = window.document.createElement("span");
+    shimmer.className = "loading-shimmer";
+    shimmer.textContent = "Thinking";
+    block.append(shimmer);
+    const runtime = runtimeFor(window);
+
+    const live = await readThinkingActivity(runtime);
+    expect(live.strong).toBe(true);
+    const meta = { messageId: "new-answer-id" };
+    expect(window.eval(buildCompletionVisibilityExpressionForTest(meta, undefined, floor))).toBe(
+      true,
+    );
+    let gate = createTerminalGateState(0);
+    for (let cycle = 0; cycle < 10; cycle += 1) {
+      const decision = classifyTurnTerminal(
+        gate,
+        {
+          now: cycle * 1_000,
+          len: "partial answer".length,
+          contentKey: "new-answer-id::partial answer",
+          stopVisible: false,
+          barVisible: true,
+          strongThinkingActive: live.strong,
+        },
+        { barConfirmCycles: 3, minStableMs: 1_200 },
+      );
+      gate = decision.state;
+      expect(decision.terminal).toBe(false);
+    }
+
+    shimmer.remove();
+    expect((await readThinkingActivity(runtime)).strong).toBe(false);
+  });
+
   test("a code block's Copy button inside the answer is not completion evidence", () => {
     const window = openNew("2026-09-25-plain-code-math");
     // Keep only the first turn group: its answer holds two code blocks with their own Copy.
