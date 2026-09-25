@@ -216,10 +216,14 @@ function buildChatModeProbeExpression(): string {
     const conversationId = conversationIdFromPath(pathname);
     if (conversationId) {
       // Conversation messages can contain same-origin links to the current thread. Only sidebar
-      // history items use ChatGPT's renderer-owned menu-item anchor class.
-      const activeHistoryLinks = Array.from(
-        document.querySelectorAll('a.__menu-item[href*="/c/"]'),
-      ).filter((node) => {
+      // history items use ChatGPT's renderer-owned menu-item anchor class, or since 2026-09-25
+      // (PL-168) its row-link attribute, whose Work badge sits beside the anchor in the row.
+      const historyLinks = [
+        ...Array.from(document.querySelectorAll('a.__menu-item[href*="/c/"]')),
+        ...Array.from(document.querySelectorAll('a[data-interactive-row-link="true"][href*="/c/"]')),
+      ];
+      const badgeScope = (link) => link.closest?.('[data-thread-title-trigger]') || link;
+      const activeHistoryLinks = historyLinks.filter((node) => {
         try {
           const candidateUrl = new URL(node.getAttribute('href') || '', location.origin);
           return candidateUrl.origin === location.origin && conversationIdFromPath(candidateUrl.pathname) === conversationId;
@@ -229,7 +233,7 @@ function buildChatModeProbeExpression(): string {
       });
       if (activeHistoryLinks.length > 0) {
         const hasWorkBadge = activeHistoryLinks.some((link) =>
-          Array.from(link.querySelectorAll('span')).some(isStructuredWorkBadge),
+          Array.from(badgeScope(link).querySelectorAll('span')).some(isStructuredWorkBadge),
         );
         if (hasWorkBadge) return { status: 'work-conversation' };
 
