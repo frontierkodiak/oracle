@@ -1,13 +1,22 @@
 import type { ChromeClient, BrowserLogger } from "../types.js";
 import {
   ANSWER_SELECTORS,
+  ASSISTANT_MESSAGE_BODY_SELECTOR,
   ASSISTANT_ROLE_SELECTOR,
+  ASSISTANT_UNIT_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
   COPY_BUTTON_SELECTOR,
   FINISHED_ACTIONS_SELECTOR,
+  MESSAGE_UNIT_KEY_ATTRIBUTE,
+  MESSAGE_UNIT_SELECTOR,
   STOP_BUTTON_SELECTORS,
+  USER_ROLE_SELECTOR,
 } from "../constants.js";
-import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import {
+  buildConversationTurnListExpression,
+  buildTurnDomHelpersJs,
+  buildUnitRoleGuardJs,
+} from "../conversationTurns.js";
 import { buildThinkingActivePredicateJs, readThinkingActivity } from "./thinkingStatus.js";
 import { delay } from "../utils.js";
 import {
@@ -483,27 +492,22 @@ export async function captureAssistantMarkdown(
 }
 
 // Records the submitted prompt's own turn ordinal and message id at commit. That ordinal is the
-// culling-proof baseline: ChatGPT never renumbers `conversation-turn-N`, so an answer that follows
-// this prompt has a strictly larger N even after earlier turns unmount. Reading at commit (while
-// the prompt is pinned) also prevents a later scrolled-away viewport from re-anchoring on an older
-// prompt and licensing a wrong answer.
+// baseline: an answer that follows this prompt has a strictly larger one. ChatGPT never renumbers
+// the old `conversation-turn-N`, so it survives culling; the new shape's ordinal is positional
+// (see buildTurnDomHelpersJs for how unmounting and remounting move it).
+// Reading at commit (while the prompt is pinned) also prevents a later scrolled-away viewport from
+// re-anchoring on an older prompt and licensing a wrong answer.
 function buildSubmittedUserTurnAnchorExpression(): string {
   return `(() => {
-    const users = Array.from(
-      document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
-    );
+    ${buildTurnDomHelpersJs()}
+    const users = Array.from(document.querySelectorAll(${JSON.stringify(USER_ROLE_SELECTOR)}));
     const last = users[users.length - 1] ?? null;
     if (!last || !(last instanceof HTMLElement)) return { turnNumber: null, messageId: null };
     const container =
-      (last.closest && last.closest('[data-testid^="conversation-turn"]')) || null;
-    const testId = (container && container.getAttribute('data-testid')) || last.getAttribute('data-testid') || '';
-    const match = /^conversation-turn-(\\d+)$/.exec(testId);
-    const messageNode = last.getAttribute('data-message-id')
-      ? last
-      : (last.querySelector && last.querySelector('[data-message-id]'));
+      (last.closest && last.closest('[data-testid^="conversation-turn"]')) || last;
     return {
-      turnNumber: match ? Number(match[1]) : null,
-      messageId: messageNode ? messageNode.getAttribute('data-message-id') : null,
+      turnNumber: turnDom.turnNumber(container),
+      messageId: turnDom.messageId(last),
     };
   })()`;
 }
@@ -528,7 +532,7 @@ export async function readSubmittedUserTurnAnchor(
   }
 }
 
-// Highest `conversation-turn-N` ordinal currently mounted. Used as a floor for the commit-time
+// Highest turn ordinal currently mounted (`conversation-turn-N`, or a unit's position). Used as a floor for the commit-time
 // anchor: a resumed conversation opens on its last turn, so the pre-submit last turn is always on
 // the page and an answer to the new prompt is strictly above it. If the anchor read races ahead of
 // the new user turn, the floor still keeps a previous answer from passing.
@@ -538,12 +542,12 @@ export async function readHighestConversationTurnNumber(
   try {
     const { result } = await Runtime.evaluate({
       expression: `(() => {
-        const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
+        ${buildTurnDomHelpersJs()}
+        const turns = ${buildConversationTurnListExpression()};
         let highest = null;
         for (const turn of turns) {
-          const match = /^conversation-turn-(\\d+)$/.exec(turn.getAttribute('data-testid') || '');
-          if (!match) continue;
-          const value = Number(match[1]);
+          const value = turnDom.turnNumber(turn);
+          if (value == null) continue;
           highest = highest == null ? value : Math.max(highest, value);
         }
         return highest;
@@ -909,6 +913,7 @@ function buildCompletionVisibilityExpression(
     const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      ${buildUnitRoleGuardJs("node", "assistant")}
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
       const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
@@ -918,6 +923,7 @@ function buildCompletionVisibilityExpression(
       return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
     };
 
+    ${buildTurnDomHelpersJs()}
     const turns = ${buildConversationTurnListExpression()};
     let lastAssistantTurn = null;
     let lastAssistantIndex = -1;
@@ -933,17 +939,14 @@ function buildCompletionVisibilityExpression(
     // Primary culling-proof anchor: the turn's own ordinal. When the baseline ordinal is known and
     // the sampled turn's ordinal parses, it is authoritative; otherwise fall back to document
     // order / the positional index below.
-    const turnNumberMatch = /^conversation-turn-(\\d+)$/.exec(lastAssistantTurn.getAttribute('data-testid') || '');
-    const lastAssistantTurnNumber = turnNumberMatch ? Number(turnNumberMatch[1]) : null;
+    const lastAssistantTurnNumber = turnDom.turnNumber(lastAssistantTurn);
     const hasOrdinalAnchor = MIN_TURN_NUMBER >= 0 && lastAssistantTurnNumber != null;
 
     // Culling-proof fallback: a turn after the last mounted user turn cannot be a stale
     // pre-submit turn, even when ChatGPT culled earlier turns and shifted the positional
     // baseline below the answer's index.
     const lastUserTurn = (() => {
-      const users = Array.from(
-        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
-      );
+      const users = Array.from(document.querySelectorAll(${JSON.stringify(USER_ROLE_SELECTOR)}));
       return users[users.length - 1] ?? null;
     })();
     const isAfterLastUser = (node) => {
@@ -955,11 +958,17 @@ function buildCompletionVisibilityExpression(
     if (hasExpectedIdentity) {
       const identityNodes = [
         lastAssistantTurn,
-        ...Array.from(lastAssistantTurn.querySelectorAll('[data-message-id], [data-testid]')),
+        ...Array.from(
+          lastAssistantTurn.querySelectorAll('[data-message-id], [data-chatgpt-selection-message-id], [data-testid]'),
+        ),
       ];
       const identityMatches = identityNodes.some((node) =>
-        (EXPECTED_MESSAGE_ID && node.getAttribute?.('data-message-id') === EXPECTED_MESSAGE_ID) ||
-        (EXPECTED_TURN_ID && node.getAttribute?.('data-testid') === EXPECTED_TURN_ID),
+        (EXPECTED_MESSAGE_ID &&
+          (node.getAttribute?.('data-message-id') === EXPECTED_MESSAGE_ID ||
+            node.getAttribute?.('data-chatgpt-selection-message-id') === EXPECTED_MESSAGE_ID)) ||
+        (EXPECTED_TURN_ID &&
+          (node.getAttribute?.('data-testid') === EXPECTED_TURN_ID ||
+            node.getAttribute?.(${JSON.stringify(MESSAGE_UNIT_KEY_ATTRIBUTE)}) === EXPECTED_TURN_ID)),
       );
       if (!identityMatches) return false;
     } else if (hasOrdinalAnchor) {
@@ -974,7 +983,7 @@ function buildCompletionVisibilityExpression(
       return false;
     }
 
-    if (lastAssistantTurn.querySelector('${FINISHED_ACTIONS_SELECTOR}')) return true;
+    if (turnDom.hasFinishedActions(lastAssistantTurn)) return true;
     const markdowns = lastAssistantTurn.querySelectorAll('.markdown');
     return Array.from(markdowns).some((node) => (node.textContent || '').trim() === 'Done');
   })()`;
@@ -1133,7 +1142,6 @@ function buildResponseObserverExpression(
     ${buildClickDispatcher()}
     const SELECTORS = ${selectorsLiteral};
     const STOP_SELECTOR = ${JSON.stringify(STOP_CONTROL_SELECTOR)};
-    const FINISHED_SELECTOR = '${FINISHED_ACTIONS_SELECTOR}';
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const MIN_TURN_NUMBER = ${minTurnNumberLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
@@ -1155,6 +1163,7 @@ function buildResponseObserverExpression(
     // Helper to detect assistant turns - must match buildAssistantExtractor logic for consistency.
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      ${buildUnitRoleGuardJs("node", "assistant")}
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
       const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
@@ -1263,6 +1272,7 @@ function buildResponseObserverExpression(
       });
 
     // Check if the last assistant turn has finished (scoped to avoid detecting old turns).
+    ${buildTurnDomHelpersJs()}
     const isLastAssistantTurnFinished = () => {
       const turns = ${buildConversationTurnListExpression()};
       let lastAssistantTurn = null;
@@ -1274,7 +1284,7 @@ function buildResponseObserverExpression(
       }
       if (!lastAssistantTurn) return false;
       // Check for action buttons in this specific turn
-      if (lastAssistantTurn.querySelector(FINISHED_SELECTOR)) return true;
+      if (turnDom.hasFinishedActions(lastAssistantTurn)) return true;
       // Check for "Done" text in this turn's markdown
       const markdowns = lastAssistantTurn.querySelectorAll('.markdown');
       return Array.from(markdowns).some((n) => (n.textContent || '').trim() === 'Done');
@@ -1377,6 +1387,7 @@ function buildAssistantExtractor(functionName: string): string {
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      ${buildUnitRoleGuardJs("node", "assistant")}
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') {
         return true;
@@ -1392,17 +1403,14 @@ function buildAssistantExtractor(functionName: string): string {
       return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
     };
 
-    // Primary culling-proof anchor: the turn's own conversation-turn-N ordinal, which ChatGPT
-    // never renumbers when it culls or unmounts earlier turns. Document order (the answer follows
-    // the last mounted user turn) is kept only as a fallback for layouts that omit the ordinal.
-    const turnNumberFor = (node) => {
-      const match = /^conversation-turn-(\\d+)$/.exec(node.getAttribute('data-testid') || '');
-      return match ? Number(match[1]) : null;
-    };
+    // Primary anchor: the turn's ordinal. The old conversation-turn-N is never renumbered when
+    // ChatGPT culls earlier turns; the new shape's unit position is (see buildTurnDomHelpersJs).
+    // Document order (the answer follows the last mounted user turn) is kept only as a fallback
+    // for layouts that expose no ordinal.
+    ${buildTurnDomHelpersJs()}
+    const turnNumberFor = (node) => turnDom.turnNumber(node);
     const lastUserTurn = (() => {
-      const users = Array.from(
-        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
-      );
+      const users = Array.from(document.querySelectorAll(${JSON.stringify(USER_ROLE_SELECTOR)}));
       return users[users.length - 1] ?? null;
     })();
     const isAfterLastUser = (node) => {
@@ -1427,6 +1435,14 @@ function buildAssistantExtractor(functionName: string): string {
       }
     };
 
+    // New shape: one markdown body is the answer; several (text around a tool call, say) are
+    // read together from the message-id container so none is dropped.
+    const newShapeBody = (root) => {
+      const bodies = root.querySelectorAll(${JSON.stringify(ASSISTANT_MESSAGE_BODY_SELECTOR)});
+      if (bodies.length === 1) return bodies[0];
+      return bodies.length > 1 ? root.querySelector('[data-chatgpt-selection-message-id]') : null;
+    };
+
     const turns = ${buildConversationTurnListExpression()};
     for (let index = turns.length - 1; index >= 0; index -= 1) {
       const turn = turns[index];
@@ -1438,6 +1454,7 @@ function buildAssistantExtractor(functionName: string): string {
       const preferred =
         (messageRoot.matches?.('.markdown') || messageRoot.matches?.('[data-message-content]') ? messageRoot : null) ||
         messageRoot.querySelector('.markdown') ||
+        newShapeBody(messageRoot) ||
         messageRoot.querySelector('[data-message-content]') ||
         messageRoot.querySelector('[data-testid*="message"]') ||
         messageRoot.querySelector('[data-testid*="assistant"]') ||
@@ -1451,8 +1468,12 @@ function buildAssistantExtractor(functionName: string): string {
       const textContent = contentRoot?.textContent ?? '';
       const text = innerText.trim().length > 0 ? innerText : textContent;
       const html = contentRoot?.innerHTML ?? '';
-      const messageId = messageRoot.getAttribute('data-message-id');
-      const turnId = messageRoot.getAttribute('data-testid');
+      const messageId = turnDom.isUnit(turn)
+        ? turnDom.messageId(turn)
+        : messageRoot.getAttribute('data-message-id');
+      const turnId = turnDom.isUnit(turn)
+        ? turn.getAttribute(${JSON.stringify(MESSAGE_UNIT_KEY_ATTRIBUTE)})
+        : messageRoot.getAttribute('data-testid');
       const turnNumber = turnNumberFor(turn);
       const generatedImages = Array.from(messageRoot.querySelectorAll('img')).filter((img) =>
         String(img?.src || '').includes('/backend-api/estuary/content?id=file_')
@@ -1482,6 +1503,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     : "null";
   return `(() => {
     const __minTurn = ${turnIndexValue};
+    ${buildTurnDomHelpersJs()}
     const roots = [
       document.querySelector('section[data-testid="screen-threadFlyOut"]'),
       document.querySelector('[data-testid="chat-thread"]'),
@@ -1489,7 +1511,9 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       document.querySelector('[role="main"]'),
     ].filter(Boolean);
     if (roots.length === 0) return null;
-    const markdownSelector = '.markdown,[data-message-content],[data-testid*="message"],.prose,[class*="markdown"]';
+    const markdownSelector = '.markdown,[data-message-content],[data-testid*="message"],.prose,[class*="markdown"],${ASSISTANT_MESSAGE_BODY_SELECTOR}';
+    // Role-bearing ancestor for either DOM shape; turnDom.role() reads it.
+    const ROLE_CONTAINER = '[data-message-author-role], [data-turn], ${MESSAGE_UNIT_SELECTOR}';
     const isExcluded = (node) =>
       Boolean(
         node?.closest?.(
@@ -1498,7 +1522,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       );
     const scoreRoot = (node) => {
       const actions = node.querySelectorAll('${FINISHED_ACTIONS_SELECTOR}').length;
-      const assistants = node.querySelectorAll('[data-message-author-role="assistant"], [data-turn="assistant"]').length;
+      const assistants = node.querySelectorAll('${ASSISTANT_ROLE_SELECTOR}').length;
       const markdowns = node.querySelectorAll(markdownSelector).length;
       return actions * 10 + assistants * 5 + markdowns;
     };
@@ -1522,7 +1546,7 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
     const collectLastUser = (scope) => {
       if (!scope?.querySelectorAll) return null;
-      const userTurns = Array.from(scope.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'));
+      const userTurns = Array.from(scope.querySelectorAll('${USER_ROLE_SELECTOR}'));
       return userTurns[userTurns.length - 1] ?? null;
     };
     const lastUser = collectLastUser(root) || collectLastUser(document);
@@ -1548,11 +1572,9 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
     const markdowns = Array.from(root.querySelectorAll(markdownSelector))
       .filter((node) => !isExcluded(node))
       .filter((node) => {
-        const container = node.closest('[data-message-author-role], [data-turn]');
+        const container = node.closest(ROLE_CONTAINER);
         if (!container) return true;
-        const role =
-          (container.getAttribute('data-message-author-role') || container.getAttribute('data-turn') || '').toLowerCase();
-        return role !== 'user';
+        return turnDom.role(container) !== 'user';
       });
     if (markdowns.length === 0) return null;
     const actionButtons = Array.from(root.querySelectorAll('${FINISHED_ACTIONS_SELECTOR}'));
@@ -1567,29 +1589,33 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       const scoped = Array.from(container.querySelectorAll(markdownSelector))
         .filter((node) => !isExcluded(node))
         .filter((node) => {
-          const roleNode = node.closest('[data-message-author-role], [data-turn]');
+          const roleNode = node.closest(ROLE_CONTAINER);
           if (!roleNode) return true;
-          const role =
-            (roleNode.getAttribute('data-message-author-role') || roleNode.getAttribute('data-turn') || '').toLowerCase();
-          return role !== 'user';
+          return turnDom.role(roleNode) !== 'user';
         });
       if (scoped.length === 0) continue;
       for (const node of scoped) {
         actionMarkdowns.push(node);
       }
     }
+    // New shape: the action bar sits in the turn group outside the assistant unit, so the loop
+    // above never reaches a unit; ask each finished assistant unit instead.
+    for (const unit of Array.from(root.querySelectorAll('${ASSISTANT_UNIT_SELECTOR}'))) {
+      if (!turnDom.hasFinishedActions(unit)) continue;
+      for (const node of Array.from(unit.querySelectorAll(markdownSelector))) {
+        if (!isExcluded(node) && !actionMarkdowns.includes(node)) actionMarkdowns.push(node);
+      }
+    }
     const assistantMarkdowns = markdowns.filter((node) => {
-      const container = node.closest('[data-message-author-role], [data-turn], [data-testid*="assistant"]');
+      const container = node.closest(ROLE_CONTAINER + ', [data-testid*="assistant"]');
       if (!container) return false;
-      const role =
-        (container.getAttribute('data-message-author-role') || container.getAttribute('data-turn') || '').toLowerCase();
-      if (role === 'assistant') return true;
+      if (turnDom.role(container) === 'assistant') return true;
       const testId = (container.getAttribute('data-testid') || '').toLowerCase();
       return testId.includes('assistant');
     });
     const hasAssistantIndicators = Boolean(
       root.querySelector('${FINISHED_ACTIONS_SELECTOR}') ||
-        root.querySelector('[data-message-author-role="assistant"], [data-turn="assistant"], [data-testid*="assistant"]'),
+        root.querySelector('${ASSISTANT_ROLE_SELECTOR}, [data-testid*="assistant"]'),
     );
     const allowMarkdownFallback = hasAssistantIndicators || hasTurns || Boolean(userText);
     const candidates =
@@ -1610,18 +1636,14 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       const html = node.innerHTML ?? '';
       const turnIndex = resolveTurnIndex(node);
       const containerNode =
-        (node.closest && node.closest('[data-testid^="conversation-turn"]')) ||
-        (node.parentElement && node.parentElement.closest && node.parentElement.closest('[data-testid^="conversation-turn"]')) ||
+        (node.closest && node.closest('[data-testid^="conversation-turn"], ${MESSAGE_UNIT_SELECTOR}')) ||
         null;
-      const ordinalMatch = containerNode
-        ? /^conversation-turn-(\\d+)$/.exec(containerNode.getAttribute('data-testid') || '')
-        : null;
       return {
         text,
         html,
         messageId: null,
         turnId: null,
-        turnNumber: ordinalMatch ? Number(ordinalMatch[1]) : null,
+        turnNumber: containerNode ? turnDom.turnNumber(containerNode) : null,
         turnIndex,
         completionVisible: actionMarkdowns.includes(node),
         afterLastUser: isAfterCurrentUser(node),
@@ -1637,20 +1659,29 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
     const BUTTON_SELECTOR = '${COPY_BUTTON_SELECTOR}';
     const TIMEOUT_MS = 10000;
 
+    ${buildTurnDomHelpersJs()}
+    const UNIT_SELECTOR = ${JSON.stringify(MESSAGE_UNIT_SELECTOR)};
     const locateButton = () => {
       const hint = ${JSON.stringify(meta ?? {})};
+      // A message or turn id names the turn; the copy control is found relative to that turn
+      // (inside it for the old shape, in its group's bar for the new one).
+      const turnFor = (node) => (node ? node.closest?.(UNIT_SELECTOR) || node : null);
       if (hint?.messageId) {
-        const node = document.querySelector('[data-message-id="' + hint.messageId + '"]');
-        const buttons = node ? Array.from(node.querySelectorAll('${COPY_BUTTON_SELECTOR}')) : [];
-        const button = buttons.at(-1) ?? null;
+        const quoted = JSON.stringify(String(hint.messageId));
+        const node =
+          document.querySelector('[data-message-id=' + quoted + ']') ||
+          document.querySelector('[data-chatgpt-selection-message-id=' + quoted + ']');
+        const button = turnDom.copyButton(turnFor(node));
         if (button) {
           return button;
         }
       }
       if (hint?.turnId) {
-        const node = document.querySelector('[data-testid="' + hint.turnId + '"]');
-        const buttons = node ? Array.from(node.querySelectorAll('${COPY_BUTTON_SELECTOR}')) : [];
-        const button = buttons.at(-1) ?? null;
+        const quoted = JSON.stringify(String(hint.turnId));
+        const node =
+          document.querySelector('[data-testid=' + quoted + ']') ||
+          document.querySelector('[${MESSAGE_UNIT_KEY_ATTRIBUTE}=' + quoted + ']');
+        const button = turnDom.copyButton(turnFor(node));
         if (button) {
           return button;
         }
@@ -1659,6 +1690,7 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
       const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
       const isAssistantTurn = (node) => {
         if (!(node instanceof HTMLElement)) return false;
+        ${buildUnitRoleGuardJs("node", "assistant")}
         const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
         if (turnAttr === 'assistant') return true;
         const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
@@ -1671,7 +1703,7 @@ function buildCopyExpression(meta: { messageId?: string | null; turnId?: string 
       for (let i = turns.length - 1; i >= 0; i -= 1) {
         const turn = turns[i];
         if (!isAssistantTurn(turn)) continue;
-        const button = turn.querySelector(BUTTON_SELECTOR);
+        const button = turnDom.isUnit(turn) ? turnDom.copyButton(turn) : turn.querySelector(BUTTON_SELECTOR);
         if (button) {
           return button;
         }
@@ -1811,7 +1843,7 @@ interface AssistantSnapshot {
   messageId?: string | null;
   turnId?: string | null;
   turnIndex?: number | null;
-  // The turn's own `conversation-turn-N` ordinal, which is stable under ChatGPT's turn culling.
+  // The turn's ordinal: `conversation-turn-N` (stable under culling) or a unit's position.
   turnNumber?: number | null;
   completionVisible?: boolean;
   // True when the turn follows the last user turn currently mounted in the DOM. ChatGPT culls

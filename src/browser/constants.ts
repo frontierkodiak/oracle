@@ -22,6 +22,19 @@ export const INPUT_SELECTORS = [
   '[contenteditable="true"][data-virtualkeyboard="true"]',
 ];
 
+// ChatGPT's September 2026 frontend dropped `article[data-testid^="conversation-turn"]`,
+// `data-message-author-role` and `.markdown`. Each message is now a unit keyed
+// `<turn>:<index>:<role>` inside a turn group, the answer body carries its message id, and the
+// assistant's action bar sits in the group, after (not inside) the assistant unit. Rollouts are
+// staged, so every selector below accepts either shape.
+export const MESSAGE_UNIT_SELECTOR = "[data-content-search-unit-key]";
+export const MESSAGE_UNIT_KEY_ATTRIBUTE = "data-content-search-unit-key";
+export const TURN_GROUP_SELECTOR = "[data-content-search-turn-key]";
+export const ASSISTANT_UNIT_SELECTOR = '[data-content-search-unit-key$=":assistant"]';
+export const USER_UNIT_SELECTOR = '[data-content-search-unit-key$=":user"]';
+export const MESSAGE_ID_SELECTOR = "[data-message-id], [data-chatgpt-selection-message-id]";
+export const ASSISTANT_MESSAGE_BODY_SELECTOR = '[data-markdown-text-style="assistant-message"]';
+
 export const ANSWER_SELECTORS = [
   'article[data-testid^="conversation-turn"][data-message-author-role="assistant"]',
   'article[data-testid^="conversation-turn"][data-turn="assistant"]',
@@ -32,15 +45,18 @@ export const ANSWER_SELECTORS = [
   '[data-turn="assistant"] .markdown',
   '[data-message-author-role="assistant"]',
   '[data-turn="assistant"]',
+  `${ASSISTANT_UNIT_SELECTOR} ${ASSISTANT_MESSAGE_BODY_SELECTOR}`,
+  ASSISTANT_UNIT_SELECTOR,
 ];
 
 export const CONVERSATION_TURN_SELECTOR =
   'article[data-testid^="conversation-turn"], div[data-testid^="conversation-turn"], section[data-testid^="conversation-turn"], ' +
   "article[data-message-author-role], div[data-message-author-role], section[data-message-author-role], " +
-  "article[data-turn], div[data-turn], section[data-turn]";
+  "article[data-turn], div[data-turn], section[data-turn], " +
+  `div${MESSAGE_UNIT_SELECTOR}`;
 export const CONVERSATION_TURN_CONTAINER_SELECTOR = '[data-testid^="conversation-turn"]';
-export const ASSISTANT_ROLE_SELECTOR =
-  '[data-message-author-role="assistant"], [data-turn="assistant"]';
+export const ASSISTANT_ROLE_SELECTOR = `[data-message-author-role="assistant"], [data-turn="assistant"], ${ASSISTANT_UNIT_SELECTOR}`;
+export const USER_ROLE_SELECTOR = `[data-message-author-role="user"], [data-turn="user"], ${USER_UNIT_SELECTOR}`;
 export const CLOUDFLARE_SCRIPT_SELECTOR = 'script[src*="/challenge-platform/"]';
 export const CLOUDFLARE_TITLE = "just a moment";
 export const PROMPT_PRIMARY_SELECTOR = "#prompt-textarea";
@@ -94,6 +110,12 @@ export const MODEL_BUTTON_SELECTOR =
   '[data-testid="model-switcher-dropdown-button"], button.__composer-pill[aria-haspopup="menu"]';
 export const COMPOSER_MODEL_SIGNAL_SELECTOR = '[data-testid="composer-footer-actions"]';
 export const COPY_BUTTON_SELECTOR = 'button[data-testid="copy-turn-action-button"]';
+// New shape: the turn group's action bar has labelled buttons and no test ids. Code blocks inside
+// the answer carry their own "Copy" button, so these only count outside the assistant unit; see
+// buildTurnDomHelpersJs() in conversationTurns.ts.
+export const TURN_GROUP_COPY_BUTTON_SELECTOR = 'button[aria-label="Copy"]';
+export const TURN_GROUP_FINISHED_ACTIONS_SELECTOR =
+  'button[aria-label="Copy"], button[aria-label="Share"], button[aria-label="Regenerate response"]';
 // Action buttons that only appear once a turn has finished rendering.
 export const DEEP_RESEARCH_PLUS_BUTTON = '[data-testid="composer-plus-btn"]';
 export const DEEP_RESEARCH_DROPDOWN_ITEM_TEXT = "Deep research";

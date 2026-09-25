@@ -8,7 +8,7 @@ import type {
   SavedBrowserImage,
 } from "./types.js";
 import { ASSISTANT_ROLE_SELECTOR } from "./constants.js";
-import { buildConversationTurnListExpression } from "./conversationTurns.js";
+import { buildConversationTurnListExpression, buildUnitRoleGuardJs } from "./conversationTurns.js";
 import { delay } from "./utils.js";
 import { readAssistantSnapshot } from "./pageActions.js";
 import { getOracleHomeDir } from "../oracleHome.js";
@@ -102,6 +102,7 @@ function buildAssistantImageExpression(minTurnIndex?: number): string {
       }));
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      ${buildUnitRoleGuardJs("node", "assistant")}
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
       const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();

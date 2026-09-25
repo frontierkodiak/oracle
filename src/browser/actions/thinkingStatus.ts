@@ -5,6 +5,7 @@ import {
   CONVERSATION_TURN_SELECTOR,
   STOP_BUTTON_SELECTORS,
 } from "../constants.js";
+import { buildUnitRoleGuardJs } from "../conversationTurns.js";
 
 const THINKING_STALE_HINT_MS = 10 * 60_000;
 
@@ -252,6 +253,7 @@ function buildThinkingStatusExpression(): string {
       Boolean(node.closest?.('[contenteditable="true"], textarea, [data-testid*="composer"], [id*="composer"]'));
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      ${buildUnitRoleGuardJs("node", "assistant")}
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
       const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();

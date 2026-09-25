@@ -1694,7 +1694,7 @@ describe("waitForAssistantResponse", () => {
     expect(capturedExpression).toContain("characterData: true");
     expect(capturedExpression).toContain("copy-turn-action-button");
     expect(capturedExpression).toContain("isLastAssistantTurnFinished");
-    expect(capturedExpression).toContain("lastAssistantTurn.querySelector(FINISHED_SELECTOR)");
+    expect(capturedExpression).toContain("turnDom.hasFinishedActions(lastAssistantTurn)");
     expect(capturedExpression).not.toContain("document.querySelector(FINISHED_SELECTOR)");
     expect(capturedExpression).toContain("lastAssistantTurn.querySelectorAll('.markdown')");
     expect(capturedExpression).not.toContain("document.querySelectorAll('.markdown')");
