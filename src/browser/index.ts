@@ -753,6 +753,30 @@ type BrowserSubmissionResult = {
   deepResearchTargetBaselineCaptured?: boolean;
 };
 
+export type CaptureLoopBaseline = {
+  baselineTurns: number | null;
+  baselineTurnNumber: number | null;
+  baselineAssistantText: string | null;
+};
+
+// Copy a submission's capture anchors into the loop's baseline state. Every submission site routes
+// through this single function: the initial submission and each in-run follow-up, on both the local
+// and `--remote-chrome` paths. A follow-up must re-anchor on its own prompt's turn ordinal, or the
+// previous answer can pass while the new turn is still empty; keeping the copy in one place makes
+// that behavior directly unit-testable instead of only reachable through a whole browser run.
+export function copySubmissionAnchors(
+  submission: Pick<
+    BrowserSubmissionResult,
+    "baselineTurns" | "baselineTurnNumber" | "baselineAssistantText"
+  >,
+): CaptureLoopBaseline {
+  return {
+    baselineTurns: submission.baselineTurns,
+    baselineTurnNumber: submission.baselineTurnNumber ?? null,
+    baselineAssistantText: submission.baselineAssistantText,
+  };
+}
+
 async function captureDeepResearchTargetBaseline(
   client: ChromeClient,
   logger: BrowserLogger,
@@ -1841,7 +1865,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       }
       const providerBaselineTurnNumber = providerState.baselineTurnNumber;
       const anchoredTurnNumber =
-        typeof providerBaselineTurnNumber === "number" && Number.isFinite(providerBaselineTurnNumber)
+        typeof providerBaselineTurnNumber === "number" &&
+        Number.isFinite(providerBaselineTurnNumber)
           ? providerBaselineTurnNumber
           : -1;
       const flooredTurnNumber =
@@ -1911,9 +1936,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         },
         logger,
       });
-      baselineTurns = submission.baselineTurns;
-      baselineTurnNumber = submission.baselineTurnNumber ?? null;
-      baselineAssistantText = submission.baselineAssistantText;
+      ({ baselineTurns, baselineTurnNumber, baselineAssistantText } =
+        copySubmissionAnchors(submission));
       deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
       deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     } finally {
@@ -2403,11 +2427,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           },
           logger,
         });
-        baselineTurns = submission.baselineTurns;
-        // Re-anchor the follow-up: the new prompt has its own turn ordinal, and leaving the first
-        // prompt's number here would let the previous answer pass while the new one is still empty.
-        baselineTurnNumber = submission.baselineTurnNumber ?? null;
-        baselineAssistantText = submission.baselineAssistantText;
+        ({ baselineTurns, baselineTurnNumber, baselineAssistantText } =
+          copySubmissionAnchors(submission));
       } finally {
         await releaseProfileLockIfHeld();
       }
@@ -3630,7 +3651,8 @@ async function runRemoteBrowserMode(
       }
       const providerBaselineTurnNumber = providerState.baselineTurnNumber;
       const anchoredTurnNumber =
-        typeof providerBaselineTurnNumber === "number" && Number.isFinite(providerBaselineTurnNumber)
+        typeof providerBaselineTurnNumber === "number" &&
+        Number.isFinite(providerBaselineTurnNumber)
           ? providerBaselineTurnNumber
           : -1;
       const flooredTurnNumber =
@@ -3671,9 +3693,8 @@ async function runRemoteBrowserMode(
       },
       logger,
     });
-    baselineTurns = submission.baselineTurns;
-    baselineTurnNumber = submission.baselineTurnNumber ?? null;
-    baselineAssistantText = submission.baselineAssistantText;
+    ({ baselineTurns, baselineTurnNumber, baselineAssistantText } =
+      copySubmissionAnchors(submission));
     deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
     deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     const imageArtifactMinTurnIndex = baselineTurns;
@@ -4113,10 +4134,8 @@ async function runRemoteBrowserMode(
         },
         logger,
       });
-      baselineTurns = submission.baselineTurns;
-      // Re-anchor the follow-up (remote path): same reason as the local loop above.
-      baselineTurnNumber = submission.baselineTurnNumber ?? null;
-      baselineAssistantText = submission.baselineAssistantText;
+      ({ baselineTurns, baselineTurnNumber, baselineAssistantText } =
+        copySubmissionAnchors(submission));
       const turn = await captureAssistantTurn(followUpPrompt, `Follow-up ${index + 1}`);
       turns.push({ ...turn, prompt: followUpPrompt });
       answerText = turn.answerText;
