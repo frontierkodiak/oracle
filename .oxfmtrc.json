@@ -15,6 +15,7 @@
     "node_modules/**/*",
     ".pnpm-store/**/*",
     "coverage/**/*",
-    ".bun-check/**/*"
+    ".bun-check/**/*",
+    "tests/fixtures/chatgpt-dom/**/*.html"
   ]
 }
