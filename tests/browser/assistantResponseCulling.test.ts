@@ -62,12 +62,8 @@ class El {
     return this.descendants().includes(other);
   }
   closest(selector: string): El | null {
-    let node: El | null = this;
-    while (node) {
-      if (matchSimple(node, selector)) return node;
-      node = node.parent;
-    }
-    return null;
+    if (matchSimple(this, selector)) return this;
+    return this.parent ? this.parent.closest(selector) : null;
   }
   compareDocumentPosition(other: El): number {
     if (other.order > this.order) return 4; // FOLLOWING

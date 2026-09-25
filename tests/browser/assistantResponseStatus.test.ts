@@ -836,11 +836,7 @@ describe("culling-proof new-turn acceptance", () => {
       { "data-turn": "assistant", "data-message-id": "answer" },
       true,
     );
-    const prev = new OrderedTurn(
-      0,
-      { "data-turn": "assistant", "data-message-id": "prev" },
-      true,
-    );
+    const prev = new OrderedTurn(0, { "data-turn": "assistant", "data-message-id": "prev" }, true);
     // Baseline 4 (pre-submit turns) but culling left only 3 mounted -> answer index 2.
     expect(
       evaluateCompletion({ minTurnIndex: 4, turns: [prev, user, answer], users: [user] }),
@@ -848,15 +844,9 @@ describe("culling-proof new-turn acceptance", () => {
   });
 
   test("still rejects an older assistant action bar that precedes the submitted user turn", () => {
-    const prev = new OrderedTurn(
-      0,
-      { "data-turn": "assistant", "data-message-id": "prev" },
-      true,
-    );
+    const prev = new OrderedTurn(0, { "data-turn": "assistant", "data-message-id": "prev" }, true);
     const user = new OrderedTurn(1, { "data-message-author-role": "user" });
-    expect(evaluateCompletion({ minTurnIndex: 4, turns: [prev, user], users: [user] })).toBe(
-      false,
-    );
+    expect(evaluateCompletion({ minTurnIndex: 4, turns: [prev, user], users: [user] })).toBe(false);
   });
 
   test("readAssistantSnapshot accepts the shifted answer and rejects the unanchored one", async () => {

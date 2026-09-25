@@ -3705,7 +3705,8 @@ async function runRemoteBrowserMode(
     });
     const anchors = copySubmissionAnchors(submission);
     const deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
-    const deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
+    const deepResearchTargetBaselineCaptured =
+      submission.deepResearchTargetBaselineCaptured ?? false;
     const imageArtifactMinTurnIndex = anchors.baselineTurns;
     if (deepResearch) {
       await waitForResearchPlanAutoConfirm(Runtime, logger);
