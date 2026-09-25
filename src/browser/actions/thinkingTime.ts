@@ -11,6 +11,7 @@ import {
 } from "../constants.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { buildPickerDomHelpersJs } from "./pickerDom.js";
 import { BrowserAutomationError } from "../../oracle/errors.js";
 
 // Snapshot of the model-picker / thinking-effort subtree, captured at the moment
@@ -308,6 +309,7 @@ function buildThinkingTimeExpression(
 
   return `(async () => {
     ${buildClickDispatcher()}
+    ${buildPickerDomHelpersJs()}
 
     const MENU_CONTAINER_SELECTOR = ${menuContainerLiteral};
     const MENU_ITEM_SELECTOR = ${menuItemLiteral};
@@ -577,7 +579,7 @@ function buildThinkingTimeExpression(
     };
     const modelKindFromNode = (button) => {
       const label = normalize(
-        (button?.textContent ?? '') + ' ' + (button?.getAttribute?.('aria-label') ?? ''),
+        pickerDom.label(button) + ' ' + (button?.getAttribute?.('aria-label') ?? ''),
       );
       if (hasToken(label, 'pro')) return 'pro';
       if (hasToken(label, 'thinking')) return 'thinking';
@@ -1099,17 +1101,14 @@ function buildThinkingTimeExpression(
     // The direct-slider rollout removes the Effort submenu entirely. Its keyboard
     // owner announces the actual tier via aria-describedby; neither the pill nor
     // the slider's maximum position alone proves that Pro was selected.
+    // Both picker shapes put the slider in a pane of the menu; pickerDom finds it in either.
     const selectDirectEffortSlider = async (menu) => {
-      const view = menu.querySelector?.('[data-model-selection-view="true"]');
-      const simple = view?.querySelector?.('[data-testid="composer-model-picker-slider-simple-view"]');
+      const simple = pickerDom.sliderPane(menu);
       if (!simple || simple.getAttribute('data-active') !== 'true' || !isVisible(simple)) return null;
       const resolve = () => {
-        const currentView = menu.querySelector?.('[data-model-selection-view="true"]');
-        const currentSimple = currentView?.querySelector?.('[data-testid="composer-model-picker-slider-simple-view"]');
+        const currentSimple = pickerDom.sliderPane(menu);
         if (currentSimple?.getAttribute('data-active') !== 'true') return null;
-        const slider = currentSimple.querySelector('[data-model-reasoning-effort-slider]');
-        const control = slider?.closest?.('[role="menuitem"]');
-        const thumb = slider?.querySelector?.('[role="slider"]');
+        const { control, thumb } = pickerDom.sliderControl(currentSimple) ?? {};
         if (!control || !thumb || !isVisible(control)) return null;
         const levels = ['light', 'standard', 'extended', 'extra-high', 'pro'];
         // The selected label leads localized aria-describedby prose, while punctuation
@@ -1232,6 +1231,33 @@ function buildThinkingTimeExpression(
       }
       return gpt56Fallback;
     };
+    // View shape (2026-09-25): one trigger owns model and effort, and its menu carries the power
+    // slider directly. Its label is the effort tier, so it is the effort owner by structure; only
+    // a Sol label ("5.6 Pro") is refused for a Latest target, as in the slider shape below.
+    const viewTrigger = pickerDom.viewTrigger();
+    if (viewTrigger) {
+      if (isSolModelPillForLatest(pickerDom.label(viewTrigger))) return failure('chip-not-found');
+      if (viewTrigger.getAttribute('aria-expanded') !== 'true') {
+        dispatchClickSequence(viewTrigger);
+        await sleep(INITIAL_WAIT_MS);
+      }
+      const deadline = performance.now() + MAX_WAIT_MS;
+      while (performance.now() < deadline) {
+        const menu = pickerDom.viewMenu(viewTrigger);
+        if (menu) {
+          const sliderResult = await selectDirectEffortSlider(menu);
+          if (sliderResult) return sliderResult;
+          const result = failure('selection-unverified');
+          closeOpenMenus();
+          return result;
+        }
+        await sleep(100);
+      }
+      const result = failure('menu-not-found');
+      closeOpenMenus();
+      return result;
+    }
+
     let composerEffortPill = findComposerEffortPill();
     let modelBtn = findModelButton();
     const modelKindFromLegacyTrailing = (trailing) => {

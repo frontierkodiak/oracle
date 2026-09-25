@@ -8,6 +8,7 @@ import {
 } from "../constants.js";
 import { logDomFailure } from "../domDebug.js";
 import { buildClickDispatcher } from "./domEvents.js";
+import { buildPickerDomHelpersJs } from "./pickerDom.js";
 import { throwIfThrottled } from "../chatgptThrottle.js";
 import { delay } from "../utils.js";
 
@@ -22,6 +23,7 @@ type ModelSelectionResult =
       hint?: { temporaryChat?: boolean; availableOptions?: string[] };
     }
   | { status: "button-missing" }
+  | { status: "selection-unverified"; label?: string | null }
   | undefined;
 
 // The model/effort picker is a composer pill that React mounts a beat after the page
@@ -100,6 +102,13 @@ export async function ensureModelSelection(
           : "";
       throw new Error(
         `Unable to find model option matching "${desiredModel}" in the model switcher.${availableHint}${tempHint}`,
+      );
+    }
+    case "selection-unverified": {
+      await logDomFailure(Runtime, logger, "model-switcher-option");
+      await throwIfThrottled(Runtime, { stage: "model-selection" }, logger);
+      throw new Error(
+        `Model picker did not confirm "${result.label ?? desiredModel}" after selecting it for "${desiredModel}".`,
       );
     }
     default: {
@@ -218,6 +227,7 @@ function buildModelSelectionExpression(
   );
   return `(() => {
     ${buildClickDispatcher()}
+    ${buildPickerDomHelpersJs()}
     // Capture the selectors and matcher literals up front so the browser expression stays pure.
     const BUTTON_SELECTOR = '${MODEL_BUTTON_SELECTOR}';
     const COMPOSER_MODEL_SIGNAL_SELECTOR = ${composerSignalSelectorLiteral};
@@ -396,7 +406,7 @@ function buildModelSelectionExpression(
       } catch {}
     };
 
-    const getButtonLabel = () => (findModelButton()?.textContent ?? '').trim();
+    const getButtonLabel = () => pickerDom.label(findModelButton());
     // With the picker closed the only evidence for "Latest" is the composer pill, so a version-less
     // "latest" target must be decided on it: the blank composer signal would otherwise pass as
     // "already selected" while GPT-5.6 Sol is active. Defined here, before getResolvedLabel, because
@@ -686,6 +696,85 @@ function buildModelSelectionExpression(
     const button = findModelButton();
     if (!button) {
       return { status: 'button-missing' };
+    }
+
+    // View shape (2026-09-25): the trigger shows only the effort tier, so the model is read from
+    // the checked radio of the picker's model view and never from the trigger. The radios stay
+    // mounted in the inactive pane, but that pane is inert: switch views before clicking one.
+    const selectModelOnViewPicker = async (trigger) => {
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const deadline = performance.now() + MAX_WAIT_MS;
+      const currentTrigger = () => pickerDom.viewTrigger() || trigger;
+      const openMenu = async () => {
+        let menu = pickerDom.viewMenu(currentTrigger());
+        if (!menu) dispatchClickSequence(currentTrigger());
+        while (!menu && performance.now() < deadline) {
+          await sleep(100);
+          menu = pickerDom.viewMenu(currentTrigger());
+        }
+        return menu;
+      };
+      const closeViewMenu = async () => {
+        for (let attempt = 0; attempt < 3 && pickerDom.viewMenu(currentTrigger()); attempt += 1) {
+          if (attempt === 0) dispatchClickSequence(currentTrigger());
+          else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, which: 27, bubbles: true }));
+          await sleep(150);
+        }
+      };
+      const finish = async (result) => {
+        await closeViewMenu();
+        return result;
+      };
+      const isChecked = (radio) => radio?.getAttribute?.('aria-checked') === 'true';
+      // Latest has an exact allow-list; other targets must name a version ("GPT-5.6 Sol").
+      // Version-less names ("Pro", "Thinking") are effort tiers in this picker, not models.
+      const radioMatchesTarget = (radio) => {
+        const label = pickerDom.radioLabel(radio);
+        if (targetIsLatest) return isLatestModelLabel(label);
+        if (!desiredVersion) return false;
+        const normalized = normalizeText(label);
+        if (versionFromLabel(normalized) !== desiredVersion) return false;
+        return !desiredModelVariant || normalized.split(' ').includes(desiredModelVariant);
+      };
+      const findTarget = (menu) => pickerDom.modelRadios(menu).find(radioMatchesTarget) ?? null;
+      const notFound = (menu) => ({
+        status: 'option-not-found',
+        hint: { availableOptions: pickerDom.modelRadios(menu).map(pickerDom.radioLabel).filter(Boolean) },
+      });
+
+      let menu = await openMenu();
+      if (!menu) return { status: 'option-not-found', hint: { availableOptions: [] } };
+      let target = findTarget(menu);
+      if (!target) return finish(notFound(menu));
+      const label = pickerDom.radioLabel(target);
+      if (isChecked(target)) return finish({ status: 'already-selected', label });
+      if (target.getAttribute('aria-disabled') === 'true' || target.hasAttribute('data-disabled')) {
+        return finish(notFound(menu));
+      }
+      if (!pickerDom.inActivePane(target)) {
+        const toggle = pickerDom.viewToggle(menu);
+        if (toggle) dispatchClickSequence(toggle);
+        while (performance.now() < deadline) {
+          menu = pickerDom.viewMenu(currentTrigger());
+          target = menu ? findTarget(menu) : null;
+          if (target && pickerDom.inActivePane(target)) break;
+          await sleep(100);
+        }
+        if (!target || !pickerDom.inActivePane(target)) return finish(notFound(menu));
+      }
+      dispatchClickSequence(target);
+      // A radio choice closes the menu. Reopen it to read the checked radio as proof.
+      const verifyDeadline = Math.min(deadline, performance.now() + 5000);
+      while (performance.now() < verifyDeadline) {
+        await sleep(150);
+        menu = await openMenu();
+        target = menu ? findTarget(menu) : null;
+        if (isChecked(target)) return finish({ status: 'switched', label: pickerDom.radioLabel(target) });
+      }
+      return finish({ status: 'selection-unverified', label });
+    };
+    if (pickerDom.isViewTrigger(button)) {
+      return selectModelOnViewPicker(button);
     }
     const buttonMatchesTarget = () => {
       if (configuredSelectionMatchesTarget()) return true;
