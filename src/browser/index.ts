@@ -1916,14 +1916,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       await raceWithDisconnect(ensurePromptReady(Runtime, config.inputTimeoutMs, logger));
     };
 
-    let baselineTurns: number | null = null;
-    let baselineTurnNumber: number | null = null;
-    let baselineAssistantText: string | null = null;
     let deepResearchTargetKeys: string[] = [];
     let deepResearchTargetBaselineCaptured = false;
     await acquireProfileLockIfNeeded();
+    let submission: BrowserSubmissionResult;
     try {
-      const submission = await runSubmissionWithRecovery({
+      submission = await runSubmissionWithRecovery({
         prompt: promptText,
         attachments,
         fallbackSubmission,
@@ -1936,14 +1934,13 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         },
         logger,
       });
-      ({ baselineTurns, baselineTurnNumber, baselineAssistantText } =
-        copySubmissionAnchors(submission));
       deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
       deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
     } finally {
       await releaseProfileLockIfHeld();
     }
-    const imageArtifactMinTurnIndex = baselineTurns;
+    const anchors = copySubmissionAnchors(submission);
+    const imageArtifactMinTurnIndex = anchors.baselineTurns;
     if (deepResearch) {
       await raceWithDisconnect(waitForResearchPlanAutoConfirm(Runtime, logger));
       const researchResult = await raceWithDisconnect(
@@ -1951,7 +1948,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           Runtime,
           logger,
           config.timeoutMs,
-          baselineTurns,
+          anchors.baselineTurns,
           Page,
           client,
           {
@@ -2036,7 +2033,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       text.toLowerCase().replace(/\s+/g, " ").trim();
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
-    const waitForFreshAssistantResponse = async (baselineNormalized: string, timeoutMs: number) => {
+    const waitForFreshAssistantResponse = async (
+      baselineNormalized: string,
+      timeoutMs: number,
+      anchors: CaptureLoopBaseline,
+    ) => {
+      const { baselineTurns } = anchors;
       const baselinePrefix =
         baselineNormalized.length >= 80
           ? baselineNormalized.slice(0, Math.min(200, baselineNormalized.length))
@@ -2083,7 +2085,8 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     };
     const recheckDelayMs = Math.max(0, config.assistantRecheckDelayMs ?? 0);
     const recheckTimeoutMs = Math.max(0, config.assistantRecheckTimeoutMs ?? 0);
-    const attemptAssistantRecheck = async () => {
+    const attemptAssistantRecheck = async (anchors: CaptureLoopBaseline) => {
+      const { baselineTurns, baselineTurnNumber } = anchors;
       if (!recheckDelayMs) return null;
       logger(
         `[browser] Assistant response timed out; waiting ${formatElapsed(recheckDelayMs)} before rechecking conversation.`,
@@ -2169,7 +2172,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     const captureAssistantTurn = async (
       turnPrompt: string,
       label: string,
+      anchors: CaptureLoopBaseline,
     ): Promise<BrowserConversationTurn & { answerHtml: string }> => {
+      const { baselineTurns, baselineTurnNumber, baselineAssistantText } = anchors;
       let turnAnswer: AssistantAnswer;
       try {
         await updateConversationHint("assistant-wait", 15_000).catch(() => false);
@@ -2198,7 +2203,9 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         );
       } catch (error) {
         if (isAssistantResponseTimeoutError(error)) {
-          const rechecked = await attemptAssistantRecheckOrRethrow(attemptAssistantRecheck);
+          const rechecked = await attemptAssistantRecheckOrRethrow(() =>
+            attemptAssistantRecheck(anchors),
+          );
           if (rechecked) {
             turnAnswer = rechecked;
           } else {
@@ -2252,7 +2259,11 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           (baselinePrefix.length > 0 && normalizedAnswer.startsWith(baselinePrefix));
         if (isBaseline) {
           logger("Detected stale assistant response; waiting for new response...");
-          const refreshed = await waitForFreshAssistantResponse(baselineNormalized, 15_000);
+          const refreshed = await waitForFreshAssistantResponse(
+            baselineNormalized,
+            15_000,
+            anchors,
+          );
           if (refreshed) {
             turnAnswer = refreshed;
           }
@@ -2402,7 +2413,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     };
 
     const turns: BrowserConversationTurn[] = [];
-    const initialTurn = await captureAssistantTurn(promptText, "Initial response");
+    const initialTurn = await captureAssistantTurn(promptText, "Initial response", anchors);
     turns.push(initialTurn);
     answerText = initialTurn.answerText;
     answerMarkdown = initialTurn.answerMarkdown;
@@ -2411,6 +2422,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
     for (let index = 0; index < followUpPrompts.length; index += 1) {
       const followUpPrompt = followUpPrompts[index];
       logger(`[browser] Sending follow-up ${index + 1}/${followUpPrompts.length}`);
+      let followUpAnchors: CaptureLoopBaseline;
       await acquireProfileLockIfNeeded();
       try {
         await raceWithDisconnect(clearPromptComposer(Runtime, logger));
@@ -2427,12 +2439,15 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           },
           logger,
         });
-        ({ baselineTurns, baselineTurnNumber, baselineAssistantText } =
-          copySubmissionAnchors(submission));
+        followUpAnchors = copySubmissionAnchors(submission);
       } finally {
         await releaseProfileLockIfHeld();
       }
-      const turn = await captureAssistantTurn(followUpPrompt, `Follow-up ${index + 1}`);
+      const turn = await captureAssistantTurn(
+        followUpPrompt,
+        `Follow-up ${index + 1}`,
+        followUpAnchors,
+      );
       turns.push({ ...turn, prompt: followUpPrompt });
       answerText = turn.answerText;
       answerMarkdown = turn.answerMarkdown;
@@ -3676,11 +3691,6 @@ async function runRemoteBrowserMode(
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
     };
 
-    let baselineTurns: number | null = null;
-    let baselineTurnNumber: number | null = null;
-    let baselineAssistantText: string | null = null;
-    let deepResearchTargetKeys: string[] = [];
-    let deepResearchTargetBaselineCaptured = false;
     const submission = await runSubmissionWithRecovery({
       prompt: promptText,
       attachments,
@@ -3693,18 +3703,17 @@ async function runRemoteBrowserMode(
       },
       logger,
     });
-    ({ baselineTurns, baselineTurnNumber, baselineAssistantText } =
-      copySubmissionAnchors(submission));
-    deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
-    deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
-    const imageArtifactMinTurnIndex = baselineTurns;
+    const anchors = copySubmissionAnchors(submission);
+    const deepResearchTargetKeys = submission.deepResearchTargetKeys ?? [];
+    const deepResearchTargetBaselineCaptured = submission.deepResearchTargetBaselineCaptured ?? false;
+    const imageArtifactMinTurnIndex = anchors.baselineTurns;
     if (deepResearch) {
       await waitForResearchPlanAutoConfirm(Runtime, logger);
       const researchResult = await waitForDeepResearchCompletion(
         Runtime,
         logger,
         config.timeoutMs,
-        baselineTurns,
+        anchors.baselineTurns,
         Page,
         client,
         {
@@ -3786,7 +3795,12 @@ async function runRemoteBrowserMode(
       text.toLowerCase().replace(/\s+/g, " ").trim();
     const expectedConversationId = () =>
       lastUrl ? extractConversationIdFromUrl(lastUrl) : undefined;
-    const waitForFreshAssistantResponse = async (baselineNormalized: string, timeoutMs: number) => {
+    const waitForFreshAssistantResponse = async (
+      baselineNormalized: string,
+      timeoutMs: number,
+      anchors: CaptureLoopBaseline,
+    ) => {
+      const { baselineTurns } = anchors;
       const baselinePrefix =
         baselineNormalized.length >= 80
           ? baselineNormalized.slice(0, Math.min(200, baselineNormalized.length))
@@ -3833,7 +3847,8 @@ async function runRemoteBrowserMode(
     };
     const recheckDelayMs = Math.max(0, config.assistantRecheckDelayMs ?? 0);
     const recheckTimeoutMs = Math.max(0, config.assistantRecheckTimeoutMs ?? 0);
-    const attemptAssistantRecheck = async () => {
+    const attemptAssistantRecheck = async (anchors: CaptureLoopBaseline) => {
+      const { baselineTurns, baselineTurnNumber } = anchors;
       if (!recheckDelayMs) return null;
       logger(
         `[browser] Assistant response timed out; waiting ${formatElapsed(recheckDelayMs)} before rechecking conversation.`,
@@ -3915,7 +3930,9 @@ async function runRemoteBrowserMode(
     const captureAssistantTurn = async (
       turnPrompt: string,
       label: string,
+      anchors: CaptureLoopBaseline,
     ): Promise<BrowserConversationTurn & { answerHtml: string }> => {
+      const { baselineTurns, baselineTurnNumber, baselineAssistantText } = anchors;
       let turnAnswer: AssistantAnswer;
       try {
         await activeConversationUrlMonitor.update("assistant-wait", 15_000).catch(() => false);
@@ -3942,7 +3959,9 @@ async function runRemoteBrowserMode(
         );
       } catch (error) {
         if (isAssistantResponseTimeoutError(error)) {
-          const rechecked = await attemptAssistantRecheckOrRethrow(attemptAssistantRecheck);
+          const rechecked = await attemptAssistantRecheckOrRethrow(() =>
+            attemptAssistantRecheck(anchors),
+          );
           if (rechecked) {
             turnAnswer = rechecked;
           } else {
@@ -3996,7 +4015,11 @@ async function runRemoteBrowserMode(
           (baselinePrefix.length > 0 && normalizedAnswer.startsWith(baselinePrefix));
         if (isBaseline) {
           logger("Detected stale assistant response; waiting for new response...");
-          const refreshed = await waitForFreshAssistantResponse(baselineNormalized, 15_000);
+          const refreshed = await waitForFreshAssistantResponse(
+            baselineNormalized,
+            15_000,
+            anchors,
+          );
           if (refreshed) {
             turnAnswer = refreshed;
           }
@@ -4112,7 +4135,7 @@ async function runRemoteBrowserMode(
 
     const followUpPrompts = normalizeBrowserFollowUpPrompts(options.followUpPrompts);
     const turns: BrowserConversationTurn[] = [];
-    const initialTurn = await captureAssistantTurn(promptText, "Initial response");
+    const initialTurn = await captureAssistantTurn(promptText, "Initial response", anchors);
     turns.push(initialTurn);
     answerText = initialTurn.answerText;
     answerMarkdown = initialTurn.answerMarkdown;
@@ -4134,9 +4157,12 @@ async function runRemoteBrowserMode(
         },
         logger,
       });
-      ({ baselineTurns, baselineTurnNumber, baselineAssistantText } =
-        copySubmissionAnchors(submission));
-      const turn = await captureAssistantTurn(followUpPrompt, `Follow-up ${index + 1}`);
+      const followUpAnchors = copySubmissionAnchors(submission);
+      const turn = await captureAssistantTurn(
+        followUpPrompt,
+        `Follow-up ${index + 1}`,
+        followUpAnchors,
+      );
       turns.push({ ...turn, prompt: followUpPrompt });
       answerText = turn.answerText;
       answerMarkdown = turn.answerMarkdown;
