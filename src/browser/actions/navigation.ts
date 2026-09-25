@@ -816,7 +816,7 @@ export function buildCloudflareVerdictExpression(): string {
       title.includes(${JSON.stringify(CLOUDFLARE_TITLE.toLowerCase())}) ||
       (title.includes('attention required') && title.includes('cloudflare'));
     const hasAppShell = Boolean(document.querySelector(
-      '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid^="conversation-turn"], [data-testid="profile-button"], main form[data-type], nav a[href*="/c/"]'
+      '#prompt-textarea, [data-testid="prompt-textarea"], [data-testid^="conversation-turn"], [data-content-search-unit-key], [data-chatgpt-composer], [data-testid="profile-button"], main form[data-type], nav a[href*="/c/"]'
     ));
     const bodyText = String((document.body && document.body.innerText) || '')
       .toLowerCase().replace(/\\s+/g, ' ').trim();

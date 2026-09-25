@@ -8,9 +8,10 @@ import {
   MODEL_BUTTON_SELECTOR,
   SEND_BUTTON_SELECTORS,
   STOP_BUTTON_SELECTOR,
+  USER_ROLE_SELECTOR,
 } from "./constants.js";
 import { captureAssistantMarkdown, readAssistantSnapshot } from "./actions/assistantResponse.js";
-import { buildConversationTurnListExpression } from "./conversationTurns.js";
+import { buildConversationTurnListExpression, buildTurnDomHelpersJs } from "./conversationTurns.js";
 import { extractStableConversationIdFromUrl } from "./conversationUrl.js";
 import { delay } from "./utils.js";
 
@@ -154,6 +155,7 @@ function buildTabInspectionExpression(): string {
       const SEND_SELECTORS = ${sendSelectorsLiteral};
       const ANSWER_SELECTORS = ${answerSelectorsLiteral};
       const ASSISTANT_ROLE_SELECTOR = ${assistantRoleLiteral};
+      const USER_ROLE_SELECTOR = ${escapeLiteral(USER_ROLE_SELECTOR)};
       const MODEL_BUTTON_SELECTOR = ${modelButtonSelectorLiteral};
       const STOP_BUTTON_SELECTOR = ${stopSelectorLiteral};
       const LOGIN_CTA = ${LOGIN_CTA_PATTERN.toString()};
@@ -183,21 +185,20 @@ function buildTabInspectionExpression(): string {
       const sendExists = Boolean(sendButton);
       const promptNode = firstVisible(INPUT_SELECTORS);
       const promptReady = Boolean(promptNode);
+      ${buildTurnDomHelpersJs()}
       const turns = ${buildConversationTurnListExpression()};
       const assistantTurns = turns.filter((turn) => {
-        const role = normalize(turn.getAttribute('data-message-author-role') || turn.getAttribute('data-turn')).toLowerCase();
+        const role = turnDom.role(turn);
         if (role === 'assistant') return true;
+        if (turnDom.isUnit(turn)) return false;
         return Boolean(turn.querySelector(ASSISTANT_ROLE_SELECTOR));
       });
-      const fallbackUserTurns = Array.from(
-        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
-      );
+      const fallbackUserTurns = Array.from(document.querySelectorAll(USER_ROLE_SELECTOR));
       const userTurns = turns.filter((turn) => {
-        const role = normalize(turn.getAttribute('data-message-author-role') || turn.getAttribute('data-turn')).toLowerCase();
+        const role = turnDom.role(turn);
         if (role === 'user') return true;
-        return Boolean(
-          turn.querySelector('[data-message-author-role="user"], [data-turn="user"]'),
-        );
+        if (turnDom.isUnit(turn)) return false;
+        return Boolean(turn.querySelector(USER_ROLE_SELECTOR));
       });
       const answerNode = ANSWER_SELECTORS
         .map((selector) => document.querySelectorAll(selector))

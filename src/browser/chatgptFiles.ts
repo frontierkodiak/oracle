@@ -7,7 +7,7 @@ import type {
   SavedBrowserFile,
 } from "./types.js";
 import { ASSISTANT_ROLE_SELECTOR } from "./constants.js";
-import { buildConversationTurnListExpression } from "./conversationTurns.js";
+import { buildConversationTurnListExpression, buildUnitRoleGuardJs } from "./conversationTurns.js";
 import {
   computeFileSha256,
   resolveSessionArtifactsDir,
@@ -333,6 +333,7 @@ function buildAssistantDownloadableFilesExpression(minTurnIndex?: number): strin
     const ASSISTANT_SELECTOR = ${assistantLiteral};
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      ${buildUnitRoleGuardJs("node", "assistant")}
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
       const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
@@ -747,6 +748,7 @@ function buildClickAssistantDownloadButtonsExpression(
     const CLICKED_ATTRIBUTE = 'data-oracle-download-clicked';
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      ${buildUnitRoleGuardJs("node", "assistant")}
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
       const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();

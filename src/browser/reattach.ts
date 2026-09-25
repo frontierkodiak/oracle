@@ -23,7 +23,7 @@ import {
 import { resolveBrowserConfig } from "./config.js";
 import { clearStaleChatGptConversationCookies, syncCookies } from "./cookies.js";
 import { CHATGPT_URL } from "./constants.js";
-import { buildConversationTurnListExpression } from "./conversationTurns.js";
+import { buildConversationTurnListExpression, buildTurnDomHelpersJs } from "./conversationTurns.js";
 import { cleanupStaleProfileState } from "./profileState.js";
 import { readDevToolsActivePortInfo } from "./detect.js";
 import {
@@ -461,11 +461,13 @@ async function readPromptPreviewTurnIndex(
       const needle = ${JSON.stringify(preview.toLowerCase().replace(/\s+/g, " ").slice(0, 120))};
       if (!needle) return null;
       const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+      ${buildTurnDomHelpersJs()}
       const turns = ${buildConversationTurnListExpression()};
       let matched = null;
       for (const [index, node] of turns.entries()) {
-        const attr = (node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-        const isUser = attr === 'user' || Boolean(node.querySelector('[data-message-author-role="user"]'));
+        const isUser =
+          turnDom.role(node) === 'user' ||
+          (!turnDom.isUnit(node) && Boolean(node.querySelector('[data-message-author-role="user"]')));
         if (!isUser) continue;
         const text = normalize(node.innerText || node.textContent || '');
         if (text.length > 0 && (text.includes(needle) || needle.includes(text.slice(0, needle.length)))) {

@@ -1,7 +1,10 @@
 import path from "node:path";
 import type { ChromeClient, BrowserAttachment, BrowserLogger } from "../types.js";
 import { INPUT_SELECTORS, SEND_BUTTON_SELECTORS, UPLOAD_STATUS_SELECTORS } from "../constants.js";
-import { buildConversationTurnListExpression } from "../conversationTurns.js";
+import {
+  buildConversationTurnListExpression,
+  buildTurnDomHelpersJs,
+} from "../conversationTurns.js";
 import { delay } from "../utils.js";
 import { logDomFailure } from "../domDebug.js";
 import { transferAttachmentViaDataTransfer } from "./attachmentDataTransfer.js";
@@ -1824,16 +1827,19 @@ function buildUserTurnAttachmentExpression(options: {
     ) {
       return { ok: false, conversationMismatch: true };
     }
+    ${buildTurnDomHelpersJs()}
     const turns = ${buildConversationTurnListExpression()};
     const userTurns = turns.map((node, index) => ({ node, index })).filter(({ node }) => {
-      const attr = (node.getAttribute('data-message-author-role') || node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
-      if (attr === 'user') return true;
+      if (turnDom.role(node) === 'user') return true;
+      if (turnDom.isUnit(node)) return false;
       return Boolean(node.querySelector('[data-message-author-role="user"]'));
     });
     const eligibleTurns =
       MIN_TURN_INDEX === null ? userTurns : userTurns.filter(({ index }) => index >= MIN_TURN_INDEX);
     const lastUser = eligibleTurns[eligibleTurns.length - 1];
     if (!lastUser) return { ok: false };
+    // New shape: the attachment cards sit beside the user unit, in its search-unit wrapper.
+    const userScope = (turnDom.isUnit(lastUser.node) && lastUser.node.closest?.('[data-chatgpt-search-unit-key]')) || lastUser.node;
     const text = (lastUser.node.innerText || '').toLowerCase().replace(/\\s+/g, ' ').trim();
     const textPrefix = text.slice(0, Math.min(text.length, EXPECTED_PROMPT_PREFIX.length));
     const promptMatches =
@@ -1841,7 +1847,7 @@ function buildUserTurnAttachmentExpression(options: {
       (text.length > 0 &&
         (text.includes(EXPECTED_PROMPT_PREFIX) ||
           (textPrefix.length > 0 && EXPECTED_PROMPT_PREFIX.includes(textPrefix))));
-    const attrs = Array.from(lastUser.node.querySelectorAll('[aria-label],[title]')).map((el) => {
+    const attrs = Array.from(userScope.querySelectorAll('[aria-label],[title]')).map((el) => {
       const aria = el.getAttribute('aria-label') || '';
       const title = el.getAttribute('title') || '';
       return (aria + ' ' + title).trim().toLowerCase();
@@ -1855,11 +1861,11 @@ function buildUserTurnAttachmentExpression(options: {
       '[title*="file"]',
       '[title*="attachment"]',
     ];
-    const attachmentUiCount = lastUser.node.querySelectorAll(attachmentSelectors.join(',')).length;
+    const attachmentUiCount = userScope.querySelectorAll(attachmentSelectors.join(',')).length;
     const hasAttachmentUi =
       attachmentUiCount > 0 || attrs.some((attr) => attr.includes('file') || attr.includes('attachment'));
     const countRegex = /(?:^|\\b)(\\d+)\\s+(?:files?|attachments?)\\b/;
-    const fileCountNodes = Array.from(lastUser.node.querySelectorAll('button,span,div,[aria-label],[title]'));
+    const fileCountNodes = Array.from(userScope.querySelectorAll('button,span,div,[aria-label],[title]'));
     let fileCount = 0;
     for (const node of fileCountNodes) {
       if (!(node instanceof HTMLElement)) continue;

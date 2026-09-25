@@ -12,6 +12,7 @@ export function buildConversationDebugExpression(): string {
       role: node.getAttribute('data-message-author-role'),
       text: node.innerText?.slice(0, 200),
       testid: node.getAttribute('data-testid'),
+      unit: node.getAttribute('data-content-search-unit-key'),
     }));
   })()`;
 }
@@ -72,6 +73,7 @@ export async function captureBrowserDiagnostics(
       role: node.getAttribute('data-message-author-role') || node.getAttribute('data-turn'),
       text: (node.innerText || node.textContent || '').slice(0, 2000),
       testid: node.getAttribute('data-testid'),
+      unit: node.getAttribute('data-content-search-unit-key'),
     }));
     return {
       url: location.href,

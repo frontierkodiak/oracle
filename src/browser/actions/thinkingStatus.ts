@@ -3,8 +3,11 @@ import { formatElapsed } from "../../oracle/format.js";
 import {
   ASSISTANT_ROLE_SELECTOR,
   CONVERSATION_TURN_SELECTOR,
+  MESSAGE_UNIT_KEY_ATTRIBUTE,
   STOP_BUTTON_SELECTORS,
+  TURN_GROUP_SELECTOR,
 } from "../constants.js";
+import { buildUnitRoleGuardJs } from "../conversationTurns.js";
 
 const THINKING_STALE_HINT_MS = 10 * 60_000;
 
@@ -252,6 +255,7 @@ function buildThinkingStatusExpression(): string {
       Boolean(node.closest?.('[contenteditable="true"], textarea, [data-testid*="composer"], [id*="composer"]'));
     const isAssistantTurn = (node) => {
       if (!(node instanceof HTMLElement)) return false;
+      ${buildUnitRoleGuardJs("node", "assistant")}
       const turnAttr = (node.getAttribute('data-turn') || node.dataset?.turn || '').toLowerCase();
       if (turnAttr === 'assistant') return true;
       const role = (node.getAttribute('data-message-author-role') || node.dataset?.messageAuthorRole || '').toLowerCase();
@@ -596,9 +600,15 @@ function buildThinkingActivityPredicateJs(fnName: string, detailed: boolean): st
       try { return document.querySelectorAll(CONVERSATION_SELECTOR); } catch { return []; }
     })();
     const lastTurn = turns.length ? turns[turns.length - 1] : null;
+    // New shape: the reasoning block renders between the user and assistant units, outside both,
+    // so the current turn is the whole turn group (a completed group carries no busy markers).
+    const liveScope =
+      lastTurn instanceof HTMLElement && lastTurn.getAttribute?.(${JSON.stringify(MESSAGE_UNIT_KEY_ATTRIBUTE)})
+        ? lastTurn.closest?.(${JSON.stringify(TURN_GROUP_SELECTOR)}) || lastTurn
+        : lastTurn;
     if (
-      lastTurn instanceof HTMLElement &&
-      (hasBusyIndicator(lastTurn) || hasLiveProgress(lastTurn))
+      liveScope instanceof HTMLElement &&
+      (hasBusyIndicator(liveScope) || hasLiveProgress(liveScope))
     ) return ${strong};
     // 6) A visible thinking/reasoning sidecar panel (the connector/reasoning phase is often
     //    exposed ONLY through a right-side panel with no inline label). Match the existing
