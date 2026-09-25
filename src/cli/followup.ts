@@ -85,6 +85,7 @@ export async function resolveBrowserFollowupReference(
     typeof storedModel === "string" && storedModel.startsWith("gpt-")
       ? (storedModel as ModelName)
       : DEFAULT_MODEL;
+  const captureOnlyParent = parentBrowserConfig.captureOnly === true;
   return {
     sessionId: metadata.id,
     resumeConversationUrl,
@@ -92,6 +93,19 @@ export async function resolveBrowserFollowupReference(
     browserConfig: {
       ...parentBrowserConfig,
       browserTabRef: null,
+      // Capture sessions are read-only observations. An ordinary follow-up must
+      // never inherit that mode and silently become another capture.
+      ...(captureOnlyParent
+        ? {
+            captureOnly: false,
+            // Capture model labels describe the capture request, not the model
+            // currently selected in the resumed conversation. Avoid reusing
+            // them as a selection/effort assertion.
+            desiredModel: undefined,
+            modelStrategy: "ignore" as const,
+            thinkingTime: undefined,
+          }
+        : {}),
       resumeConversationUrl,
       researchMode: "off",
       archiveConversations: "never",

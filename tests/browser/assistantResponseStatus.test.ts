@@ -13,6 +13,7 @@ import {
   hasScopedCompletionProof,
   isAnswerNowPlaceholderText,
   matchesThinkingStatusLabelForTest,
+  readAssistantSnapshot,
   type TerminalGateConfig,
   type TerminalSample,
 } from "../../src/browser/actions/assistantResponse.js";
@@ -776,5 +777,93 @@ describe("answer-now placeholder detection", () => {
     test.each(GENUINE_PLACEHOLDERS)("the injected page source discards %s", (text) => {
       expect(runInPage(text)).toBe(true);
     });
+  });
+});
+
+// Regression for the Carbon live campaign (PL-95): ChatGPT culls off-screen turns, so a
+// positional new-turn baseline drifts and can sit above the answer's index even though the
+// answer is genuinely new. Document order (the answer follows the just-submitted user turn)
+// must rescue it, while an older assistant action bar still precedes that user turn.
+describe("culling-proof new-turn acceptance", () => {
+  class OrderedTurn {
+    public dataset: Record<string, string> = {};
+    constructor(
+      public order: number,
+      private attrs: Record<string, string> = {},
+      private hasBar = false,
+    ) {}
+    getAttribute(name: string): string | null {
+      return this.attrs[name] ?? null;
+    }
+    querySelector(): object | null {
+      return this.hasBar ? {} : null;
+    }
+    querySelectorAll(): OrderedTurn[] {
+      return [];
+    }
+    compareDocumentPosition(other: OrderedTurn): number {
+      // DOCUMENT_POSITION_FOLLOWING = 4 when `other` is after `this`.
+      return other.order > this.order ? 4 : 2;
+    }
+  }
+
+  function evaluateCompletion(args: {
+    minTurnIndex: number;
+    turns: OrderedTurn[];
+    users: OrderedTurn[];
+    messageId?: string;
+  }): boolean {
+    const expression = buildCompletionVisibilityExpressionForTest(
+      { messageId: args.messageId },
+      args.minTurnIndex,
+    );
+    const context = createContext({
+      Array,
+      Boolean,
+      HTMLElement: OrderedTurn,
+      document: {
+        querySelectorAll: (selector: string) =>
+          selector.includes("user") ? args.users : args.turns,
+      },
+    });
+    return new Script(expression).runInContext(context) as boolean;
+  }
+
+  test("accepts an answer whose shifted index fell below the baseline but follows the submitted user turn", () => {
+    const user = new OrderedTurn(1, { "data-message-author-role": "user" });
+    const answer = new OrderedTurn(
+      3,
+      { "data-turn": "assistant", "data-message-id": "answer" },
+      true,
+    );
+    const prev = new OrderedTurn(0, { "data-turn": "assistant", "data-message-id": "prev" }, true);
+    // Baseline 4 (pre-submit turns) but culling left only 3 mounted -> answer index 2.
+    expect(
+      evaluateCompletion({ minTurnIndex: 4, turns: [prev, user, answer], users: [user] }),
+    ).toBe(true);
+  });
+
+  test("still rejects an older assistant action bar that precedes the submitted user turn", () => {
+    const prev = new OrderedTurn(0, { "data-turn": "assistant", "data-message-id": "prev" }, true);
+    const user = new OrderedTurn(1, { "data-message-author-role": "user" });
+    expect(evaluateCompletion({ minTurnIndex: 4, turns: [prev, user], users: [user] })).toBe(false);
+  });
+
+  test("readAssistantSnapshot accepts the shifted answer and rejects the unanchored one", async () => {
+    const accept = { text: "answer", turnIndex: 3, afterLastUser: true };
+    const reject = { text: "old", turnIndex: 3 };
+    const atBaseline = { text: "answer", turnIndex: 4 };
+    const runtimeFor = (value: unknown) => ({
+      evaluate: async () => ({ result: { value } }),
+    });
+    expect(await readAssistantSnapshot(runtimeFor(accept) as never, 4)).toEqual(accept);
+    expect(await readAssistantSnapshot(runtimeFor(reject) as never, 4)).toBeNull();
+    expect(await readAssistantSnapshot(runtimeFor(atBaseline) as never, 4)).toEqual(atBaseline);
+  });
+
+  test("the page expressions carry the document-order anchor", () => {
+    expect(buildAssistantSnapshotExpressionForTest(4, "abc")).toContain("afterLastUser");
+    expect(buildResponseObserverExpressionForTest(1000, 4, "abc")).toContain("afterLastUser");
+    expect(buildCompletionVisibilityExpressionForTest({}, 4)).toContain("isAfterLastUser");
   });
 });

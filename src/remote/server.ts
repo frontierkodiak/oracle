@@ -1,3 +1,5 @@
+import { RunReconciler, RECONCILIATION_CAPABILITY_ID } from "./reconciliation.js";
+import { deriveChatgptProfileId } from "../transcriptLedger.js";
 import http from "node:http";
 import { createReadStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
@@ -41,6 +43,7 @@ import {
 import {
   ARTIFACT_TRANSFER_FEATURE_ID,
   CAPTURE_ONLY_FEATURE_ID,
+  IDEMPOTENCY_LOOKUP_FEATURE_ID,
   MAX_REMOTE_ARTIFACT_BYTES,
   REMOTE_HEALTH_SCHEMA_VERSION,
 } from "./types.js";
@@ -161,6 +164,10 @@ function artifactCapabilities(
       limits: { maxQueued: queue.backlog, maxConcurrentRuns: queue.capacity },
     },
     {
+      id: IDEMPOTENCY_LOOKUP_FEATURE_ID,
+      version: 1,
+    },
+    {
       id: MAINTENANCE_DRAIN_CAPABILITY_ID,
       version: MAINTENANCE_DRAIN_CAPABILITY_VERSION,
     },
@@ -169,6 +176,7 @@ function artifactCapabilities(
       version: CAPTURE_GRANT_CAPABILITY_VERSION,
     },
   ];
+  if (allowCaptureOnly) features.push({ id: RECONCILIATION_CAPABILITY_ID, version: 1 });
   if (allowCaptureOnly) features.splice(1, 0, { id: CAPTURE_ONLY_FEATURE_ID, version: 1 });
   return {
     schemaVersion: REMOTE_HEALTH_SCHEMA_VERSION,
@@ -234,6 +242,13 @@ export async function createRemoteServer(
     capacity: effectiveConcurrency,
     backlog: options.maxQueuedRuns ?? 8,
   });
+  const hostProfileId = deriveChatgptProfileId({
+    manualLoginProfileDir: options.manualLoginProfileDir,
+  });
+  const reconciler = new RunReconciler(durableQueue, {
+    enabled: options.allowCaptureOnly === true,
+    profileId: hostProfileId,
+  });
   let durableWorkers = 0;
   let closing = false;
   const durableControllers = new Map<string, AbortController>();
@@ -259,6 +274,8 @@ export async function createRemoteServer(
     }
   };
   const pumpDurableQueue = async (): Promise<void> => {
+    if (closing) return;
+    await reconciler.sweep().catch((error) => logger(`[reconciliation] ${String(error)}`));
     while (!closing && durableWorkers < effectiveConcurrency) {
       const next = durableQueue.claimNext();
       if (!next) return;
@@ -269,7 +286,15 @@ export async function createRemoteServer(
         const started = Date.now();
         const id = next.id;
         const captureGrant = durableQueue.captureGrantForRun(id);
+        const reconciliation = reconciler.forCapture(id);
         try {
+          if (
+            reconciliation &&
+            (!reconciliation.profileBinding ||
+              reconciliation.profileId !== hostProfileId ||
+              ["paused", "profile_mismatch", "profile_unbound"].includes(reconciliation.state))
+          )
+            throw new Error("reconciliation_profile_or_admission_mismatch");
           const payload = await durableQueue.request(id);
           if (!payload) throw new Error("durable request missing");
           const runDir = durableQueue.runDirectory(id);
@@ -347,6 +372,7 @@ export async function createRemoteServer(
             }
           }) as BrowserLogger;
           automationLogger.verbose = Boolean(payload.options?.verbose);
+          durableQueue.bindProfile(id, hostProfileId);
           const result = await runBrowser({
             prompt: payload.prompt,
             attachments,
@@ -364,6 +390,15 @@ export async function createRemoteServer(
             runtimeHintCb: async (hint, modelSelection) => {
               const raw = hint as unknown as Record<string, unknown>;
               const publicHint = sanitizeRemoteRuntimeHint(raw, modelSelection);
+              if (reconciliation) {
+                const observed = observedConversationIdFromEvidence(raw);
+                if (
+                  raw.submissionAttempted === true ||
+                  raw.promptSubmitted === true ||
+                  (observed && observed !== reconciliation.conversationId)
+                )
+                  throw new Error("reconciliation_capture_violation");
+              }
               if (captureGrant) {
                 durableQueue.recordCaptureEvidence(id, {
                   submissionAttempted: raw.submissionAttempted === true,
@@ -407,6 +442,13 @@ export async function createRemoteServer(
               }
             },
           });
+          if (
+            reconciliation &&
+            (result.promptSubmitted !== false ||
+              (result as unknown as Record<string, unknown>).submissionAttempted === true ||
+              result.conversationId !== reconciliation.conversationId)
+          )
+            throw new Error("reconciliation_capture_violation");
           if (captureGrant) {
             const rawResult = result as unknown as Record<string, unknown>;
             if (rawResult.submissionAttempted === true || result.promptSubmitted === true) {
@@ -587,6 +629,10 @@ export async function createRemoteServer(
     }
   };
   void pumpDurableQueue();
+  const reconciliationTimer = setInterval(() => {
+    if (!closing) void pumpDurableQueue();
+  }, 5000);
+  reconciliationTimer.unref();
 
   if (!process.listenerCount("unhandledRejection")) {
     process.on("unhandledRejection", (reason) => {
@@ -722,11 +768,113 @@ export async function createRemoteServer(
           runtime,
           process: { pid: process.pid },
           browser: { windowMode: browserWindowMode },
+          // Stable identity of this queue; a durable receipt records it so a 404
+          // from a different queue is never read as a definite not-found.
+          queueId: durableQueue.queueId(),
           queue: queueStatus,
           admission: durableQueue.admission(),
         }),
       );
       return;
+    }
+    const idempotencyLookupMatch = /^\/v1\/runs\/by-idempotency-key\/([^/]+)$/.exec(
+      (req.url ?? "").split("?")[0]!,
+    );
+    if (idempotencyLookupMatch) {
+      if (!operatorAuthorized) {
+        denyAuthorization(res, captureAuthorization !== undefined);
+        return;
+      }
+      if (req.method !== "GET") {
+        res.writeHead(405);
+        res.end();
+        return;
+      }
+      let key: string;
+      try {
+        key = decodeURIComponent(idempotencyLookupMatch[1]!);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_idempotency_key" }));
+        return;
+      }
+      if (!key) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "idempotency_key_required" }));
+        return;
+      }
+      const snapshot = durableQueue.getByIdempotencyKey(key);
+      if (!snapshot) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "run_not_found" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(publicDurableSnapshot(snapshot)));
+      return;
+    }
+    const reconciliationMatch = /^\/v1\/runs\/([^/]+)\/reconciliation$/.exec(
+      (req.url ?? "").split("?")[0]!,
+    );
+    if (reconciliationMatch) {
+      if (!operatorAuthorized) {
+        denyAuthorization(res, captureAuthorization !== undefined);
+        return;
+      }
+      if (options.allowCaptureOnly !== true) {
+        res.writeHead(403);
+        res.end(JSON.stringify({ error: "capture_only_disabled" }));
+        return;
+      }
+      try {
+        const id = decodeURIComponent(reconciliationMatch[1]!);
+        if (!durableQueue.get(id)) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        if (req.method !== "GET" && req.method !== "POST") {
+          res.writeHead(405);
+          res.end();
+          return;
+        }
+        if (req.method === "POST") {
+          const body = await readRequestBody(req, 1024);
+          const parsed = body.trim() ? JSON.parse(body) : {};
+          const resume =
+            parsed &&
+            !Array.isArray(parsed) &&
+            Object.keys(parsed).every((key) => key === "action" || key === "useCurrentProfile") &&
+            parsed.action === "resume" &&
+            (parsed.useCurrentProfile === undefined || parsed.useCurrentProfile === true);
+          if (
+            !resume &&
+            (!parsed ||
+              typeof parsed !== "object" ||
+              Array.isArray(parsed) ||
+              Object.keys(parsed).length !== 0)
+          ) {
+            res.writeHead(400);
+            res.end(JSON.stringify({ error: "reconciliation_takes_no_override" }));
+            return;
+          }
+          if (durableQueue.get(id)?.state !== "unknown") {
+            res.writeHead(409);
+            res.end(JSON.stringify({ error: "run_not_interrupted" }));
+            return;
+          }
+          if (resume) await reconciler.resume(id, parsed.useCurrentProfile === true);
+          else await reconciler.request(id);
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(reconciler.get(id) ?? null));
+        if (req.method === "POST") void pumpDurableQueue();
+        return;
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid_reconciliation_request" }));
+        return;
+      }
     }
     const v1Match = req.url
       ? /^\/v1\/runs\/([^/]+)(?:\/(events|cancel))?$/.exec(req.url.split("?")[0] ?? "")
@@ -894,6 +1042,8 @@ export async function createRemoteServer(
     token: authToken,
     async close() {
       closing = true;
+      clearInterval(reconciliationTimer);
+      await reconciler.idle();
       for (const controller of durableControllers.values()) controller.abort();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -1362,7 +1512,7 @@ function validateRemotePayload(payload: unknown): asserts payload is RemoteRunPa
 
 function formatDurableFailure(error: unknown): {
   message: string;
-  metadata: { code?: string; type?: string; message?: string };
+  metadata: { code?: string; type?: string; message?: string; throttleMs?: number };
 } {
   const oracleError = asOracleUserError(error);
   if (!oracleError) {
@@ -1371,7 +1521,13 @@ function formatDurableFailure(error: unknown): {
   }
   const details = oracleError.details ?? {};
   const type = remoteFailureIdentifier(details.stage ?? details.code ?? oracleError.category);
-  const code = remoteFailureIdentifier(details.code);
+  const captureReason = (details.details as { failure?: { reason?: unknown } } | undefined)?.failure
+    ?.reason;
+  const code =
+    details.stage === "capture-only" &&
+    (captureReason === "auth-session-unavailable" || captureReason === "challenged")
+      ? captureReason
+      : remoteFailureIdentifier(details.code);
   const message =
     type === "chatgpt-throttled"
       ? "ChatGPT rate limiting is active for this account; retry later."
@@ -1383,6 +1539,9 @@ function formatDurableFailure(error: unknown): {
     metadata: {
       type,
       code,
+      ...(Number.isSafeInteger(details.throttleMs) && Number(details.throttleMs) >= 0
+        ? { throttleMs: Number(details.throttleMs) }
+        : {}),
       message,
     },
   };

@@ -52,6 +52,7 @@ import {
   dedupePathInputs,
 } from "../src/cli/options.js";
 import { copyToClipboard } from "../src/cli/clipboard.js";
+import { isGpt6ProAlias } from "../src/cli/browserConfig.js";
 import { buildMarkdownBundle } from "../src/cli/markdownBundle.js";
 import { shouldDetachSession, stopDetachedWorker } from "../src/cli/detach.js";
 import { applyHiddenAliases } from "../src/cli/hiddenAliases.js";
@@ -78,9 +79,12 @@ import { resolveRemoteServiceConfig } from "../src/remote/remoteServiceConfig.js
 import { buildBrowserConfig } from "../src/cli/browserConfig.js";
 import {
   cancelDurableRemoteRun,
+  reconcileDurableRemoteRun,
   getDurableRemoteQueueStatus,
   getDurableRemoteRun,
+  readDurableReceipt,
   receiptPath,
+  resolveDurableReceipt,
   submitDurableRemoteRunWithReceipt,
   watchDurableRemoteRun,
 } from "../src/remote/client.js";
@@ -1423,6 +1427,33 @@ remoteCancel.action(async function (this: Command, runId: string) {
   printRemoteValue(snapshot, Boolean(options.json), `${snapshot.id}: ${snapshot.state}`);
 });
 
+const remoteReconcile = addRemoteConnectionOptions(
+  remoteCommand
+    .command("reconcile <run-id>")
+    .alias("collect")
+    .description("Schedule read-only collection for an interrupted run; never resend its prompt.")
+    .option("--inspect", "Read the persisted collection receipt without scheduling work.", false)
+    .option("--resume", "Resume attention with another bounded retry budget.", false)
+    .option(
+      "--use-current-profile",
+      "Explicitly bind a historical run with unknown profile to this host profile.",
+      false,
+    ),
+);
+remoteReconcile.action(async function (this: Command, runId: string) {
+  const options = this.opts<Record<string, unknown>>();
+  const { host, token } = remoteHostAndToken(this);
+  const value = await reconcileDurableRemoteRun(
+    host,
+    runId,
+    token,
+    Boolean(options.inspect),
+    Boolean(options.resume),
+    Boolean(options.useCurrentProfile),
+  );
+  printRemoteValue(value, Boolean(options.json), `${runId}: ${value?.state ?? "not scheduled"}`);
+});
+
 const remoteStatus = addRemoteConnectionOptions(
   remoteCommand
     .command("status [run-id]")
@@ -1441,6 +1472,91 @@ remoteStatus.action(async function (this: Command, runId: string | undefined) {
       ? `${runId}: ${(value as any).state}`
       : `Queue: ${(value as any).queued} queued / ${(value as any).active} active`,
   );
+});
+
+const remoteRecover = addRemoteConnectionOptions(
+  remoteCommand
+    .command("recover")
+    .description(
+      "Resolve a durable receipt read-only; never resubmits. Exit codes: 0 found, 2 not found, 3 missing run, 4 unreachable, 5 unsupported, 6 queue mismatch, 7 identity unverified, 8 unverified 404.",
+    )
+    .option("--session-id <id>", "Durable session/receipt ID to resolve."),
+);
+remoteRecover.action(async function (this: Command) {
+  const options = this.opts<Record<string, unknown>>();
+  const { host, token } = remoteHostAndToken(this);
+  const sessionId = options.sessionId as string | undefined;
+  if (!sessionId) throw new Error("--session-id is required to resolve a durable receipt");
+  const receipt = await readDurableReceipt(sessionId);
+  if (!receipt) throw new Error(`no durable receipt found for session ${sessionId}`);
+  const result = await resolveDurableReceipt(host, receipt, token);
+  if (result.found) {
+    printRemoteValue(
+      { sessionId, ...result },
+      Boolean(options.json),
+      `${result.runId}: ${result.snapshot.state}`,
+    );
+    return;
+  }
+  const json = Boolean(options.json);
+  switch (result.reason) {
+    case "not_found":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `No durable run was accepted for session ${sessionId}`,
+      );
+      process.exitCode = 2;
+      return;
+    case "missing_run":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason, runId: receipt.runId },
+        json,
+        `Session ${sessionId} records run ${receipt.runId}, but that run is absent from this queue`,
+      );
+      process.exitCode = 3;
+      return;
+    case "unreachable":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason, error: result.error },
+        json,
+        `Remote service unreachable; the submission outcome for ${sessionId} is unknown`,
+      );
+      process.exitCode = 4;
+      return;
+    case "unsupported":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `Remote service does not support read-only receipt lookup; upgrade the bridge before resolving ${sessionId}`,
+      );
+      process.exitCode = 5;
+      return;
+    case "identity_mismatch":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `Session ${sessionId} was submitted to a different queue; not treating its absence here as a definite miss`,
+      );
+      process.exitCode = 6;
+      return;
+    case "identity_unverified":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `Session ${sessionId} records no queue identity; not treating its absence here as a definite miss`,
+      );
+      process.exitCode = 7;
+      return;
+    case "not_found_unverified":
+      printRemoteValue(
+        { found: false, sessionId, reason: result.reason },
+        json,
+        `The 404 for session ${sessionId} was not the documented run_not_found response; not treating it as a definite miss`,
+      );
+      process.exitCode = 8;
+      return;
+  }
 });
 
 const projectSourcesCommand = program
@@ -2291,9 +2407,19 @@ async function runRootCommand(options: CliOptions): Promise<void> {
   }
 
   const providerMode = resolveApiProviderMode(options);
-  const engineModels = multiModelProvided
-    ? Array.from(new Set(options.models!.map((entry) => resolveApiModel(entry))))
-    : [resolveApiModel(normalizeModelOption(options.model) || DEFAULT_MODEL)];
+  // Engine discovery must not apply API-only validation to browser aliases.
+  const engineModelInputs = multiModelProvided
+    ? options.models!
+    : [normalizeModelOption(options.model) || DEFAULT_MODEL];
+  const engineModels = Array.from(
+    new Set(
+      engineModelInputs.map((entry) =>
+        isGpt6ProAlias(entry) && !options.route && !options.preflight
+          ? ("gpt-6-pro" as ModelName)
+          : resolveApiModel(entry),
+      ),
+    ),
+  );
   if (options.route || options.preflight) {
     const routeAzureEndpoint = firstNonEmpty(
       options.azureEndpoint,

@@ -27,6 +27,8 @@ export interface RemoteHealthResult {
   manifest?: RemoteCapabilityManifest;
   capabilities?: RemoteArtifactCapabilities;
   browser?: RemoteBrowserHealth;
+  /** Stable identity of the durable queue this service owns, when advertised. */
+  queueId?: string;
 }
 
 export interface RemoteBrowserHealth {
@@ -108,6 +110,7 @@ export async function checkRemoteHealth({
         manifest: parsed.manifest,
         capabilities: parsed.artifact,
         browser: parsed.browser,
+        ...(parsed.queueId ? { queueId: parsed.queueId } : {}),
       };
     }
     if (response.statusCode === 404) {
@@ -133,6 +136,7 @@ export function parseHealthEnvelope(value: unknown):
       artifact?: RemoteArtifactCapabilities;
       installSha?: string | null;
       browser?: RemoteBrowserHealth;
+      queueId?: string;
     }
   | undefined {
   if (!value || typeof value !== "object") return undefined;
@@ -162,6 +166,14 @@ export function parseHealthEnvelope(value: unknown):
     installSha !== undefined &&
     installSha !== null &&
     (typeof installSha !== "string" || !/^[0-9a-f]{40}$/i.test(installSha))
+  )
+    return undefined;
+  const rawQueueId = raw.queueId;
+  if (
+    rawQueueId !== undefined &&
+    (typeof rawQueueId !== "string" ||
+      rawQueueId.trim().length === 0 ||
+      rawQueueId !== rawQueueId.trim())
   )
     return undefined;
   const rawBrowser = raw.browser;
@@ -239,6 +251,7 @@ export function parseHealthEnvelope(value: unknown):
     artifact,
     ...(installSha !== undefined ? { installSha: installSha as string | null } : {}),
     ...(browser ? { browser } : {}),
+    ...(typeof rawQueueId === "string" ? { queueId: rawQueueId } : {}),
   };
 }
 

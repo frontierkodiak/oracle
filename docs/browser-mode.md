@@ -395,3 +395,17 @@ This mode is ideal when you have a macOS VM (or spare Mac mini) logged into Chat
 - Gemini web (cookie) smoke: `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/gemini-web-live.test.ts` (requires a signed-in Chrome profile at `gemini.google.com`)
 - `pnpm test --filter browser` does not exist yet; manual runs with `--engine browser -v` are the current validation path.
 - Most of the heavy lifting lives in `src/browserMode.ts`. If you change selectors or the mutation observer logic, run a local `oracle --engine browser --browser-keep-browser` session so you can inspect DevTools before cleanup.
+
+### GPT-6 browser selection (downstream port)
+
+Use `--engine browser --model gpt-6-pro --browser-thinking-time pro` to target
+ChatGPT's **Latest** model radio with **Pro** effort. The radio and the effort
+control are verified separately; their evidence records describe observed UI
+state, not backend model attestation. A GPT-5.6 Sol selection cannot verify a
+Latest request, and unconfirmed Pro effort fails before submission.
+
+This port retains the existing default model and API capabilities. It includes
+the upstream direct-slider readiness and localized-label support needed for the
+new picker. Queue, capture-only recovery, ledger, and service behavior are
+unchanged. Offline picker and CLI regressions pass; deployment still requires a
+live Latest/Pro submission and reattach check on the intended authenticated host.

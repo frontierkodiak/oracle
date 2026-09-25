@@ -2,9 +2,19 @@
 
 ## Unreleased
 
+### Added
+
+- Serve: resolve a durable receipt that has no run ID through a read-only, operator-authenticated idempotency-key lookup (`GET /v1/runs/by-idempotency-key/:key`, capability `oracle.remote.idempotency-lookup`). Health advertises a stable `queueId`; a fresh receipt records the accepting queue's identity before its first POST so a 404 is definite only from the same queue, while an existing receipt with no identity stays unverified and untouched. `oracle remote recover --session-id` reports found, not found, a missing recorded run, unreachable, unsupported, or an identity/unverified miss, each with its own exit code, and never resubmits. Ambiguous or crash-mid-POST receipts are resolved read-only; only a definite same-queue miss permits the same-key idempotent POST, and every other outcome fails closed. New receipts still submit directly, so older services keep accepting work.
+
+- Serve: collect interrupted runs through the durable queue with bounded read-only retries and immutable, idempotent transcript observations. `oracle remote reconcile` / `collect` exposes a separate receipt; successful collection remains `captured_unattributed` and preserves the original transport outcome.
+
 ### Fixed
 
+- Browser: port upstream GPT-6 `Latest` selection and verified direct-slider Pro effort support. `--engine browser --model gpt-6-pro --browser-thinking-time pro` now selects the new model without changing the default model or adding API support. Preserve strict refusal when model or effort selection is unconfirmed.
+
 - Serve: honor `browser.hideWindow` for the shared manual-login Chrome, add explicit `--browser-hide-window` / `--browser-show-window` overrides and health metadata, and reveal a hidden window whenever interactive login is required.
+
+- Browser: anchor new-turn capture on the submitted prompt's own `conversation-turn-N` ordinal (with document order as a fallback), not a positional baseline index. ChatGPT virtualizes turns, which unmounts earlier turns and shifts that index, so a completed answer could stay below the baseline and hang the run until the response timeout. The stable ordinal cannot drift, and it also rejects an older answer when the viewport has scrolled away from the new prompt. Applies to both the local and `--remote-chrome` paths, re-anchors each in-run follow-up on its own prompt, and uses a pre-submit floor so a lagging anchor read cannot fall back onto the previous prompt.
 
 ## 0.18.0 — 2026-08-14
 

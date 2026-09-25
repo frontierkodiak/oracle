@@ -1,4 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
+import { resolveRunOptionsFromConfig } from "../../src/cli/runOptions.js";
 import { shouldDetachSession, stopDetachedWorker } from "../../src/cli/detach.js";
 
 describe("shouldDetachSession", () => {
@@ -68,6 +69,29 @@ describe("shouldDetachSession", () => {
         disableDetachEnv: false,
       });
       expect(result).toBe(true);
+    },
+  );
+
+  test.each([true, false])(
+    "isolates a resolved GPT-6 Pro browser run while wait preference is %s",
+    (waitPreference) => {
+      const { resolvedEngine, runOptions } = resolveRunOptionsFromConfig({
+        prompt: "Preserve the worker across a foreground interruption",
+        engine: "browser",
+        model: "gpt-6-pro",
+      });
+      const policy = {
+        engine: resolvedEngine,
+        model: runOptions.model!,
+        waitPreference,
+        disableDetachEnv: false,
+      };
+      expect(shouldDetachSession(policy)).toBe(true);
+      expect(shouldDetachSession({ ...policy, disableDetachEnv: true })).toBe(false);
+      expect(shouldDetachSession({ ...policy, model: "gpt-6-astra" })).toBe(false);
+      expect(shouldDetachSession({ ...policy, model: "gpt-6-pro-max" })).toBe(false);
+      // Browser alias recognition must not add API capabilities or API detach policy.
+      expect(shouldDetachSession({ ...policy, engine: "api" })).toBe(false);
     },
   );
 

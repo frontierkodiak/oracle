@@ -8,6 +8,7 @@ export const REMOTE_HEALTH_SCHEMA_VERSION = 1;
 export const ARTIFACT_TRANSFER_FEATURE_ID = "oracle.remote.artifact-transfer";
 export const CAPTURE_ONLY_FEATURE_ID = "oracle.browser.capture-only";
 export const DURABLE_QUEUE_FEATURE_ID = "oracle.remote.durable-queue";
+export const IDEMPOTENCY_LOOKUP_FEATURE_ID = "oracle.remote.idempotency-lookup";
 
 /** Browser settings a remote caller may place on the transport wire. */
 export const CLIENT_BROWSER_CONFIG_FIELDS = [
