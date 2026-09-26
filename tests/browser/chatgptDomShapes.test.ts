@@ -12,7 +12,10 @@ import {
   readSubmittedUserTurnAnchor,
 } from "../../src/browser/actions/assistantResponse.js";
 import { waitForResumedConversationHydration } from "../../src/browser/actions/navigation.js";
-import { readThinkingActivity } from "../../src/browser/actions/thinkingStatus.js";
+import {
+  readThinkingActivity,
+  readThinkingStatusForTest,
+} from "../../src/browser/actions/thinkingStatus.js";
 import { buildConversationTurnCountExpression } from "../../src/browser/conversationTurns.js";
 import type { ChromeClient } from "../../src/browser/types.js";
 
@@ -384,5 +387,97 @@ describe("new-shape specifics", () => {
     window.document.querySelector("[data-turn-key]")!.remove();
     // The new answer now sits at floor + 2 - 2 = floor: rejected, never an older answer admitted.
     expect(await readAssistantSnapshot(runtime, undefined, undefined, floor)).toBeNull();
+  });
+});
+
+// PL-169: the heartbeat monitor on the new shape. The fixture is the PL-168 read-only sampler's
+// record of a live resumed GPT-6 Pro turn (class names and reasoning-block text, not HTML); each
+// phase is replayed onto the recorded project page's reasoning block.
+describe("heartbeat status on the new-shape reasoning block", () => {
+  const live = JSON.parse(
+    readFileSync(
+      new URL("../fixtures/chatgpt-reasoning/2026-09-25-resumed-follow-up.json", import.meta.url),
+      "utf8",
+    ),
+  ) as {
+    phases: {
+      at: string;
+      stopVisible: boolean;
+      ariaBusyInGroup: number;
+      shimmerClasses: string[];
+      reasoningBlockText: string | null;
+    }[];
+  };
+
+  async function statusAt(phase: (typeof live.phases)[number]) {
+    const window = openNew("2026-09-25-project-attachment");
+    (
+      window.HTMLElement.prototype as unknown as { getBoundingClientRect: () => unknown }
+    ).getBoundingClientRect = () => ({
+      x: 100,
+      y: 100,
+      left: 100,
+      top: 100,
+      right: 300,
+      bottom: 140,
+      width: 200,
+      height: 40,
+    });
+    appendNewTurn(window, "partial answer");
+    const groups = window.document.querySelectorAll("[data-content-search-turn-key]");
+    const group = groups[groups.length - 1];
+    const block = group.querySelector("[data-chatgpt-agent-turn-start]")!.parentElement!;
+    if (phase.reasoningBlockText === null) {
+      block.remove();
+    } else {
+      let parent = block as unknown as FixtureElement;
+      block.innerHTML = '<span hidden="" data-chatgpt-agent-turn-start=""></span>';
+      for (const className of phase.shimmerClasses) {
+        const span = window.document.createElement("span");
+        span.className = className;
+        parent.append(span);
+        parent = span as unknown as FixtureElement;
+      }
+      parent.append(window.document.createTextNode(phase.reasoningBlockText));
+    }
+    if (phase.ariaBusyInGroup) {
+      group.querySelector("[data-content-search-unit-key]")!.setAttribute("aria-busy", "true");
+    }
+    if (phase.stopVisible) {
+      const stop = window.document.createElement("button");
+      stop.setAttribute("data-testid", "stop-button");
+      stop.setAttribute("aria-label", "Stop streaming");
+      window.document.body.append(stop);
+    }
+    return readThinkingStatusForTest(runtimeFor(window));
+  }
+
+  test("every recorded phase reads as reasoning, streaming or idle", async () => {
+    for (const phase of live.phases) {
+      const busy = phase.ariaBusyInGroup > 0 || phase.shimmerClasses.length > 0;
+      const status = await statusAt(phase);
+      const expected = busy ? "reasoning active" : phase.stopVisible ? "response streaming" : null;
+      expect(status?.message ?? null, phase.at).toBe(expected);
+    }
+  });
+
+  test("the headline digest changes as reasoning progresses, without logging its text", async () => {
+    const shimmering = live.phases.filter(
+      (phase) => phase.shimmerClasses.length && phase.reasoningBlockText,
+    );
+    const keys = new Set<string | undefined>();
+    for (const phase of shimmering) {
+      const status = await statusAt(phase);
+      expect(status?.activityKey).toMatch(/^[0-9a-f]{1,8}$/);
+      expect(JSON.stringify(status)).not.toContain("prime");
+      keys.add(status?.activityKey);
+    }
+    expect(new Set(shimmering.map((phase) => phase.reasoningBlockText)).size).toBeGreaterThan(1);
+    expect(keys.size).toBe(new Set(shimmering.map((phase) => phase.reasoningBlockText)).size);
+  });
+
+  test("a completed reasoning summary in an earlier turn is not activity", async () => {
+    const window = openNew("2026-09-25-project-attachment");
+    await expect(readThinkingStatusForTest(runtimeFor(window))).resolves.toBeNull();
   });
 });
