@@ -1,0 +1,74 @@
+{
+  "description": "Read-only 2 s DOM samples of the last turn group during PL-168's resumed GPT-6 Pro follow-up on carbon (conversation 6ab7069e, prompt about a prime; no user content). Recorded fields only, not HTML: stop-button visibility, aria-busy count and shimmer class names inside the last [data-content-search-turn-key] group, and the text of the reasoning block ([data-chatgpt-agent-turn-start] parent).",
+  "source": "PL-168 livegate sampler, samples3.jsonl",
+  "phases": [
+    {
+      "at": "2026-09-25T23:55:19.094Z",
+      "stopVisible": false,
+      "ariaBusyInGroup": 0,
+      "shimmerClasses": [],
+      "reasoningBlockText": "Worked for 49s Analyzed",
+      "messageUnits": 2
+    },
+    {
+      "at": "2026-09-25T23:55:23.111Z",
+      "stopVisible": true,
+      "ariaBusyInGroup": 1,
+      "shimmerClasses": [],
+      "reasoningBlockText": null,
+      "messageUnits": 3
+    },
+    {
+      "at": "2026-09-25T23:55:35.225Z",
+      "stopVisible": true,
+      "ariaBusyInGroup": 0,
+      "shimmerClasses": [
+        "relative inline-block align-top cadencedShimmer-uMTG1d text-",
+        "cadencedShimmerSweep-ICUAVH",
+        "cadencedShimmerHighlight-VcX29h"
+      ],
+      "reasoningBlockText": "Finding the next prime in a stepwise sequence Finding the next prime in a stepwise sequence Analyzing",
+      "messageUnits": 3
+    },
+    {
+      "at": "2026-09-25T23:55:39.248Z",
+      "stopVisible": true,
+      "ariaBusyInGroup": 0,
+      "shimmerClasses": [
+        "relative inline-block align-top cadencedShimmer-uMTG1d text-",
+        "cadencedShimmerSweep-ICUAVH",
+        "cadencedShimmerHighlight-VcX29h"
+      ],
+      "reasoningBlockText": "Finding the next prime in a stepwise sequence Finding the next prime in a stepwise sequence Analyzed",
+      "messageUnits": 3
+    },
+    {
+      "at": "2026-09-25T23:55:41.263Z",
+      "stopVisible": true,
+      "ariaBusyInGroup": 0,
+      "shimmerClasses": [],
+      "reasoningBlockText": "Checked a prime formula Analyzed",
+      "messageUnits": 3
+    },
+    {
+      "at": "2026-09-25T23:55:45.313Z",
+      "stopVisible": true,
+      "ariaBusyInGroup": 0,
+      "shimmerClasses": [
+        "relative inline-block align-top cadencedShimmer-uMTG1d text-",
+        "cadencedShimmerSweep-ICUAVH",
+        "cadencedShimmerHighlight-VcX29h"
+      ],
+      "reasoningBlockText": "Thinking Thinking Checked a prime formula Found the next prime in a stepwise sequence Analyzed",
+      "messageUnits": 3
+    },
+    {
+      "at": "2026-09-25T23:55:49.359Z",
+      "stopVisible": false,
+      "ariaBusyInGroup": 0,
+      "shimmerClasses": [],
+      "reasoningBlockText": "Worked for 25s Analyzed",
+      "messageUnits": 4
+    }
+  ]
+}

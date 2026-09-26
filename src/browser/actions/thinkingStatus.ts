@@ -17,6 +17,9 @@ export interface ThinkingStatusSnapshot {
   progressPercent?: number;
   panelOpened?: boolean;
   panelVisible?: boolean;
+  // Digest of the active reasoning headline: lets the stale hint see progress without logging
+  // provider text.
+  activityKey?: string;
 }
 
 interface ThinkingStatusMonitorOptions {
@@ -129,6 +132,7 @@ function buildThinkingStatusFingerprint(snapshot: ThinkingStatusSnapshot): strin
     snapshot.message,
     snapshot.progressPercent == null ? "" : Math.round(snapshot.progressPercent),
     snapshot.panelVisible ? "panel" : "",
+    snapshot.activityKey ?? "",
   ].join(":");
 }
 
@@ -158,18 +162,24 @@ async function readThinkingStatus(
   if (!message && progressPercent == null) {
     return null;
   }
+  const activityKey =
+    typeof value.activityKey === "string" && /^[0-9a-f]{1,8}$/.test(value.activityKey)
+      ? value.activityKey
+      : undefined;
   return {
     message: message || "active",
     source,
     progressPercent,
     panelOpened: value.panelOpened === true,
     panelVisible: value.panelVisible === true,
+    activityKey,
   };
 }
 
 const SAFE_THINKING_STATUS_MESSAGES = new Set([
   "active",
   "response streaming",
+  "reasoning active",
   "thinking sidecar active",
   "thinking sidecar opened",
 ]);
@@ -203,6 +213,12 @@ function buildThinkingStatusExpression(): string {
   ];
   const keywords = ["pro thinking", "thinking", "reasoning"];
   const stopSelector = STOP_BUTTON_SELECTORS.join(", ");
+  // September 2026 shape: the reasoning block sits in the turn group between the user and
+  // assistant units, outside both, headed by a model-written summary rather than "Thinking".
+  // While active it carries aria-busy or a shimmer class ("cadencedShimmer-…" live); its
+  // completed summary ("Worked for 20s") carries neither.
+  const reasoningBusySelector =
+    '[aria-busy="true"], [class*="loading-shimmer"], [class*="cadencedShimmer"]';
   const selectorLiteral = JSON.stringify(selectors);
   const keywordsLiteral = JSON.stringify(keywords);
   const stopSelectorLiteral = JSON.stringify(stopSelector);
@@ -212,6 +228,8 @@ function buildThinkingStatusExpression(): string {
     const selectors = ${selectorLiteral};
     const keywords = ${keywordsLiteral};
     const stopSelector = ${stopSelectorLiteral};
+    const TURN_GROUP_SELECTOR = ${JSON.stringify(TURN_GROUP_SELECTOR)};
+    const REASONING_BUSY_SELECTOR = ${JSON.stringify(reasoningBusySelector)};
     const normalize = (value) =>
       String(value || '')
         .normalize('NFD')
@@ -404,6 +422,20 @@ function buildThinkingStatusExpression(): string {
         progressPercent,
         panelOpened,
         panelVisible: true,
+      };
+    }
+    const groups = document.querySelectorAll(TURN_GROUP_SELECTOR);
+    const lastGroup = groups.length ? groups[groups.length - 1] : null;
+    if (lastGroup instanceof HTMLElement && lastGroup.querySelector(REASONING_BUSY_SELECTOR)) {
+      const block = lastGroup.querySelector('[data-chatgpt-agent-turn-start]')?.parentElement;
+      let hash = 0x811c9dc5;
+      for (const char of normalize(block?.textContent)) {
+        hash = Math.imul(hash ^ char.charCodeAt(0), 0x01000193);
+      }
+      return {
+        message: 'reasoning active',
+        source: 'inline',
+        activityKey: (hash >>> 0).toString(16),
       };
     }
     const nodes = new Set();
