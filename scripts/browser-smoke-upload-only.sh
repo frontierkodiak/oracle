@@ -22,8 +22,9 @@ esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD=(node "$ROOT/dist/bin/oracle-cli.js" --engine browser --wait --heartbeat 0 --timeout 900 --browser-input-timeout 120000 --browser-model-strategy select)
-# A saved browser.thinkingTime of "pro" cannot select Pro on Instant: the strict Pro-effort check aborts the run.
-FAST_ARGS=(--model "$FAST_MODEL")
+# Explicit non-Pro effort so a saved ~/.oracle/config.json browser.thinkingTime (e.g. "pro") cannot be injected.
+# "light" is the Instant tier; ensureThinkingTime also aborts if the active effort reads Pro after selection.
+FAST_ARGS=(--model "$FAST_MODEL" --browser-thinking-time light)
 
 tmpdir="$(mktemp -d -t oracle-browser-smoke)"
 tmpfile="$tmpdir/smoke-attachment.txt"

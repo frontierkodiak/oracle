@@ -55,7 +55,8 @@ const CASES = [
     name: "gpt-5.5-instant",
     desiredModel: "GPT-5.5 Instant",
     thinkingTime: undefined as "pro" | undefined,
-    expectedModel: ["5.5", "instant"],
+    // Supported picker paths report either "GPT-5.5 Instant" or the bare "Instant" label.
+    expectedModel: ["instant"],
     expectedEffort: [] as string[],
   },
   ...(PRO_MODEL
