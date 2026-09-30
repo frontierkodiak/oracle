@@ -3,12 +3,10 @@ import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-const cdpNewMock = vi.fn();
+const backgroundTargetMock = vi.fn();
 const cdpCloseMock = vi.fn();
 const cdpListMock = vi.fn();
 const cdpMock = Object.assign(vi.fn(), {
-  // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
-  New: cdpNewMock,
   // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
   Close: cdpCloseMock,
   // biome-ignore lint/style/useNamingConvention: CDP API uses capitalized members.
@@ -16,6 +14,9 @@ const cdpMock = Object.assign(vi.fn(), {
 });
 
 vi.mock("chrome-remote-interface", () => ({ default: cdpMock }));
+vi.mock("../../src/browser/backgroundTarget.js", () => ({
+  createBackgroundTarget: backgroundTargetMock,
+}));
 
 vi.doMock("../../src/browser/profileState.js", async () => {
   const original = await vi.importActual<typeof import("../../src/browser/profileState.js")>(
@@ -217,7 +218,7 @@ describe("hidden-window launch flags", () => {
 describe("connectWithNewTab", () => {
   beforeEach(() => {
     cdpMock.mockReset();
-    cdpNewMock.mockReset();
+    backgroundTargetMock.mockReset();
     cdpCloseMock.mockReset();
     cdpListMock.mockReset();
   });
@@ -227,7 +228,7 @@ describe("connectWithNewTab", () => {
   });
 
   test("falls back to default target when new tab cannot be opened", async () => {
-    cdpNewMock.mockRejectedValue(new Error("boom"));
+    backgroundTargetMock.mockRejectedValue(new Error("boom"));
     cdpMock.mockResolvedValue({});
 
     const { connectWithNewTab } = await import("../../src/browser/chromeLifecycle.js");
@@ -236,7 +237,7 @@ describe("connectWithNewTab", () => {
     const result = await connectWithNewTab(9222, logger);
 
     expect(result.targetId).toBeUndefined();
-    expect(cdpNewMock).toHaveBeenCalledTimes(1);
+    expect(backgroundTargetMock).toHaveBeenCalledTimes(1);
     expect(cdpMock).toHaveBeenCalledWith({ port: 9222, host: "127.0.0.1" });
     expect(logger).toHaveBeenCalledWith(
       expect.stringContaining("Failed to open isolated browser tab"),
@@ -244,7 +245,7 @@ describe("connectWithNewTab", () => {
   });
 
   test("closes unused tab when attach fails", async () => {
-    cdpNewMock.mockResolvedValue({ id: "target-1" });
+    backgroundTargetMock.mockResolvedValue("target-1");
     cdpMock.mockRejectedValueOnce(new Error("attach fail")).mockResolvedValueOnce({});
     cdpCloseMock.mockResolvedValue(undefined);
 
@@ -254,7 +255,7 @@ describe("connectWithNewTab", () => {
     const result = await connectWithNewTab(9222, logger);
 
     expect(result.targetId).toBeUndefined();
-    expect(cdpNewMock).toHaveBeenCalledTimes(1);
+    expect(backgroundTargetMock).toHaveBeenCalledTimes(1);
     expect(cdpCloseMock).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9222, id: "target-1" });
     expect(cdpMock).toHaveBeenCalledWith({ port: 9222, host: "127.0.0.1" });
     expect(logger).toHaveBeenCalledWith(
@@ -263,7 +264,7 @@ describe("connectWithNewTab", () => {
   });
 
   test("throws when strict mode disallows fallback", async () => {
-    cdpNewMock.mockRejectedValue(new Error("boom"));
+    backgroundTargetMock.mockRejectedValue(new Error("boom"));
 
     const { connectWithNewTab } = await import("../../src/browser/chromeLifecycle.js");
     const logger = vi.fn();
@@ -275,7 +276,7 @@ describe("connectWithNewTab", () => {
   });
 
   test("returns isolated target when attach succeeds", async () => {
-    cdpNewMock.mockResolvedValue({ id: "target-2" });
+    backgroundTargetMock.mockResolvedValue("target-2");
     cdpMock.mockResolvedValue({});
 
     const { connectWithNewTab } = await import("../../src/browser/chromeLifecycle.js");
@@ -284,15 +285,15 @@ describe("connectWithNewTab", () => {
     const result = await connectWithNewTab(9222, logger);
 
     expect(result.targetId).toBe("target-2");
-    expect(cdpNewMock).toHaveBeenCalledTimes(1);
+    expect(backgroundTargetMock).toHaveBeenCalledTimes(1);
     expect(cdpMock).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9222, target: "target-2" });
   });
 
   test("retries transient DevTools connection failures before falling back", async () => {
     vi.useFakeTimers();
-    cdpNewMock
+    backgroundTargetMock
       .mockRejectedValueOnce(new Error("connect ECONNREFUSED 127.0.0.1:9222"))
-      .mockResolvedValueOnce({ id: "target-3" });
+      .mockResolvedValueOnce("target-3");
     cdpMock.mockResolvedValue({});
 
     const { connectWithNewTab } = await import("../../src/browser/chromeLifecycle.js");
@@ -306,7 +307,7 @@ describe("connectWithNewTab", () => {
     const result = await resultPromise;
 
     expect(result.targetId).toBe("target-3");
-    expect(cdpNewMock).toHaveBeenCalledTimes(2);
+    expect(backgroundTargetMock).toHaveBeenCalledTimes(2);
     expect(cdpMock).toHaveBeenCalledWith({ host: "127.0.0.1", port: 9222, target: "target-3" });
   });
 });
@@ -314,7 +315,7 @@ describe("connectWithNewTab", () => {
 describe("closeBlankChromeTabs", () => {
   beforeEach(() => {
     cdpMock.mockReset();
-    cdpNewMock.mockReset();
+    backgroundTargetMock.mockReset();
     cdpCloseMock.mockReset();
     cdpListMock.mockReset();
   });
@@ -440,7 +441,10 @@ describe("closeBlankChromeTabs", () => {
       target: "ws://127.0.0.1:9222/devtools/browser/abc",
       local: true,
     });
-    expect(browserClient.Target.createTarget).toHaveBeenCalledWith({ url: "https://chatgpt.com/" });
+    expect(browserClient.Target.createTarget).toHaveBeenCalledWith({
+      url: "https://chatgpt.com/",
+      background: true,
+    });
     expect(browserClient.Target.attachToTarget).toHaveBeenCalledWith({
       targetId: "target-9",
       flatten: true,
@@ -574,7 +578,7 @@ describe("closeBlankChromeTabs", () => {
 
 describe("ensureChromePageTargetAfterClose", () => {
   beforeEach(() => {
-    cdpNewMock.mockReset();
+    backgroundTargetMock.mockReset();
     cdpListMock.mockReset();
   });
 
@@ -594,12 +598,12 @@ describe("ensureChromePageTargetAfterClose", () => {
         "127.0.0.1",
       ),
     ).resolves.toBe("other-target");
-    expect(cdpNewMock).not.toHaveBeenCalled();
+    expect(backgroundTargetMock).not.toHaveBeenCalled();
   });
 
   test("opens a replacement when the completed run owns the only page", async () => {
     cdpListMock.mockResolvedValue([{ id: "run-target", type: "page" }]);
-    cdpNewMock.mockResolvedValue({ id: "replacement-target" });
+    backgroundTargetMock.mockResolvedValue("replacement-target");
     const { ensureChromePageTargetAfterClose } =
       await import("../../src/browser/chromeLifecycle.js");
 
@@ -611,7 +615,7 @@ describe("ensureChromePageTargetAfterClose", () => {
         "127.0.0.1",
       ),
     ).resolves.toBe("replacement-target");
-    expect(cdpNewMock).toHaveBeenCalledWith({
+    expect(backgroundTargetMock).toHaveBeenCalledWith({
       host: "127.0.0.1",
       port: 9222,
       url: "about:blank",
@@ -623,7 +627,7 @@ describe("ensureChromePageTargetAfterClose", () => {
       { id: "run-b", type: "page" },
       { id: "replacement-a", type: "page" },
     ]);
-    cdpNewMock.mockResolvedValueOnce({ id: "replacement-a" });
+    backgroundTargetMock.mockResolvedValueOnce("replacement-a");
     const { ensureChromePageTargetAfterClose } =
       await import("../../src/browser/chromeLifecycle.js");
 
@@ -643,12 +647,12 @@ describe("ensureChromePageTargetAfterClose", () => {
         "127.0.0.1",
       ),
     ).resolves.toBe("replacement-a");
-    expect(cdpNewMock).toHaveBeenCalledTimes(1);
+    expect(backgroundTargetMock).toHaveBeenCalledTimes(1);
   });
 
   test("fails closed when a replacement cannot be opened", async () => {
     cdpListMock.mockResolvedValue([{ id: "run-target", type: "page" }]);
-    cdpNewMock.mockRejectedValue(new Error("cannot create"));
+    backgroundTargetMock.mockRejectedValue(new Error("cannot create"));
     const { ensureChromePageTargetAfterClose } =
       await import("../../src/browser/chromeLifecycle.js");
 

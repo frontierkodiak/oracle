@@ -29,6 +29,8 @@
 
 ### Fixed
 
+- Browser: open run, recovery, and replacement tabs in the background so the bridge does not take focus.
+
 - Browser: detect a disabled ChatGPT effort tier (e.g. an exhausted Pro allotment) before clicking it, and report the account's own reset notice instead of a misleading "selection unverified" failure. Thanks @enieuwy!
 
 ## 0.17.3 — 2026-08-13
