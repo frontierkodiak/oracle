@@ -1,6 +1,7 @@
 import { rm } from "node:fs/promises";
 import net from "node:net";
 import CDP from "chrome-remote-interface";
+import { createBackgroundTarget } from "./backgroundTarget.js";
 import { launch, Launcher, type LaunchedChrome } from "chrome-launcher";
 import type { BrowserLogger, ResolvedBrowserConfig, ChromeClient } from "./types.js";
 import { cleanupStaleProfileState } from "./profileState.js";
@@ -342,6 +343,7 @@ export async function connectToRemoteChromeTarget(
     if (!targetId) {
       const created = await browser.Target.createTarget({
         url: options.targetUrl ?? "about:blank",
+        background: true,
       });
       targetId = created.targetId;
       logger(`Opened dedicated remote Chrome tab targeting ${options.targetUrl ?? "about:blank"}`);
@@ -437,21 +439,21 @@ async function connectToNewTarget(
   messages: TargetConnectMessages,
 ): Promise<{ client: ChromeClient; targetId: string } | null> {
   try {
-    const target = await CDP.New({ host, port, url });
+    const targetId = await createBackgroundTarget({ host, port, url });
     try {
-      const client = await CDP({ host, port, target: target.id });
+      const client = await CDP({ host, port, target: targetId });
       if (messages.opened) {
-        logger(messages.opened(target.id));
+        logger(messages.opened(targetId));
       }
-      return { client, targetId: target.id };
+      return { client, targetId };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      logger(messages.attachFailed(target.id, message));
+      logger(messages.attachFailed(targetId, message));
       try {
-        await CDP.Close({ host, port, id: target.id });
+        await CDP.Close({ host, port, id: targetId });
       } catch (closeError) {
         const closeMessage = closeError instanceof Error ? closeError.message : String(closeError);
-        logger(messages.closeFailed(target.id, closeMessage));
+        logger(messages.closeFailed(targetId, closeMessage));
       }
     }
   } catch (error) {
@@ -625,12 +627,11 @@ export async function createChromePageTarget(
 ): Promise<string | undefined> {
   const effectiveHost = host ?? "127.0.0.1";
   try {
-    const created = (await CDP.New({
+    const createdTargetId = await createBackgroundTarget({
       host: effectiveHost,
       port,
       url: "about:blank",
-    })) as { id?: string; targetId?: string };
-    const createdTargetId = created.targetId ?? created.id;
+    });
     if (!createdTargetId) {
       logger("Failed to create a replacement Chrome tab.");
       return undefined;

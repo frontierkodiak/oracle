@@ -265,6 +265,7 @@ oracle --engine browser \
 ```
 
 - Oracle launches Chrome headful with a persistent automation profile at `~/.oracle/browser-profile` (override with `ORACLE_BROWSER_PROFILE_DIR` or `browser.manualLoginProfileDir` in `~/.oracle/config.json`).
+- Run tabs open in the background. Visible manual-login setup with `--browser-keep-browser` activates the login tab when authentication is required. Hidden automation never brings a login tab forward; use the bridge operator’s explicit sign-in/window-show command to recover a signed-out hidden bridge.
 - Log into chatgpt.com in that window the first time; Oracle polls until the session is active, then proceeds.
 - Reuse the same profile on subsequent runs (no re-login unless the session expires).
 - Add `--browser-keep-browser` (or config `browser.keepBrowser=true`) when doing the initial login/setup or debugging so the Chrome window stays open after the run. When omitted, Oracle closes Chrome but preserves the profile on disk.

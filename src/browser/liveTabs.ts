@@ -1,4 +1,5 @@
 import CDP from "chrome-remote-interface";
+import { createBackgroundTarget } from "./backgroundTarget.js";
 import { createHash } from "node:crypto";
 import type { SessionMetadata, BrowserHarvestState } from "../sessionStore.js";
 import {
@@ -289,8 +290,7 @@ export async function openChatGptTarget(
 ): Promise<string> {
   const { host, port } = normalizeHostPort(options);
   const url = options.url ?? "https://chatgpt.com/";
-  const target = await CDP.New({ host, port, url });
-  return target.id;
+  return await createBackgroundTarget({ host, port, url });
 }
 
 async function connectToTarget(host: string, port: number, targetId: string) {

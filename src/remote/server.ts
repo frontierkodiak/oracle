@@ -394,6 +394,7 @@ export async function createRemoteServer(
           automationLogger.verbose = Boolean(payload.options?.verbose);
           durableQueue.bindProfile(id, hostProfileId);
           const result = await runBrowser({
+            allowInteractiveLogin: false,
             prompt: payload.prompt,
             attachments,
             fallbackSubmission,
