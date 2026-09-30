@@ -1,7 +1,7 @@
 import { readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { ChromeClient } from "./types.js";
+import type { ChromeClient, BrowserLogger } from "./types.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 
 export function resolveManualLoginWaitMs(timeoutMs: number | undefined, keepBrowser: boolean) {
@@ -68,11 +68,31 @@ export function defaultManualLoginProfileDir() {
 /** Human-requested setup may activate a login tab; unattended/hidden runs must not. */
 export async function revealManualLoginSetupTab(
   page: ChromeClient["Page"],
-  options: { headless: boolean; hideWindow: boolean; keepBrowser: boolean },
+  options: {
+    headless: boolean;
+    hideWindow: boolean;
+    keepBrowser: boolean;
+    allowInteractiveLogin?: boolean;
+    showWindow?: () => Promise<unknown>;
+    log?: BrowserLogger;
+  },
 ): Promise<boolean> {
-  if (options.headless || options.hideWindow || !options.keepBrowser) {
+  if (
+    options.allowInteractiveLogin === false ||
+    options.headless ||
+    options.hideWindow ||
+    !options.keepBrowser
+  ) {
     return false;
   }
-  await page.bringToFront();
-  return true;
+  try {
+    await options.showWindow?.();
+    await page.bringToFront();
+    return true;
+  } catch (error) {
+    options.log?.(
+      `Failed to reveal manual-login setup tab: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return false;
+  }
 }

@@ -135,6 +135,8 @@ export interface BrowserAutomationConfig {
 }
 
 export interface BrowserRunOptions {
+  /** Services set false: keeping their shared browser alive is not a human login request. */
+  allowInteractiveLogin?: boolean;
   prompt: string;
   /**
    * Abort the run when the caller no longer wants it.

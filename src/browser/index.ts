@@ -17,6 +17,7 @@ import {
   launchChrome,
   registerTerminationHooks,
   positionChromeWindowOffscreen,
+  positionChromeWindowOnscreen,
   connectToRemoteChrome,
   connectWithNewTab,
   closeTab,
@@ -1514,6 +1515,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
               headless: Boolean(config.headless),
               hideWindow: Boolean(config.hideWindow),
               keepBrowser: effectiveKeepBrowser,
+              allowInteractiveLogin: options.allowInteractiveLogin,
+              showWindow:
+                process.platform === "darwin"
+                  ? async () => await positionChromeWindowOnscreen(windowClient, logger)
+                  : undefined,
+              log: logger,
             }),
         }),
       );

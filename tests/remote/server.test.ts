@@ -353,9 +353,9 @@ describe("remote browser service", () => {
     },
   );
 
-  test.skipIf(!CAN_LISTEN_LOCALHOST)(
-    "keeps manual-login Chrome but requests completed run-tab cleanup",
-    async () => {
+  test.skipIf(!CAN_LISTEN_LOCALHOST).each([true, false])(
+    "keeps manual-login Chrome without interactive login (hidden=%s)",
+    async (browserHideWindow) => {
       const manualLoginProfileDir = "/tmp/oracle-manual-login-profile-test";
       const cleanupPolicies: Array<boolean | undefined> = [];
       const server = await createRemoteServer(
@@ -366,7 +366,7 @@ describe("remote browser service", () => {
           logger: () => {},
           manualLoginDefault: true,
           manualLoginProfileDir,
-          browserHideWindow: true,
+          browserHideWindow,
         },
         {
           runBrowser: async (options) => {
@@ -375,8 +375,9 @@ describe("remote browser service", () => {
               manualLoginProfileDir,
               keepBrowser: true,
               cookieSync: false,
-              hideWindow: process.platform === "darwin",
+              hideWindow: process.platform === "darwin" && browserHideWindow,
             });
+            expect(options.allowInteractiveLogin).toBe(false);
             cleanupPolicies.push(options.closeOwnedTabOnComplete);
             return {
               answerText: "done",
