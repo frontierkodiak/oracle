@@ -1,10 +1,35 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Live gate. This script sends real prompts to ChatGPT, so refuse before building or launching anything.
+# ChatGPT Pro allowance is scarce: Pro legs run only when a Pro model is named explicitly (no default).
+if [ "${ORACLE_LIVE_TEST:-}" != "1" ]; then
+  echo "[browser-smoke] refusing to run: this script sends live prompts to ChatGPT. Set ORACLE_LIVE_TEST=1 to opt in." >&2
+  exit 2
+fi
+# Explicit allowlist: only a model with no Pro effort tier. GPT-5.5 Thinking / GPT-5.4 can start with a Pro
+# effort persisted in the picker, and a failed effort selection would keep it and submit on Pro; Oracle has no
+# fail-closed mode for non-Pro effort, so the fast legs use Instant with an explicit light effort. Anything else
+# (empty/whitespace, aliases such as classic/latest/gpt-6, Thinking, Pro models) is refused.
+FAST_MODEL="$(printf '%s' "${ORACLE_BROWSER_SMOKE_FAST_MODEL:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+case "$FAST_MODEL" in
+  gpt-5.5-instant) ;;
+  *)
+    echo "[browser-smoke] refusing to run: set ORACLE_BROWSER_SMOKE_FAST_MODEL=gpt-5.5-instant (the only allowed fast model; got '${ORACLE_BROWSER_SMOKE_FAST_MODEL:-}')." >&2
+    exit 2
+    ;;
+esac
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CMD=(node "$ROOT/dist/bin/oracle-cli.js" --engine browser --wait --heartbeat 0 --timeout 900 --browser-input-timeout 120000)
-FAST_MODEL="${ORACLE_BROWSER_SMOKE_FAST_MODEL:-gpt-5.5}"
-PRO_MODEL="${ORACLE_BROWSER_SMOKE_PRO_MODEL:-gpt-5.5-pro}"
+CMD=(node "$ROOT/dist/bin/oracle-cli.js" --engine browser --wait --heartbeat 0 --timeout 900 --browser-input-timeout 120000 --browser-model-strategy select)
+# Explicit non-Pro effort so a saved ~/.oracle/config.json browser.thinkingTime (e.g. "pro") cannot be injected.
+# "light" is the Instant tier. Residual risk: if the picker cannot find that chip while a Pro effort is
+# persisted, Oracle keeps the existing effort (see docs/testing.md).
+FAST_ARGS=(--model "$FAST_MODEL" --browser-thinking-time light)
+PRO_MODEL="${ORACLE_BROWSER_SMOKE_PRO_MODEL:-}"
+if [ -n "$PRO_MODEL" ]; then
+  echo "[browser-smoke] WARNING: Pro legs enabled (model: $PRO_MODEL); each Pro leg spends a Pro message from the account allowance."
+fi
 
 tmpdir="$(mktemp -d -t oracle-browser-smoke)"
 tmpfile="$tmpdir/smoke-attachment.txt"
@@ -13,7 +38,7 @@ trap 'rm -rf "$tmpdir" "$upload_log"' EXIT
 echo "smoke-attachment" >"$tmpfile"
 
 echo "[browser-smoke] fast upload attachment (non-inline)"
-if ! "${CMD[@]}" --model "$FAST_MODEL" --browser-attachments always --prompt "Read the attached file and return exactly one markdown bullet '- upload: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-upload --force | tee "$upload_log"; then
+if ! "${CMD[@]}" "${FAST_ARGS[@]}" --browser-attachments always --prompt "Read the attached file and return exactly one markdown bullet '- upload: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-upload --force | tee "$upload_log"; then
   exit 1
 fi
 if ! grep -Eq -- "^[[:space:]]*[-*][[:space:]]+upload:[[:space:]]+smoke-attachment" "$upload_log"; then
@@ -23,13 +48,22 @@ if ! grep -Eq -- "^[[:space:]]*[-*][[:space:]]+upload:[[:space:]]+smoke-attachme
 fi
 
 echo "[browser-smoke] fast simple"
-"${CMD[@]}" --model "$FAST_MODEL" --prompt "Return exactly one markdown bullet: '- pro-ok'." --slug browser-smoke-pro --force
+"${CMD[@]}" "${FAST_ARGS[@]}" --prompt "Return exactly one markdown bullet: '- pro-ok'." --slug browser-smoke-pro --force
 
 echo "[browser-smoke] fast with attachment preview (inline)"
-"${CMD[@]}" --model "$FAST_MODEL" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-file --preview --force
+"${CMD[@]}" "${FAST_ARGS[@]}" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-file --preview --force
 
-echo "[browser-smoke] pro standard markdown check"
-"${CMD[@]}" --model "$PRO_MODEL" --prompt "Return two markdown bullets and a fenced code block labeled js that logs 'thinking-ok'." --slug browser-smoke-thinking --force
+if [ -n "$PRO_MODEL" ]; then
+  echo "[browser-smoke] pro standard markdown check"
+  "${CMD[@]}" --model "$PRO_MODEL" --prompt "Return two markdown bullets and a fenced code block labeled js that logs 'thinking-ok'." --slug browser-smoke-thinking --force
+else
+  echo "[browser-smoke] pro standard markdown check: skipped (no Pro model named; set ORACLE_BROWSER_SMOKE_PRO_MODEL)"
+fi
+
+if [ -z "$PRO_MODEL" ]; then
+  echo "[browser-smoke] reattach flow after controller loss: skipped (no Pro model named; set ORACLE_BROWSER_SMOKE_PRO_MODEL)"
+  exit 0
+fi
 
 echo "[browser-smoke] reattach flow after controller loss"
 slug="browser-reattach-smoke"

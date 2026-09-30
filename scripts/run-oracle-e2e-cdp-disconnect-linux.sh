@@ -5,6 +5,16 @@
 #   bash scripts/run-oracle-e2e-cdp-disconnect-linux.sh
 set -euo pipefail
 
+# This sends a live prompt to ChatGPT (PL-229): refuse before starting Docker.
+if [[ "${ORACLE_LIVE_TEST:-}" != "1" ]]; then
+  echo "[linux-e2e] refusing to run: sends a live prompt. Set ORACLE_LIVE_TEST=1 to opt in." >&2
+  exit 2
+fi
+if [[ -z "${ORACLE_E2E_PRO_MODEL:-}" && "$(printf '%s' "${ORACLE_E2E_MODEL:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" != "gpt-5.5-instant" ]]; then
+  echo "[linux-e2e] refusing to run: set ORACLE_E2E_MODEL=gpt-5.5-instant (Pro needs an explicit ORACLE_E2E_PRO_MODEL)." >&2
+  exit 2
+fi
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COOKIES="${ORACLE_BROWSER_COOKIES_FILE:-/tmp/oracle-e2e-cookies.json}"
 IMAGE="${ORACLE_LINUX_PROOF_IMAGE:-node:24-bookworm}"
@@ -26,7 +36,9 @@ docker run --rm \
   -w /tmp/oracle-e2e \
   -e ORACLE_BROWSER_COOKIES_FILE=/secrets/chatgpt-cookies.json \
   -e ORACLE_E2E_BROWSER_PORT=9344 \
-  -e ORACLE_E2E_MODEL_STRATEGY=current \
+  -e ORACLE_LIVE_TEST=1 \
+  -e ORACLE_E2E_MODEL="${ORACLE_E2E_MODEL:-}" \
+  -e ORACLE_E2E_PRO_MODEL="${ORACLE_E2E_PRO_MODEL:-}" \
   -e ORACLE_E2E_HIDE_WINDOW=1 \
   -e ORACLE_CHROME_NO_SANDBOX=1 \
   -e CHROME_PATH=/usr/bin/chromium \

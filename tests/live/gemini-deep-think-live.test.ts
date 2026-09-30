@@ -4,6 +4,8 @@ import { acquireLiveTestLock, releaseLiveTestLock } from "./liveLock.js";
 
 const LIVE = process.env.ORACLE_LIVE_TEST === "1";
 const MANUAL = process.env.ORACLE_LIVE_TEST_MANUAL_LOGIN === "1";
+// Non-Pro by default; a Pro model is used only when ORACLE_LIVE_BROWSER_PRO_MODEL names it explicitly.
+const PRO_MODEL = process.env.ORACLE_LIVE_BROWSER_PRO_MODEL?.trim() || undefined;
 
 (LIVE && MANUAL ? describe : describe.skip)("Gemini Deep Think DOM automation live", () => {
   it(
@@ -103,6 +105,9 @@ const MANUAL = process.env.ORACLE_LIVE_TEST_MANUAL_LOGIN === "1";
           config: {
             manualLogin: true,
             keepBrowser: false,
+            // Name a non-Pro model explicitly; the generic browser default is Pro (PL-229).
+            desiredModel: PRO_MODEL ?? "GPT-5.5 Instant",
+            ...(PRO_MODEL ? { thinkingTime: "pro" as const } : {}),
             timeoutMs: 180_000,
           },
         });

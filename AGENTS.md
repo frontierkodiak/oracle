@@ -3,7 +3,7 @@
 Oracle-specific notes:
 
 - ChatGPT project URLs: steipete@gmail.com -> https://chatgpt.com/g/g-p-691edc9fec088191b553a35093da1ea8-oracle/project; studpete@gmail.com -> https://chatgpt.com/g/g-p-69505ed97e3081918a275477a647a682/project. Prefer studpete URL if steipete project not found.
-- Pro browser runs: allow up to 10 minutes; never click "Answer now"; keep at least 1–2 Pro live tests (reattach must stay Pro); move other tests to faster models where safe.
+- Pro browser runs: allow up to 10 minutes; never click "Answer now". Never spend a GPT-6 Pro (ChatGPT Pro) turn on bridge/capture/transport tests (PL-229): the browser live suites and `scripts/browser-smoke.sh` use explicit non-Pro models and refuse or skip unless `ORACLE_LIVE_TEST=1` is set, and Pro cases run only when a Pro model is named explicitly (`ORACLE_LIVE_BROWSER_PRO_MODEL`, `ORACLE_BROWSER_SMOKE_PRO_MODEL`).
 - Live smoke tests: OpenAI live tests are opt-in. Run `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/openai-live.test.ts` with a real `OPENAI_API_KEY` when you need the background path; gpt-5-pro can take ~10 minutes.
 - Wait defaults: gpt-5-pro API runs detach by default; use `--wait` to stay attached. gpt-5.1 and browser runs block by default; every run prints `oracle session <id>` for reattach.
 - Session storage: Oracle stores session data under `~/.oracle`; delete it if you need a clean slate.

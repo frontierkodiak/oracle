@@ -18,7 +18,7 @@ and run the live API suite before shipping major transport changes.
 
 ### Quick browser port smoke
 
-- `pnpm test:browser` — launches headful Chrome and checks the DevTools endpoint is reachable. Set `ORACLE_BROWSER_PORT` (or `ORACLE_BROWSER_DEBUG_PORT`) to reuse a fixed port when you’ve already opened a firewall rule.
+- `pnpm test:browser` — launches headful Chrome and checks the DevTools endpoint is reachable, then runs `scripts/browser-smoke.sh` (live prompts; requires `ORACLE_LIVE_TEST=1` and `ORACLE_BROWSER_SMOKE_FAST_MODEL`, and skips the Pro legs unless `ORACLE_BROWSER_SMOKE_PRO_MODEL` is set — see docs/testing.md). Set `ORACLE_BROWSER_PORT` (or `ORACLE_BROWSER_DEBUG_PORT`) to reuse a fixed port when you’ve already opened a firewall rule.
 
 ### Gemini browser mode (Gemini web / cookies)
 

@@ -89,6 +89,8 @@ async function waitForPageTarget(host: string, port: number, timeoutMs = 30_000)
             manualLogin: true,
             manualLoginProfileDir: profileDir,
             manualLoginCookieSync: true,
+            // Name a non-Pro model explicitly; the generic browser default is Pro.
+            desiredModel: "GPT-5.5 Instant",
             chromeProfile: "Default",
             keepBrowser: false,
             timeoutMs: 180_000,

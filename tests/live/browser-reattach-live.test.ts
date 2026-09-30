@@ -15,6 +15,35 @@ const PROJECT_URLS = process.env.ORACLE_CHATGPT_PROJECT_URL
   ? [process.env.ORACLE_CHATGPT_PROJECT_URL]
   : DEFAULT_PROJECT_URLS;
 
+// GPT-6 Pro allowance is scarce: the default reattach run is non-Pro. The Pro variant runs only when
+// ORACLE_LIVE_BROWSER_PRO_MODEL names the Pro model explicitly (each run spends a Pro message).
+const PRO_MODEL = process.env.ORACLE_LIVE_BROWSER_PRO_MODEL?.trim();
+const CASES = [
+  {
+    // Instant has no Pro effort tier, so a failed or skipped effort selection cannot leave the run on Pro.
+    name: "non-pro",
+    desiredModel: "GPT-5.5 Instant",
+    thinkingTime: undefined as "pro" | undefined,
+    timeoutMs: 600_000,
+  },
+  ...(PRO_MODEL
+    ? [
+        {
+          name: "pro",
+          desiredModel: PRO_MODEL,
+          thinkingTime: "pro" as const,
+          timeoutMs: 1_200_000,
+        },
+      ]
+    : []),
+];
+
+if (LIVE && !PRO_MODEL) {
+  console.warn(
+    "Skipping Pro live reattach case (ORACLE_LIVE_BROWSER_PRO_MODEL not set; no Pro model named).",
+  );
+}
+
 async function hasChatGptCookies(): Promise<boolean> {
   const { cookies } = await getCookies({
     url: "https://chatgpt.com",
@@ -47,9 +76,9 @@ function isMissingChatGptSessionError(error: unknown): boolean {
 }
 
 (LIVE ? describe : describe.skip)("ChatGPT browser live reattach", () => {
-  test(
-    "reattaches from project list after closing Chrome (pro request)",
-    async () => {
+  test.each(CASES)(
+    "reattaches from project list after closing Chrome ($name request)",
+    async (entry) => {
       if (!(await hasChatGptCookies())) return;
       // Learned: reattach needs exclusive access to the profile to avoid target mismatch.
       await acquireLiveTestLock("chatgpt-browser");
@@ -59,8 +88,8 @@ function isMissingChatGptSessionError(error: unknown): boolean {
           return;
         }
 
-        // Learned: keep Pro here; it exercises long-running "thinking" + reattach timing.
-        const promptToken = `live reattach pro ${Date.now()}`;
+        // The non-Pro case still exercises "thinking" + reattach timing; Pro is explicit opt-in only.
+        const promptToken = `live reattach ${entry.name} ${Date.now()}`;
         const prompt = `${promptToken}\nRepeat the first line exactly. No other text.`;
         const log = createLogger();
         let runtime: {
@@ -87,8 +116,9 @@ function isMissingChatGptSessionError(error: unknown): boolean {
                   chromeProfile: "Default",
                   url: projectUrl,
                   keepBrowser: true,
-                  desiredModel: "GPT-5.2 Pro",
-                  timeoutMs: 1_200_000,
+                  desiredModel: entry.desiredModel,
+                  thinkingTime: entry.thinkingTime,
+                  timeoutMs: entry.timeoutMs,
                 },
                 log,
               });
@@ -102,7 +132,7 @@ function isMissingChatGptSessionError(error: unknown): boolean {
                 return;
               }
               if (/Unable to find model option/i.test(message)) {
-                console.warn(`Skipping live reattach (pro model unavailable): ${message}`);
+                console.warn(`Skipping live reattach (model unavailable): ${message}`);
                 return;
               }
               const missingProject =
@@ -174,7 +204,7 @@ function isMissingChatGptSessionError(error: unknown): boolean {
             chromePort: undefined,
             chromeTargetId: undefined,
           },
-          { chromeProfile: "Default", url: selectedProjectUrl, timeoutMs: 1_200_000 },
+          { chromeProfile: "Default", url: selectedProjectUrl, timeoutMs: entry.timeoutMs },
           Object.assign(createLogger(), { verbose: true }),
           { promptPreview: promptToken },
         );

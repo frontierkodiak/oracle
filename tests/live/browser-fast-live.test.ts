@@ -8,6 +8,8 @@ import { getCookies } from "@steipete/sweet-cookie";
 
 const LIVE = process.env.ORACLE_LIVE_TEST === "1";
 const FAST = process.env.ORACLE_LIVE_TEST_FAST === "1";
+// Never inherit the generic Pro default: GPT-6 Pro allowance is scarce, so these suites name a non-Pro model.
+const FAST_MODEL = "GPT-5.5 Instant";
 
 async function hasChatGptSession(): Promise<boolean> {
   try {
@@ -47,6 +49,7 @@ function isMissingChatGptSessionError(error: unknown): boolean {
             prompt: `${promptToken}\nReply with OK only.`,
             config: {
               url: "https://chatgpt.com/g/does-not-exist/project",
+              desiredModel: FAST_MODEL,
               timeoutMs: 180_000,
               inputTimeoutMs: 20_000,
             },
@@ -67,7 +70,7 @@ function isMissingChatGptSessionError(error: unknown): boolean {
   );
 
   test(
-    "uploads attachments and sends the prompt (gpt-5.2)",
+    "uploads attachments and sends the prompt (GPT-5.5 Instant)",
     async () => {
       if (!(await hasChatGptSession())) {
         console.warn("Skipping fast live test (missing ChatGPT session cookie).");
@@ -91,6 +94,7 @@ function isMissingChatGptSessionError(error: unknown): boolean {
               { path: fileB, displayPath: "oracle-fast-b.txt", sizeBytes: statB.size },
             ],
             config: {
+              desiredModel: FAST_MODEL,
               timeoutMs: 240_000,
               inputTimeoutMs: 60_000,
             },
