@@ -12,6 +12,8 @@ import { mkdir, readFile, realpath, writeFile, stat } from "node:fs/promises";
 import chalk from "chalk";
 import type { BrowserLogger, CookieParam } from "../browser/types.js";
 import { runBrowserMode } from "../browserMode.js";
+import { getOracleHomeDir } from "../oracleHome.js";
+import { createCommandSpendGate, refuseAllSpendGate, type SpendGate } from "./spendGate.js";
 import { normalizeMaxConcurrentTabs } from "../browser/tabLeaseRegistry.js";
 import { loadUserConfig } from "../config.js";
 import {
@@ -87,6 +89,13 @@ export interface RemoteServerOptions {
   allowCaptureOnly?: boolean;
   /** Test/embedding seam; production defaults to ORACLE_HOME_DIR. */
   queueHomeDir?: string;
+  /**
+   * Ledger command asked to reserve every provider send before it happens
+   * (PL-229), invoked as `<command> charge --at-submit ...`.
+   */
+  spendGateCommand?: string;
+  /** Refuse every send when no spend gate is configured. */
+  spendGateRequired?: boolean;
 }
 
 export function qualifiesForProEtaSample(
@@ -106,6 +115,7 @@ export function qualifiesForProEtaSample(
 
 interface RemoteServerDeps {
   runBrowser?: typeof runBrowserMode;
+  spendGate?: SpendGate;
 }
 
 interface RemoteServerInstance {
@@ -242,6 +252,16 @@ export async function createRemoteServer(
     capacity: effectiveConcurrency,
     backlog: options.maxQueuedRuns ?? 8,
   });
+  const spendGate: SpendGate | undefined =
+    deps.spendGate ??
+    (options.spendGateCommand
+      ? createCommandSpendGate({
+          command: options.spendGateCommand,
+          oracleHome: options.queueHomeDir ?? getOracleHomeDir(),
+        })
+      : options.spendGateRequired
+        ? refuseAllSpendGate
+        : undefined);
   const hostProfileId = deriveChatgptProfileId({
     manualLoginProfileDir: options.manualLoginProfileDir,
   });
@@ -384,6 +404,21 @@ export async function createRemoteServer(
             heartbeatIntervalMs: payload.options?.heartbeatIntervalMs as number | undefined,
             sessionId,
             followUpPrompts: payload.options?.followUpPrompts as string[] | undefined,
+            // Every send this run makes is reserved on the ledger first; a
+            // capture or reconciliation read sends nothing and is never charged.
+            beforeSend:
+              spendGate && !captureGrant && !reconciliation
+                ? ({ ordinal }) =>
+                    spendGate({
+                      runId: id,
+                      sessionId: payload.options?.sessionId
+                        ? String(payload.options.sessionId)
+                        : undefined,
+                      ordinal,
+                      model: payload.browserConfig.desiredModel as string | undefined,
+                      effort: payload.browserConfig.thinkingTime as string | undefined,
+                    })
+                : undefined,
             closeOwnedTabOnComplete: Boolean(
               options.manualLoginDefault && !clientRequestedKeepBrowser,
             ),
