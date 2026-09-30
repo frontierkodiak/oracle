@@ -9,7 +9,7 @@ if [ "${ORACLE_LIVE_TEST:-}" != "1" ]; then
 fi
 # Explicit allowlist: only a model with no Pro effort tier. GPT-5.5 Thinking / GPT-5.4 can start with a Pro
 # effort persisted in the picker, and a failed effort selection would keep it and submit on Pro; Oracle has no
-# fail-closed mode for non-Pro effort, so the fast legs use Instant and pass no effort. Anything else
+# fail-closed mode for non-Pro effort, so the fast legs use Instant with an explicit light effort. Anything else
 # (empty/whitespace, aliases such as classic/latest/gpt-6, Thinking, Pro models) is refused.
 FAST_MODEL="$(printf '%s' "${ORACLE_BROWSER_SMOKE_FAST_MODEL:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 case "$FAST_MODEL" in
@@ -23,7 +23,8 @@ esac
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD=(node "$ROOT/dist/bin/oracle-cli.js" --engine browser --wait --heartbeat 0 --timeout 900 --browser-input-timeout 120000 --browser-model-strategy select)
 # Explicit non-Pro effort so a saved ~/.oracle/config.json browser.thinkingTime (e.g. "pro") cannot be injected.
-# "light" is the Instant tier; ensureThinkingTime also aborts if the active effort reads Pro after selection.
+# "light" is the Instant tier. Residual risk: if the picker cannot find that chip while a Pro effort is
+# persisted, Oracle keeps the existing effort (see docs/testing.md).
 FAST_ARGS=(--model "$FAST_MODEL" --browser-thinking-time light)
 
 tmpdir="$(mktemp -d -t oracle-browser-smoke)"
