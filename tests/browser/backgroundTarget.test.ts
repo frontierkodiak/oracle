@@ -11,7 +11,9 @@ import { openChatGptTarget } from "../../src/browser/liveTabs.js";
 
 beforeEach(() => {
   vi.resetAllMocks();
-  version.mockResolvedValue({ webSocketDebuggerUrl: "ws://host:9222/devtools/browser/test" });
+  version.mockResolvedValue({
+    webSocketDebuggerUrl: "ws://reported-host:9333/devtools/browser/test",
+  });
 });
 
 test("opens on the browser endpoint without activating and closes only the connection", async () => {
@@ -22,7 +24,7 @@ test("opens on the browser endpoint without activating and closes only the conne
   await expect(openChatGptTarget({ host: "host", port: 9222 })).resolves.toBe("page-1");
   expect(version).toHaveBeenCalledWith({ host: "host", port: 9222 });
   expect(connect).toHaveBeenCalledWith({
-    target: "ws://host:9222/devtools/browser/test",
+    target: "ws://reported-host:9333/devtools/browser/test",
     local: true,
   });
   expect(createTarget).toHaveBeenCalledWith({ url: "https://chatgpt.com/", background: true });

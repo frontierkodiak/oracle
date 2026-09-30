@@ -1,6 +1,7 @@
 import { readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { ChromeClient } from "./types.js";
 import { BrowserAutomationError } from "../oracle/errors.js";
 
 export function resolveManualLoginWaitMs(timeoutMs: number | undefined, keepBrowser: boolean) {
@@ -62,4 +63,16 @@ export function formatManualLoginSetupCommand(profileDir: string): string {
 
 export function defaultManualLoginProfileDir() {
   return path.join(os.homedir(), ".oracle", "browser-profile");
+}
+
+/** Human-requested setup may activate a login tab; unattended/hidden runs must not. */
+export async function revealManualLoginSetupTab(
+  page: ChromeClient["Page"],
+  options: { headless: boolean; hideWindow: boolean; keepBrowser: boolean },
+): Promise<boolean> {
+  if (options.headless || options.hideWindow || !options.keepBrowser) {
+    return false;
+  }
+  await page.bringToFront();
+  return true;
 }

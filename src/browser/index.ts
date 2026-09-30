@@ -17,7 +17,6 @@ import {
   launchChrome,
   registerTerminationHooks,
   positionChromeWindowOffscreen,
-  positionChromeWindowOnscreen,
   connectToRemoteChrome,
   connectWithNewTab,
   closeTab,
@@ -117,6 +116,7 @@ import {
   formatManualLoginSetupCommand,
   isManualLoginProfileInitialized,
   resolveManualLoginWaitMs,
+  revealManualLoginSetupTab,
 } from "./manualLoginProfile.js";
 import { describeBrowserControlPlan, formatBrowserControlPlan } from "./controlPlan.js";
 import { CHROME_COOKIE_SYNC_WARNING, shouldSyncBrowserCookies } from "./policies.js";
@@ -1509,14 +1509,12 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
           timeoutMs: config.timeoutMs,
           profileDir: userDataDir,
           keepBrowser: effectiveKeepBrowser,
-          onLoginRequired:
-            !config.headless && config.hideWindow && process.platform === "darwin"
-              ? async () => await positionChromeWindowOnscreen(windowClient, logger)
-              : undefined,
-          onLoginAuthenticated:
-            !config.headless && config.hideWindow && process.platform === "darwin"
-              ? async () => await positionChromeWindowOffscreen(windowClient, logger)
-              : undefined,
+          onLoginRequired: async () =>
+            await revealManualLoginSetupTab(Page, {
+              headless: Boolean(config.headless),
+              hideWindow: Boolean(config.hideWindow),
+              keepBrowser: effectiveKeepBrowser,
+            }),
         }),
       );
 
@@ -2915,7 +2913,6 @@ async function waitForLogin({
   profileDir,
   keepBrowser,
   onLoginRequired,
-  onLoginAuthenticated,
 }: {
   runtime: ChromeClient["Runtime"];
   logger: BrowserLogger;
@@ -2925,7 +2922,6 @@ async function waitForLogin({
   profileDir?: string;
   keepBrowser?: boolean;
   onLoginRequired?: () => Promise<boolean>;
-  onLoginAuthenticated?: () => Promise<void>;
 }): Promise<void> {
   if (!manualLogin) {
     await ensureLoggedIn(runtime, logger, { appliedCookies });
@@ -2934,14 +2930,10 @@ async function waitForLogin({
   const waitMs = resolveManualLoginWaitMs(timeoutMs, Boolean(keepBrowser));
   const deadline = Date.now() + waitMs;
   let lastNotice = 0;
-  let loginWindowRevealed = false;
+  let loginRevealAttempted = false;
   while (Date.now() < deadline) {
     try {
       await ensureLoggedIn(runtime, logger, { appliedCookies });
-      if (loginWindowRevealed) {
-        logger("Manual login detected; returning the shared Chrome window off-screen.");
-        await onLoginAuthenticated?.();
-      }
       return;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -2950,11 +2942,11 @@ async function waitForLogin({
       if (!loginDetected && !sessionMissing) {
         throw error;
       }
-      if (!loginWindowRevealed && onLoginRequired) {
-        logger(
-          "Manual login required: bringing the shared Chrome window on-screen now. Sign in to ChatGPT there; Oracle will move it off-screen again after authentication.",
-        );
-        loginWindowRevealed = await onLoginRequired();
+      if (!loginRevealAttempted && onLoginRequired) {
+        loginRevealAttempted = true;
+        if (await onLoginRequired()) {
+          logger("Manual login required: activated the login tab for explicit visible setup.");
+        }
       }
       const now = Date.now();
       if (now - lastNotice > 5000) {
@@ -4410,6 +4402,7 @@ export const __test__ = {
   listIgnoredRemoteChromeFlags,
   normalizeAuthenticatedModelSelectionError,
   resolveManualLoginWaitMs,
+  revealManualLoginSetupTab,
   preparePromptBoundaryForTest: preparePromptBoundary,
   runRemoteCaptureOnlyForTest: runRemoteCaptureOnlyIfRequested,
   shouldCleanupBlankTabsAfterLastLease,

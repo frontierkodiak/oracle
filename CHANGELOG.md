@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Browser: open run, recovery, and replacement tabs in the background. Hidden automation stays quiet when signed out; explicit visible manual-login setup activates its login tab.
+
 ### Added
 
 - Serve: resolve a durable receipt that has no run ID through a read-only, operator-authenticated idempotency-key lookup (`GET /v1/runs/by-idempotency-key/:key`, capability `oracle.remote.idempotency-lookup`). Health advertises a stable `queueId`; a fresh receipt records the accepting queue's identity before its first POST so a 404 is definite only from the same queue, while an existing receipt with no identity stays unverified and untouched. `oracle remote recover --session-id` reports found, not found, a missing recorded run, unreachable, unsupported, or an identity/unverified miss, each with its own exit code, and never resubmits. Ambiguous or crash-mid-POST receipts are resolved read-only; only a definite same-queue miss permits the same-key idempotent POST, and every other outcome fails closed. New receipts still submit directly, so older services keep accepting work.
@@ -28,8 +32,6 @@
 - Browser: route the generic current-Pro aliases (`gpt-5-pro`, `gpt-5.1-pro`, `gpt-5.2-pro`, and `gpt-5.4-pro`) to GPT-5.6 Sol with Pro effort. Use the explicit `gpt-5.5-pro` model to keep the historical GPT-5.5 target; an explicit thinking-time setting still overrides the alias default. Fixes #373. Thanks @pdurlej!
 
 ### Fixed
-
-- Browser: open run, recovery, and replacement tabs in the background so the bridge does not take focus.
 
 - Browser: detect a disabled ChatGPT effort tier (e.g. an exhausted Pro allotment) before clicking it, and report the account's own reset notice instead of a misleading "selection unverified" failure. Thanks @enieuwy!
 
