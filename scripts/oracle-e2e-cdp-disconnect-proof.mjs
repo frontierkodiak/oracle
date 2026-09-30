@@ -12,10 +12,15 @@
  *   ORACLE_BROWSER_COOKIES_FILE=/tmp/oracle-e2e-cookies.json \
  *     node scripts/oracle-e2e-cdp-disconnect-proof.mjs
  *
+ * This sends a live prompt to ChatGPT, so it is gated (PL-229): it refuses to run
+ * unless ORACLE_LIVE_TEST=1 and ORACLE_E2E_MODEL=gpt-5.5-instant (no default), and it
+ * always passes --browser-model-strategy select and --browser-thinking-time light.
+ * A Pro run needs an explicit ORACLE_E2E_PRO_MODEL and spends a Pro message.
+ *
  * Optional:
  *   ORACLE_E2E_REMOTE_CHROME=127.0.0.1:9222
  *   ORACLE_E2E_BROWSER_PORT=9342
- *   ORACLE_E2E_MODEL_STRATEGY=current|select|ignore
+ *   ORACLE_E2E_PRO_MODEL=<explicit Pro model>   (opt-in; spends Pro allowance)
  *   ORACLE_E2E_CLEANUP=1
  */
 import { spawn, execFileSync } from "node:child_process";
@@ -25,6 +30,30 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+// Live gate: refuse before doing anything, since this script sends a real prompt to ChatGPT.
+const proModel = (process.env.ORACLE_E2E_PRO_MODEL || "").trim();
+const requestedModel = (process.env.ORACLE_E2E_MODEL || "").trim().toLowerCase();
+if (process.env.ORACLE_LIVE_TEST !== "1") {
+  console.error(
+    "[oracle-e2e-cdp] refusing to run: this script sends a live prompt to ChatGPT. Set ORACLE_LIVE_TEST=1 to opt in.",
+  );
+  process.exit(2);
+}
+if (!proModel && requestedModel !== "gpt-5.5-instant") {
+  console.error(
+    `[oracle-e2e-cdp] refusing to run: set ORACLE_E2E_MODEL=gpt-5.5-instant (the only allowed non-Pro model; got '${process.env.ORACLE_E2E_MODEL ?? ""}'). Pro needs an explicit ORACLE_E2E_PRO_MODEL.`,
+  );
+  process.exit(2);
+}
+const model = proModel || requestedModel;
+// Non-Pro runs pin the effort so a saved config cannot inject Pro; a Pro run is an explicit opt-in.
+const effort = proModel ? "pro" : "light";
+if (proModel) {
+  console.warn(
+    `[oracle-e2e-cdp] WARNING: Pro run (model: ${proModel}); this spends a Pro message from the account allowance.`,
+  );
+}
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const cli = path.join(root, "dist", "bin", "oracle-cli.js");
@@ -32,7 +61,6 @@ const cli = path.join(root, "dist", "bin", "oracle-cli.js");
 const slug = `e2e-cdp-${Date.now().toString(36)}`;
 const sessionDir = path.join(os.homedir(), ".oracle", "sessions", slug);
 const metaPath = path.join(sessionDir, "meta.json");
-const model = process.env.ORACLE_E2E_MODEL || "gpt-5.5";
 const token = `e2e-cdp-ok-${Date.now().toString(36)}`;
 // Long enough that ChatGPT is still generating when we steal the CDP socket.
 const prompt = [
@@ -193,9 +221,11 @@ async function main() {
     "600",
     "--browser-input-timeout",
     "120000",
-    // Free / Plus accounts often lack Thinking 5.5; keep whatever ChatGPT has selected.
+    // Always select the named model: "current"/"ignore" could keep an already-selected Pro model.
     "--browser-model-strategy",
-    process.env.ORACLE_E2E_MODEL_STRATEGY || "current",
+    "select",
+    "--browser-thinking-time",
+    effort,
     "--model",
     model,
     "--prompt",

@@ -65,71 +65,6 @@ export class ThinkingTierUnavailableError extends BrowserAutomationError {
   }
 }
 
-/**
- * A non-Pro effort was requested but the active effort reads Pro. Pro is scarce and
- * expensive, so a lower-tier request must never submit on a retained or switched Pro effort.
- */
-export class ProEffortActiveError extends BrowserAutomationError {
-  readonly requestedLevel: string;
-  readonly activeLabel: string | null;
-
-  constructor(requestedLevel: string, requestedLabel: string, activeLabel: string | null) {
-    super(
-      `Thinking time: ${requestedLabel} was requested but the active effort reads Pro (${activeLabel ?? "unlabelled"}); refusing to submit on Pro.`,
-      { stage: "thinking-pro-effort-active", requestedLevel, activeLabel },
-    );
-    this.name = "ProEffortActiveError";
-    this.requestedLevel = requestedLevel;
-    this.activeLabel = activeLabel;
-  }
-}
-
-const PRO_TOKEN_PATTERN = /(?:^|[^a-z0-9])pro(?:[^a-z0-9]|$)/i;
-
-function labelReadsPro(label: string | null | undefined): boolean {
-  return PRO_TOKEN_PATTERN.test(label ?? "");
-}
-
-/**
- * Reads the labels of the composer pills that show the active model/effort. Returns null
- * when the DOM cannot be read (the caller then keeps its best-effort behaviour).
- */
-async function readActiveEffortLabels(Runtime: ChromeClient["Runtime"]): Promise<string[] | null> {
-  try {
-    const outcome = await Runtime.evaluate({
-      expression: buildActiveEffortProbeExpression(),
-      awaitPromise: true,
-      returnByValue: true,
-    });
-    const value = outcome.result?.value as { activeEffortLabels?: unknown } | undefined;
-    const labels = value?.activeEffortLabels;
-    if (!Array.isArray(labels)) return null;
-    return labels.filter((entry): entry is string => typeof entry === "string");
-  } catch {
-    return null;
-  }
-}
-
-function buildActiveEffortProbeExpression(): string {
-  const modelButtonLiteral = JSON.stringify(MODEL_BUTTON_SELECTOR);
-  return `(() => {
-    const labels = [];
-    const nodes = [
-      ...Array.from(document.querySelectorAll(${modelButtonLiteral})),
-      ...Array.from(document.querySelectorAll('[data-model-picker-thinking-effort-action="true"]')),
-    ];
-    for (const node of nodes) {
-      const text = ((node.textContent || '') + ' ' + (node.getAttribute?.('aria-label') || '')).trim();
-      if (text) labels.push(text.slice(0, 120));
-    }
-    return { activeEffortLabels: labels };
-  })()`;
-}
-
-export function buildActiveEffortProbeExpressionForTest(): string {
-  return buildActiveEffortProbeExpression();
-}
-
 function confirmedThinkingTarget(
   level: ThinkingTimeLevel,
   capitalizedLevel: string,
@@ -185,26 +120,6 @@ export async function ensureThinkingTime(
   const strictProEffort =
     level === "pro" ||
     ((targetModelKind === "pro" || observedModelKind === "pro") && level === "extended");
-
-  // Fail closed on a non-Pro request that would submit on Pro. Explicit Pro requests (level "pro",
-  // "heavy", or a Pro target model) keep their existing behaviour.
-  const guardsAgainstPro = level !== "pro" && level !== "heavy" && targetModelKind !== "pro";
-  const assertNotOnPro = (activeLabel: string | null) => {
-    if (guardsAgainstPro && labelReadsPro(activeLabel)) {
-      throw new ProEffortActiveError(level, capitalizedLevel, activeLabel);
-    }
-  };
-  if (result?.status === "already-selected" || result?.status === "switched") {
-    assertNotOnPro(result.label ?? null);
-  } else if (guardsAgainstPro) {
-    // The selection was not confirmed, so the effort in ChatGPT is whatever it already was.
-    const active = await readActiveEffortLabels(Runtime);
-    const proLabel = active?.find((entry) => labelReadsPro(entry));
-    if (proLabel !== undefined) {
-      await logDomFailure(Runtime, logger, "thinking-pro-effort-active");
-      throw new ProEffortActiveError(level, capitalizedLevel, proLabel);
-    }
-  }
 
   switch (result?.status) {
     case "already-selected":

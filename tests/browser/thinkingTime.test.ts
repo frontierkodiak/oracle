@@ -1,9 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ThinkingTimeLevel } from "../../src/oracle/types.js";
 import {
-  ProEffortActiveError,
   ThinkingTierUnavailableError,
-  buildActiveEffortProbeExpressionForTest,
   buildThinkingTimeExpressionForTest,
   ensureThinkingTime,
   ensureThinkingTimeIfAvailable,
@@ -3543,129 +3541,5 @@ describe("unified Intelligence picker with Advanced -> Effort submenu", () => {
     const logged = logs.join(" ");
     expect(logged).toContain("keeping the effort already selected in ChatGPT");
     expect(logged).not.toContain("continuing with default");
-  });
-});
-
-describe("fail closed when a non-Pro effort request would submit on Pro (PL-229)", () => {
-  function buildRuntime(selection: unknown, activeEffortLabels: string[] | null) {
-    const calls = { selection: 0, probe: 0 };
-    const runtime = {
-      evaluate: async ({ expression }: { expression: string }) => {
-        if (expression.includes("activeEffortLabels")) {
-          calls.probe += 1;
-          return {
-            result: { value: activeEffortLabels === null ? undefined : { activeEffortLabels } },
-          };
-        }
-        calls.selection += 1;
-        return { result: { value: selection } };
-      },
-    };
-    return { runtime, calls };
-  }
-  const logger = (() => {}) as never;
-
-  it.each(["light", "standard"] as const)(
-    "throws when %s was requested, selection failed, and the Pro chip is active",
-    async (level) => {
-      const { runtime } = buildRuntime({ status: "chip-not-found" }, ["Pro"]);
-      await expect(
-        ensureThinkingTime(runtime as never, level, logger, "GPT-5.5 Instant"),
-      ).rejects.toBeInstanceOf(ProEffortActiveError);
-    },
-  );
-
-  it("throws when the active pill reads Pro after an unconfirmed click", async () => {
-    const { runtime } = buildRuntime({ status: "selection-unverified" }, [
-      "GPT-5.5",
-      "Extended Pro",
-    ]);
-    await expect(
-      ensureThinkingTime(runtime as never, "standard", logger, "Thinking 5.5"),
-    ).rejects.toThrow(/refusing to submit on Pro/);
-  });
-
-  it("throws when a non-Pro request reports Pro as the selected effort", async () => {
-    const { runtime, calls } = buildRuntime({ status: "switched", label: "Pro" }, ["Standard"]);
-    await expect(
-      ensureThinkingTime(runtime as never, "standard", logger, "Thinking 5.5"),
-    ).rejects.toBeInstanceOf(ProEffortActiveError);
-    expect(calls.probe).toBe(0);
-  });
-
-  it("throws when the effort can only be inferred and the pill reads Pro", async () => {
-    const { runtime } = buildRuntime({ status: "model-kind-not-found", modelKind: null }, ["Pro"]);
-    await expect(
-      ensureThinkingTime(runtime as never, "light", logger, null),
-    ).rejects.toBeInstanceOf(ProEffortActiveError);
-  });
-
-  it("passes when the requested tier is confirmed", async () => {
-    const { runtime, calls } = buildRuntime({ status: "already-selected", label: "Standard" }, [
-      "Pro",
-    ]);
-    await expect(
-      ensureThinkingTime(runtime as never, "standard", logger, "Thinking 5.5"),
-    ).resolves.not.toBeInstanceOf(ProEffortActiveError);
-    expect(calls.probe).toBe(0);
-  });
-
-  it("stays best-effort when selection failed but the active effort is not Pro", async () => {
-    const { runtime } = buildRuntime({ status: "chip-not-found" }, ["GPT-5.5 Instant"]);
-    await expect(
-      ensureThinkingTime(runtime as never, "light", logger, "GPT-5.5 Instant"),
-    ).resolves.not.toBeInstanceOf(ProEffortActiveError);
-  });
-
-  it("stays best-effort when the active effort cannot be read", async () => {
-    const { runtime } = buildRuntime({ status: "chip-not-found" }, null);
-    await expect(
-      ensureThinkingTime(runtime as never, "light", logger, "GPT-5.5 Instant"),
-    ).resolves.not.toBeInstanceOf(ProEffortActiveError);
-  });
-
-  it("leaves explicit Pro requests unchanged", async () => {
-    const proSelected = buildRuntime({ status: "switched", label: "Pro" }, ["Pro"]);
-    await expect(
-      ensureThinkingTime(proSelected.runtime as never, "pro", logger, "GPT-5.5 Instant"),
-    ).resolves.not.toBeInstanceOf(ProEffortActiveError);
-    expect(proSelected.calls.probe).toBe(0);
-
-    const proTierMissing = buildRuntime({ status: "chip-not-found" }, ["Pro"]);
-    const failure = await ensureThinkingTime(
-      proTierMissing.runtime as never,
-      "pro",
-      logger,
-      "gpt-5.5-pro",
-    ).catch((error: unknown) => error);
-    expect(failure).toBeInstanceOf(Error);
-    expect(failure).not.toBeInstanceOf(ProEffortActiveError);
-    expect(proTierMissing.calls.probe).toBe(0);
-
-    const proModelExtended = buildRuntime({ status: "chip-not-found" }, ["Pro"]);
-    const extendedFailure = await ensureThinkingTime(
-      proModelExtended.runtime as never,
-      "extended",
-      logger,
-      "gpt-5.5-pro",
-    ).catch((error: unknown) => error);
-    expect(extendedFailure).not.toBeInstanceOf(ProEffortActiveError);
-    expect(proModelExtended.calls.probe).toBe(0);
-  });
-
-  it("probes only the composer model/effort pills", () => {
-    const expression = buildActiveEffortProbeExpressionForTest();
-    const pill = (text: string, aria = "") => ({
-      textContent: text,
-      getAttribute: (name: string) => (name === "aria-label" ? aria : null),
-    });
-    const document = {
-      querySelectorAll: (selector: string) =>
-        selector.includes("thinking-effort-action") ? [pill("High")] : [pill("Instant", "Model")],
-    };
-    const result = new Function("document", `return ${expression}`)(document) as {
-      activeEffortLabels: string[];
-    };
-    expect(result.activeEffortLabels).toEqual(["Instant Model", "High"]);
   });
 });
