@@ -1,10 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Live gate. This script sends real prompts to ChatGPT, so refuse before building or launching anything.
+# ChatGPT Pro allowance is scarce: Pro legs run only when a Pro model is named explicitly (no default).
+if [ "${ORACLE_LIVE_TEST:-}" != "1" ]; then
+  echo "[browser-smoke] refusing to run: this script sends live prompts to ChatGPT. Set ORACLE_LIVE_TEST=1 to opt in." >&2
+  exit 2
+fi
+if [ -z "${ORACLE_BROWSER_SMOKE_FAST_MODEL:-}" ]; then
+  echo "[browser-smoke] refusing to run: set ORACLE_BROWSER_SMOKE_FAST_MODEL to an explicit non-Pro model (e.g. gpt-5.5)." >&2
+  exit 2
+fi
+
+case "$(printf '%s' "$ORACLE_BROWSER_SMOKE_FAST_MODEL" | tr '[:upper:]' '[:lower:]')" in
+  *pro*)
+    echo "[browser-smoke] refusing to run: ORACLE_BROWSER_SMOKE_FAST_MODEL must not be a Pro model (use ORACLE_BROWSER_SMOKE_PRO_MODEL for the Pro legs)." >&2
+    exit 2
+    ;;
+esac
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD=(node "$ROOT/dist/bin/oracle-cli.js" --engine browser --wait --heartbeat 0 --timeout 900 --browser-input-timeout 120000)
-FAST_MODEL="${ORACLE_BROWSER_SMOKE_FAST_MODEL:-gpt-5.5}"
-PRO_MODEL="${ORACLE_BROWSER_SMOKE_PRO_MODEL:-gpt-5.5-pro}"
+FAST_MODEL="$ORACLE_BROWSER_SMOKE_FAST_MODEL"
+PRO_MODEL="${ORACLE_BROWSER_SMOKE_PRO_MODEL:-}"
+if [ -n "$PRO_MODEL" ]; then
+  echo "[browser-smoke] WARNING: Pro legs enabled (model: $PRO_MODEL); each Pro leg spends a Pro message from the account allowance."
+fi
 
 tmpdir="$(mktemp -d -t oracle-browser-smoke)"
 tmpfile="$tmpdir/smoke-attachment.txt"
@@ -28,8 +49,17 @@ echo "[browser-smoke] fast simple"
 echo "[browser-smoke] fast with attachment preview (inline)"
 "${CMD[@]}" --model "$FAST_MODEL" --browser-inline-files --prompt "Read the attached file and return exactly one markdown bullet '- file: <content>' where <content> is the file text." --file "$tmpfile" --slug browser-smoke-file --preview --force
 
-echo "[browser-smoke] pro standard markdown check"
-"${CMD[@]}" --model "$PRO_MODEL" --prompt "Return two markdown bullets and a fenced code block labeled js that logs 'thinking-ok'." --slug browser-smoke-thinking --force
+if [ -n "$PRO_MODEL" ]; then
+  echo "[browser-smoke] pro standard markdown check"
+  "${CMD[@]}" --model "$PRO_MODEL" --prompt "Return two markdown bullets and a fenced code block labeled js that logs 'thinking-ok'." --slug browser-smoke-thinking --force
+else
+  echo "[browser-smoke] pro standard markdown check: skipped (no Pro model named; set ORACLE_BROWSER_SMOKE_PRO_MODEL)"
+fi
+
+if [ -z "$PRO_MODEL" ]; then
+  echo "[browser-smoke] reattach flow after controller loss: skipped (no Pro model named; set ORACLE_BROWSER_SMOKE_PRO_MODEL)"
+  exit 0
+fi
 
 echo "[browser-smoke] reattach flow after controller loss"
 slug="browser-reattach-smoke"

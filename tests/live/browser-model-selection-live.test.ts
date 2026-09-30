@@ -45,19 +45,40 @@ function isMissingChatGptSessionError(error: unknown): boolean {
   return /ChatGPT session not detected|Login button detected|login appears missing/i.test(message);
 }
 
+// GPT-6 Pro allowance is scarce: the default case is non-Pro. The Pro case runs only when
+// ORACLE_LIVE_BROWSER_PRO_MODEL names the Pro model explicitly (each run spends a Pro message).
+const PRO_MODEL = process.env.ORACLE_LIVE_BROWSER_PRO_MODEL?.trim();
+
 const CASES = [
   {
-    name: "gpt-5.5-pro-effort",
+    name: "gpt-5.5-thinking-standard",
     desiredModel: "Thinking 5.5",
-    thinkingTime: "pro" as const,
+    thinkingTime: "standard" as const,
     expectedModel: ["5.5"],
-    expectedEffort: ["pro"],
+    expectedEffort: ["standard"],
   },
+  ...(PRO_MODEL
+    ? [
+        {
+          name: "explicit-pro-effort",
+          desiredModel: PRO_MODEL,
+          thinkingTime: "pro" as const,
+          expectedModel: [] as string[],
+          expectedEffort: ["pro"],
+        },
+      ]
+    : []),
 ];
+
+if (LIVE && !PRO_MODEL) {
+  console.warn(
+    "Skipping Pro model-selection case (ORACLE_LIVE_BROWSER_PRO_MODEL not set; no Pro model named).",
+  );
+}
 
 (LIVE ? describe : describe.skip)("ChatGPT browser live model selection", () => {
   test(
-    "selects GPT-5.5 and its Pro effort through the Advanced picker",
+    "selects the named model and effort through the Advanced picker (non-Pro by default)",
     async () => {
       if (!(await hasChatGptCookies())) return;
       // Learned: serialize live browser tests to avoid Chrome profile contention.
@@ -75,7 +96,7 @@ const CASES = [
                   chromeProfile: "Default",
                   desiredModel: entry.desiredModel,
                   thinkingTime: entry.thinkingTime,
-                  // Pro browser responses can legitimately take up to ten minutes.
+                  // Pro browser responses (explicit opt-in only) can legitimately take up to ten minutes.
                   timeoutMs: 10 * 60_000,
                 },
                 log,
@@ -97,11 +118,13 @@ const CASES = [
                 }
               }
               const effortLog = lines.find((line) =>
-                line.toLowerCase().startsWith("thinking time:"),
+                /^(?:\[browser\]\s*)?thinking time:/i.test(line),
               );
               expect(effortLog).toBeTruthy();
               if (effortLog) {
-                const label = normalizeLabel(effortLog.replace(/^thinking time:\s*/i, ""));
+                const label = normalizeLabel(
+                  effortLog.replace(/^(?:\[browser\]\s*)?thinking time:\s*/i, ""),
+                );
                 for (const token of entry.expectedEffort) {
                   expect(label).toContain(token);
                 }
