@@ -58,7 +58,7 @@ function fencedBrowser(sent: number[]) {
   return async (options: BrowserRunOptions) => {
     const sends = 1 + (options.followUpPrompts?.length ?? 0);
     for (let ordinal = 0; ordinal < sends; ordinal++) {
-      await options.beforeSend?.({ ordinal });
+      await options.beforeSend?.({ ordinal, attempt: 0 });
       sent.push(ordinal);
     }
     return {
@@ -80,19 +80,19 @@ const run = (followUpPrompts?: string[]) => ({
 });
 
 describe("browser send gate", () => {
-  it("reserves each send ordinal once, before the attempt is marked", async () => {
+  it("reserves every attempt, recovery retries included, before it is marked", async () => {
     const events: string[] = [];
-    const gate = createSendGate(async ({ ordinal }) => {
-      events.push(`reserve ${ordinal}`);
+    const gate = createSendGate(async ({ ordinal, attempt }) => {
+      events.push(`reserve ${ordinal}.${attempt}`);
     });
     const mark = async () => {
       events.push("mark");
     };
     await gate.beforeAttempt(mark);
-    await gate.beforeAttempt(mark); // recovery retry of the same send
+    await gate.beforeAttempt(mark); // a recovery retry may dispatch again
     gate.setOrdinal(1);
     await gate.beforeAttempt(mark);
-    expect(events).toEqual(["reserve 0", "mark", "mark", "reserve 1", "mark"]);
+    expect(events).toEqual(["reserve 0.0", "mark", "reserve 0.1", "mark", "reserve 1.0", "mark"]);
   });
 
   it("a refused reservation stops the send before it is marked", async () => {
@@ -116,7 +116,14 @@ describe("command spend gate", () => {
         cb(null, "{}", "");
       },
     });
-    await ok({ runId: "run-1", sessionId: "s", ordinal: 2, model: "Latest", effort: "pro" });
+    await ok({
+      runId: "run-1",
+      sessionId: "s",
+      ordinal: 2,
+      attempt: 1,
+      model: "Latest",
+      effort: "pro",
+    });
     expect(calls[0]).toEqual([
       "charge",
       "--at-submit",
@@ -130,6 +137,8 @@ describe("command spend gate", () => {
       "run-1",
       "--ordinal",
       "2",
+      "--attempt",
+      "1",
       "--model",
       "Latest",
       "--effort",
@@ -140,9 +149,13 @@ describe("command spend gate", () => {
       oracleHome: "/h",
       exec: (_file, _args, _opts, cb) => cb(new Error("exit 2"), "", "cap would be exceeded"),
     });
-    await expect(refused({ runId: "r", ordinal: 0 })).rejects.toThrow(/cap would be exceeded/);
+    await expect(refused({ runId: "r", ordinal: 0, attempt: 0 })).rejects.toThrow(
+      /cap would be exceeded/,
+    );
     const missing = createCommandSpendGate({ command: "/nonexistent/pro-lane", oracleHome: "/h" });
-    await expect(missing({ runId: "r", ordinal: 0 })).rejects.toBeInstanceOf(SpendGateRefusedError);
+    await expect(missing({ runId: "r", ordinal: 0, attempt: 0 })).rejects.toBeInstanceOf(
+      SpendGateRefusedError,
+    );
   });
 });
 

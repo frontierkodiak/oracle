@@ -408,9 +408,10 @@ export async function createRemoteServer(
             // capture or reconciliation read sends nothing and is never charged.
             beforeSend:
               spendGate && !captureGrant && !reconciliation
-                ? ({ ordinal }) =>
+                ? ({ ordinal, attempt }) =>
                     spendGate({
                       runId: id,
+                      attempt,
                       sessionId: payload.options?.sessionId
                         ? String(payload.options.sessionId)
                         : undefined,

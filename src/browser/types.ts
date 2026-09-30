@@ -171,11 +171,12 @@ export interface BrowserRunOptions {
    */
   closeOwnedTabOnComplete?: boolean;
   /**
-   * Reserve each provider send before it happens: called once per send ordinal
-   * (0 = initial prompt, n = n-th follow-up) immediately before the pre-click
-   * fence. Rejecting refuses that send; nothing reaches the provider.
+   * Reserve each provider send attempt before it happens: called immediately
+   * before the pre-click fence of every attempt (ordinal 0 = initial prompt,
+   * n = n-th follow-up; attempt counts recovery retries of that send).
+   * Rejecting refuses the attempt; nothing reaches the provider.
    */
-  beforeSend?: (send: { ordinal: number }) => Promise<void>;
+  beforeSend?: (send: { ordinal: number; attempt: number }) => Promise<void>;
   /** Optional hook to persist runtime info and current model evidence as soon as Chrome is ready. */
   runtimeHintCb?: (
     hint: BrowserRuntimeMetadata,

@@ -8,6 +8,8 @@ export interface SpendGateSubmission {
   sessionId?: string;
   /** 0 for the initial prompt, n for the n-th follow-up in the same run. */
   ordinal: number;
+  /** Recovery retries of the same send: each may dispatch, so each is reserved. */
+  attempt: number;
   model?: string;
   effort?: string;
 }
@@ -58,6 +60,8 @@ export function createCommandSpendGate(options: {
         submission.runId,
         "--ordinal",
         String(submission.ordinal),
+        "--attempt",
+        String(submission.attempt),
       ];
       if (submission.model) args.push("--model", submission.model);
       if (submission.effort) args.push("--effort", submission.effort);
