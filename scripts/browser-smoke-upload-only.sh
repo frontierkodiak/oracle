@@ -1,9 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Live gate. This script sends a real prompt to ChatGPT, so refuse before launching anything.
+# It must never run on a Pro model: name an explicit non-Pro model (no default).
+if [ "${ORACLE_LIVE_TEST:-}" != "1" ]; then
+  echo "[browser-smoke-upload-only] refusing to run: this script sends a live prompt to ChatGPT. Set ORACLE_LIVE_TEST=1 to opt in." >&2
+  exit 2
+fi
+if [ -z "${ORACLE_BROWSER_SMOKE_FAST_MODEL:-}" ]; then
+  echo "[browser-smoke-upload-only] refusing to run: set ORACLE_BROWSER_SMOKE_FAST_MODEL to an explicit non-Pro model (e.g. gpt-5.5)." >&2
+  exit 2
+fi
+case "$(printf '%s' "$ORACLE_BROWSER_SMOKE_FAST_MODEL" | tr '[:upper:]' '[:lower:]')" in
+  *pro*)
+    echo "[browser-smoke-upload-only] refusing to run: ORACLE_BROWSER_SMOKE_FAST_MODEL must not be a Pro model." >&2
+    exit 2
+    ;;
+esac
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD=(node "$ROOT/dist/bin/oracle-cli.js" --engine browser --wait --heartbeat 0 --timeout 900 --browser-input-timeout 120000)
-FAST_MODEL="${ORACLE_BROWSER_SMOKE_FAST_MODEL:-gpt-5.5}"
+FAST_MODEL="$ORACLE_BROWSER_SMOKE_FAST_MODEL"
 
 tmpdir="$(mktemp -d -t oracle-browser-smoke)"
 tmpfile="$tmpdir/smoke-attachment.txt"
