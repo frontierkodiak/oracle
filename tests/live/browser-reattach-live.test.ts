@@ -20,9 +20,10 @@ const PROJECT_URLS = process.env.ORACLE_CHATGPT_PROJECT_URL
 const PRO_MODEL = process.env.ORACLE_LIVE_BROWSER_PRO_MODEL?.trim();
 const CASES = [
   {
+    // Instant has no Pro effort tier, so a failed or skipped effort selection cannot leave the run on Pro.
     name: "non-pro",
-    desiredModel: "Thinking 5.5",
-    thinkingTime: "standard" as const,
+    desiredModel: "GPT-5.5 Instant",
+    thinkingTime: undefined as "pro" | undefined,
     timeoutMs: 600_000,
   },
   ...(PRO_MODEL

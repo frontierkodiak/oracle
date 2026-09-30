@@ -7,22 +7,23 @@ if [ "${ORACLE_LIVE_TEST:-}" != "1" ]; then
   echo "[browser-smoke-upload-only] refusing to run: this script sends a live prompt to ChatGPT. Set ORACLE_LIVE_TEST=1 to opt in." >&2
   exit 2
 fi
-# Explicit allowlist of known non-Pro ChatGPT browser models (see BROWSER_MODEL_LABELS in src/cli/browserConfig.ts).
-# Anything else, including empty/whitespace, aliases (classic, latest, gpt-6) and Pro models, is refused.
+# Explicit allowlist: only a model with no Pro effort tier. GPT-5.5 Thinking / GPT-5.4 can start with a Pro
+# effort persisted in the picker, and a failed effort selection would keep it and submit on Pro; Oracle has no
+# fail-closed mode for non-Pro effort, so the fast legs use Instant and pass no effort. Anything else
+# (empty/whitespace, aliases such as classic/latest/gpt-6, Thinking, Pro models) is refused.
 FAST_MODEL="$(printf '%s' "${ORACLE_BROWSER_SMOKE_FAST_MODEL:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 case "$FAST_MODEL" in
-  gpt-5.5-instant) FAST_EFFORT="light" ;;
-  gpt-5.5 | gpt-5.4) FAST_EFFORT="standard" ;;
+  gpt-5.5-instant) ;;
   *)
-    echo "[browser-smoke-upload-only] refusing to run: set ORACLE_BROWSER_SMOKE_FAST_MODEL to one of gpt-5.5, gpt-5.5-instant, gpt-5.4 (explicit non-Pro model; got '${ORACLE_BROWSER_SMOKE_FAST_MODEL:-}')." >&2
+    echo "[browser-smoke-upload-only] refusing to run: set ORACLE_BROWSER_SMOKE_FAST_MODEL=gpt-5.5-instant (the only allowed fast model; got '${ORACLE_BROWSER_SMOKE_FAST_MODEL:-}')." >&2
     exit 2
     ;;
 esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD=(node "$ROOT/dist/bin/oracle-cli.js" --engine browser --wait --heartbeat 0 --timeout 900 --browser-input-timeout 120000 --browser-model-strategy select)
-# Fast legs pass explicit non-Pro effort so a saved browser.thinkingTime (e.g. "pro") cannot leak in.
-FAST_ARGS=(--model "$FAST_MODEL" --browser-thinking-time "$FAST_EFFORT")
+# A saved browser.thinkingTime of "pro" cannot select Pro on Instant: the strict Pro-effort check aborts the run.
+FAST_ARGS=(--model "$FAST_MODEL")
 
 tmpdir="$(mktemp -d -t oracle-browser-smoke)"
 tmpfile="$tmpdir/smoke-attachment.txt"

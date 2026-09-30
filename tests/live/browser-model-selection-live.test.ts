@@ -51,11 +51,12 @@ const PRO_MODEL = process.env.ORACLE_LIVE_BROWSER_PRO_MODEL?.trim();
 
 const CASES = [
   {
-    name: "gpt-5.5-thinking-standard",
-    desiredModel: "Thinking 5.5",
-    thinkingTime: "standard" as const,
-    expectedModel: ["5.5"],
-    expectedEffort: ["standard"],
+    // Instant has no Pro effort tier, so a failed or skipped effort selection cannot leave the run on Pro.
+    name: "gpt-5.5-instant",
+    desiredModel: "GPT-5.5 Instant",
+    thinkingTime: undefined as "pro" | undefined,
+    expectedModel: ["5.5", "instant"],
+    expectedEffort: [] as string[],
   },
   ...(PRO_MODEL
     ? [
@@ -120,8 +121,8 @@ if (LIVE && !PRO_MODEL) {
               const effortLog = lines.find((line) =>
                 /^(?:\[browser\]\s*)?thinking time:/i.test(line),
               );
-              expect(effortLog).toBeTruthy();
-              if (effortLog) {
+              if (entry.thinkingTime) expect(effortLog).toBeTruthy();
+              if (effortLog && entry.thinkingTime) {
                 const label = normalizeLabel(
                   effortLog.replace(/^(?:\[browser\]\s*)?thinking time:\s*/i, ""),
                 );

@@ -389,7 +389,7 @@ This mode is ideal when you have a macOS VM (or spare Mac mini) logged into Chat
 
 ## Testing Notes
 
-- ChatGPT automation smoke: `ORACLE_LIVE_TEST=1 ORACLE_BROWSER_SMOKE_FAST_MODEL=gpt-5.5 pnpm test:browser` (live prompts; Pro legs run only with an explicit `ORACLE_BROWSER_SMOKE_PRO_MODEL`, which spends Pro allowance)
+- ChatGPT automation smoke: `ORACLE_LIVE_TEST=1 ORACLE_BROWSER_SMOKE_FAST_MODEL=gpt-5.5-instant pnpm test:browser` (live prompts; Pro legs run only with an explicit `ORACLE_BROWSER_SMOKE_PRO_MODEL`, which spends Pro allowance)
 - Gemini web (cookie) smoke: `ORACLE_LIVE_TEST=1 pnpm vitest run tests/live/gemini-web-live.test.ts` (requires a signed-in Chrome profile at `gemini.google.com`)
 - `pnpm test --filter browser` does not exist yet; manual runs with `--engine browser -v` are the current validation path.
 - Most of the heavy lifting lives in `src/browserMode.ts`. If you change selectors or the mutation observer logic, run a local `oracle --engine browser --browser-keep-browser` session so you can inspect DevTools before cleanup.
