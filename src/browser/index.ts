@@ -105,6 +105,7 @@ import { collectChatGptFileArtifacts } from "./chatgptFiles.js";
 import { runProviderSubmissionFlow } from "./providerDomFlow.js";
 import { chatgptDomProvider } from "./providers/index.js";
 import { resolveAttachRunningConnection } from "./attachRunning.js";
+import { createSendGate } from "./sendGate.js";
 import { connectToExistingChatGptTab } from "./liveTabs.js";
 import { captureBrowserDiagnostics } from "./domDebug.js";
 import {
@@ -1084,6 +1085,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
       logger(`Failed to update browser tab lease: ${message}`);
     }
   };
+  const sendGate = createSendGate(options.beforeSend);
   const markPromptSubmitAttempt = async (): Promise<void> => {
     if (submissionAttempted) return;
     submissionAttempted = true;
@@ -1844,7 +1846,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
-        onPromptSubmitAttempt: markPromptSubmitAttempt,
+        onPromptSubmitAttempt: () => sendGate.beforeAttempt(markPromptSubmitAttempt),
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
@@ -2421,6 +2423,7 @@ export async function runBrowserMode(options: BrowserRunOptions): Promise<Browse
 
     for (let index = 0; index < followUpPrompts.length; index += 1) {
       const followUpPrompt = followUpPrompts[index];
+      sendGate.setOrdinal(index + 1);
       logger(`[browser] Sending follow-up ${index + 1}/${followUpPrompts.length}`);
       let followUpAnchors: CaptureLoopBaseline;
       await acquireProfileLockIfNeeded();
@@ -3333,6 +3336,7 @@ async function runRemoteBrowserMode(
       logger(`Failed to update browser tab lease: ${message}`);
     }
   };
+  const sendGate = createSendGate(options.beforeSend);
   const markPromptSubmitAttempt = async (): Promise<void> => {
     if (submissionAttempted) return;
     submissionAttempted = true;
@@ -3645,7 +3649,7 @@ async function runRemoteBrowserMode(
         attachmentTimeoutMs: config.attachmentTimeoutMs ?? undefined,
         baselineTurns: baselineTurns ?? undefined,
         attachmentNames: attachmentExpectations,
-        onPromptSubmitAttempt: markPromptSubmitAttempt,
+        onPromptSubmitAttempt: () => sendGate.beforeAttempt(markPromptSubmitAttempt),
         onPromptSubmitted: markPromptSubmitted,
       };
       const deepResearchTargetBaseline =
@@ -4144,6 +4148,7 @@ async function runRemoteBrowserMode(
 
     for (let index = 0; index < followUpPrompts.length; index += 1) {
       const followUpPrompt = followUpPrompts[index];
+      sendGate.setOrdinal(index + 1);
       logger(`[browser] Sending follow-up ${index + 1}/${followUpPrompts.length}`);
       await clearPromptComposer(Runtime, logger);
       await ensurePromptReady(Runtime, config.inputTimeoutMs, logger);
