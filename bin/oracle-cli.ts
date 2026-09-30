@@ -1026,6 +1026,15 @@ program
     "Allow capture-only durable requests (opt-in; default false).",
     false,
   )
+  .option(
+    "--spend-gate <path>",
+    "Ledger command that must reserve every provider send before it happens (invoked as `<path> charge --at-submit ...`).",
+  )
+  .option(
+    "--spend-gate-required",
+    "Refuse every send unless a spend gate is configured and approves it.",
+    false,
+  )
   .addHelpText(
     "after",
     "\nWindow override inherited from oracle:\n  --browser-hide-window  Keep the shared macOS Chrome window off-screen while preserving headful rendering.\n",
@@ -1054,6 +1063,8 @@ program
             : undefined,
       cookieSyncDefault: commandOptions.browserCookieSync,
       allowCaptureOnly: commandOptions.allowCaptureOnly === true,
+      spendGateCommand: commandOptions.spendGate as string | undefined,
+      spendGateRequired: commandOptions.spendGateRequired === true,
     });
   });
 
