@@ -233,6 +233,7 @@ export async function waitForAssistantResponse(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  minTurnNumber?: number,
 ): Promise<{
   text: string;
   html?: string;
@@ -247,6 +248,7 @@ export async function waitForAssistantResponse(
     timeoutMs,
     minTurnIndex,
     expectedConversationId,
+    minTurnNumber,
   );
   const evaluationPromise = Runtime.evaluate({
     expression,
@@ -268,6 +270,7 @@ export async function waitForAssistantResponse(
     minTurnIndex,
     expectedConversationId,
     pollerAbort.signal,
+    minTurnNumber,
   ).then(
     (value) => ({ kind: "poll" as const, value }),
     (error) => {
@@ -315,6 +318,7 @@ export async function waitForAssistantResponse(
           logger,
           minTurnIndex,
           expectedConversationId,
+          minTurnNumber,
         );
         if (recovered) {
           return recovered;
@@ -342,6 +346,7 @@ export async function waitForAssistantResponse(
         logger,
         minTurnIndex,
         expectedConversationId,
+        minTurnNumber,
       );
       if (recovered) {
         return recovered;
@@ -389,6 +394,8 @@ export async function waitForAssistantResponse(
       remainingMs,
       minTurnIndex,
       expectedConversationId,
+      undefined,
+      minTurnNumber,
     );
     if (completed) {
       return completed;
@@ -415,6 +422,7 @@ export async function readAssistantSnapshot(
   Runtime: ChromeClient["Runtime"],
   minTurnIndex?: number,
   expectedConversationId?: string,
+  minTurnNumber?: number,
 ): Promise<AssistantSnapshot | null> {
   const { result } = await Runtime.evaluate({
     expression: buildAssistantSnapshotExpression(minTurnIndex, expectedConversationId),
@@ -423,12 +431,25 @@ export async function readAssistantSnapshot(
   const value = result?.value;
   if (value && typeof value === "object") {
     const snapshot = value as AssistantSnapshot;
+    // Primary anchor: the turn's own ordinal cannot be shifted by culling, so it is authoritative
+    // whenever both the bound and the sampled ordinal are known.
+    if (
+      typeof minTurnNumber === "number" &&
+      Number.isFinite(minTurnNumber) &&
+      typeof snapshot.turnNumber === "number"
+    ) {
+      return snapshot.turnNumber > minTurnNumber ? snapshot : null;
+    }
     if (typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex)) {
       const turnIndex = typeof snapshot.turnIndex === "number" ? snapshot.turnIndex : null;
       if (turnIndex === null) {
         return snapshot;
       }
-      if (turnIndex < minTurnIndex) {
+      // A positional turnIndex is only meaningful while the pre-submit turns are still mounted.
+      // ChatGPT culls off-screen turns, so the index of a new answer can fall below the baseline
+      // even though the answer is genuinely new. Document order (the answer follows the user
+      // prompt we just submitted) is the culling-proof signal; without it, reject as before.
+      if (turnIndex < minTurnIndex && snapshot.afterLastUser !== true) {
         return null;
       }
     }
@@ -461,6 +482,81 @@ export async function captureAssistantMarkdown(
   return null;
 }
 
+// Records the submitted prompt's own turn ordinal and message id at commit. That ordinal is the
+// culling-proof baseline: ChatGPT never renumbers `conversation-turn-N`, so an answer that follows
+// this prompt has a strictly larger N even after earlier turns unmount. Reading at commit (while
+// the prompt is pinned) also prevents a later scrolled-away viewport from re-anchoring on an older
+// prompt and licensing a wrong answer.
+function buildSubmittedUserTurnAnchorExpression(): string {
+  return `(() => {
+    const users = Array.from(
+      document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
+    );
+    const last = users[users.length - 1] ?? null;
+    if (!last || !(last instanceof HTMLElement)) return { turnNumber: null, messageId: null };
+    const container =
+      (last.closest && last.closest('[data-testid^="conversation-turn"]')) || null;
+    const testId = (container && container.getAttribute('data-testid')) || last.getAttribute('data-testid') || '';
+    const match = /^conversation-turn-(\\d+)$/.exec(testId);
+    const messageNode = last.getAttribute('data-message-id')
+      ? last
+      : (last.querySelector && last.querySelector('[data-message-id]'));
+    return {
+      turnNumber: match ? Number(match[1]) : null,
+      messageId: messageNode ? messageNode.getAttribute('data-message-id') : null,
+    };
+  })()`;
+}
+
+export async function readSubmittedUserTurnAnchor(
+  Runtime: ChromeClient["Runtime"],
+): Promise<{ turnNumber: number | null; messageId: string | null }> {
+  try {
+    const { result } = await Runtime.evaluate({
+      expression: buildSubmittedUserTurnAnchorExpression(),
+      returnByValue: true,
+    });
+    const value = result?.value as { turnNumber?: unknown; messageId?: unknown } | null | undefined;
+    const turnNumber =
+      typeof value?.turnNumber === "number" && Number.isFinite(value.turnNumber)
+        ? Math.floor(value.turnNumber)
+        : null;
+    const messageId = typeof value?.messageId === "string" ? value.messageId : null;
+    return { turnNumber, messageId };
+  } catch {
+    return { turnNumber: null, messageId: null };
+  }
+}
+
+// Highest `conversation-turn-N` ordinal currently mounted. Used as a floor for the commit-time
+// anchor: a resumed conversation opens on its last turn, so the pre-submit last turn is always on
+// the page and an answer to the new prompt is strictly above it. If the anchor read races ahead of
+// the new user turn, the floor still keeps a previous answer from passing.
+export async function readHighestConversationTurnNumber(
+  Runtime: ChromeClient["Runtime"],
+): Promise<number | null> {
+  try {
+    const { result } = await Runtime.evaluate({
+      expression: `(() => {
+        const turns = Array.from(document.querySelectorAll('[data-testid^="conversation-turn"]'));
+        let highest = null;
+        for (const turn of turns) {
+          const match = /^conversation-turn-(\\d+)$/.exec(turn.getAttribute('data-testid') || '');
+          if (!match) continue;
+          const value = Number(match[1]);
+          highest = highest == null ? value : Math.max(highest, value);
+        }
+        return highest;
+      })()`,
+      returnByValue: true,
+    });
+    const value = result?.value;
+    return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : null;
+  } catch {
+    return null;
+  }
+}
+
 export function buildAssistantExtractorForTest(name: string): string {
   return buildAssistantExtractor(name);
 }
@@ -475,8 +571,18 @@ export function buildResponseObserverExpressionForTest(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  minTurnNumber?: number,
 ): string {
-  return buildResponseObserverExpression(timeoutMs, minTurnIndex, expectedConversationId);
+  return buildResponseObserverExpression(
+    timeoutMs,
+    minTurnIndex,
+    expectedConversationId,
+    minTurnNumber,
+  );
+}
+
+export function buildSubmittedUserTurnAnchorExpressionForTest(): string {
+  return buildSubmittedUserTurnAnchorExpression();
 }
 
 export function buildConversationDebugExpressionForTest(): string {
@@ -499,6 +605,7 @@ async function recoverAssistantResponse(
   logger: BrowserLogger,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  minTurnNumber?: number,
 ): Promise<{
   text: string;
   html?: string;
@@ -511,7 +618,12 @@ async function recoverAssistantResponse(
   const recoveryStartedAt = Date.now();
   const recovered = await waitForCondition(
     async () => {
-      const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
+      const snapshot = await readAssistantSnapshot(
+        Runtime,
+        minTurnIndex,
+        expectedConversationId,
+        minTurnNumber,
+      );
       return normalizeAssistantSnapshot(snapshot);
     },
     recoveryTimeoutMs,
@@ -528,6 +640,8 @@ async function recoverAssistantResponse(
         remainingMs,
         minTurnIndex,
         expectedConversationId,
+        undefined,
+        minTurnNumber,
       );
       if (confirmed) {
         logger("Recovered and confirmed assistant response via polling fallback");
@@ -673,6 +787,7 @@ async function pollAssistantCompletion(
   minTurnIndex?: number,
   expectedConversationId?: string,
   abortSignal?: AbortSignal,
+  minTurnNumber?: number,
 ): Promise<{
   text: string;
   html?: string;
@@ -685,7 +800,12 @@ async function pollAssistantCompletion(
     if (abortSignal?.aborted) {
       return null;
     }
-    const snapshot = await readAssistantSnapshot(Runtime, minTurnIndex, expectedConversationId);
+    const snapshot = await readAssistantSnapshot(
+      Runtime,
+      minTurnIndex,
+      expectedConversationId,
+      minTurnNumber,
+    );
     const normalized = normalizeAssistantSnapshot(snapshot);
     if (normalized) {
       // Generated-image answers stream no text and mount no action bar; accept immediately.
@@ -694,7 +814,7 @@ async function pollAssistantCompletion(
       }
       const [stopVisible, barVisible, thinkingActivity] = await Promise.all([
         isStopButtonVisible(Runtime),
-        isCompletionVisible(Runtime, normalized.meta, minTurnIndex),
+        isCompletionVisible(Runtime, normalized.meta, minTurnIndex, minTurnNumber),
         readThinkingActivity(Runtime),
       ]);
       const decision = classifyTurnTerminal(
@@ -767,6 +887,7 @@ export const buildStopButtonVisibilityExpressionForTest = buildStopButtonVisibil
 function buildCompletionVisibilityExpression(
   meta: { turnId?: string | null; messageId?: string | null },
   minTurnIndex?: number,
+  minTurnNumber?: number,
 ): string {
   const expectedMessageId = meta.messageId ? JSON.stringify(meta.messageId) : "null";
   const expectedTurnId = meta.turnId ? JSON.stringify(meta.turnId) : "null";
@@ -774,10 +895,15 @@ function buildCompletionVisibilityExpression(
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
       ? Math.floor(minTurnIndex)
       : -1;
+  const minTurnNumberLiteral =
+    typeof minTurnNumber === "number" && Number.isFinite(minTurnNumber) && minTurnNumber >= 0
+      ? Math.floor(minTurnNumber)
+      : -1;
   return `(() => {
     const EXPECTED_MESSAGE_ID = ${expectedMessageId};
     const EXPECTED_TURN_ID = ${expectedTurnId};
     const MIN_TURN_INDEX = ${minTurnLiteral};
+    const MIN_TURN_NUMBER = ${minTurnNumberLiteral};
     // Find the LAST assistant turn to check completion status. Must match the same logic as
     // buildAssistantExtractor, then correlate the controls to the sampled response.
     const ASSISTANT_SELECTOR = '${ASSISTANT_ROLE_SELECTOR}';
@@ -804,6 +930,27 @@ function buildCompletionVisibilityExpression(
     }
     if (!lastAssistantTurn) return false;
 
+    // Primary culling-proof anchor: the turn's own ordinal. When the baseline ordinal is known and
+    // the sampled turn's ordinal parses, it is authoritative; otherwise fall back to document
+    // order / the positional index below.
+    const turnNumberMatch = /^conversation-turn-(\\d+)$/.exec(lastAssistantTurn.getAttribute('data-testid') || '');
+    const lastAssistantTurnNumber = turnNumberMatch ? Number(turnNumberMatch[1]) : null;
+    const hasOrdinalAnchor = MIN_TURN_NUMBER >= 0 && lastAssistantTurnNumber != null;
+
+    // Culling-proof fallback: a turn after the last mounted user turn cannot be a stale
+    // pre-submit turn, even when ChatGPT culled earlier turns and shifted the positional
+    // baseline below the answer's index.
+    const lastUserTurn = (() => {
+      const users = Array.from(
+        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
+      );
+      return users[users.length - 1] ?? null;
+    })();
+    const isAfterLastUser = (node) => {
+      if (!lastUserTurn || typeof lastUserTurn.compareDocumentPosition !== 'function') return false;
+      return Boolean(lastUserTurn.compareDocumentPosition(node) & 4);
+    };
+
     const hasExpectedIdentity = Boolean(EXPECTED_MESSAGE_ID || EXPECTED_TURN_ID);
     if (hasExpectedIdentity) {
       const identityNodes = [
@@ -815,9 +962,15 @@ function buildCompletionVisibilityExpression(
         (EXPECTED_TURN_ID && node.getAttribute?.('data-testid') === EXPECTED_TURN_ID),
       );
       if (!identityMatches) return false;
-    } else if (MIN_TURN_INDEX < 0 || lastAssistantIndex < MIN_TURN_INDEX) {
+    } else if (hasOrdinalAnchor) {
+      if (!(lastAssistantTurnNumber > MIN_TURN_NUMBER)) return false;
+    } else if (MIN_TURN_INDEX < 0) {
       // Fallback/project snapshots without an identity may use the new-turn baseline, but an
       // uncorrelated persistent action bar from an older turn must never prove completion.
+      return false;
+    } else if (lastAssistantIndex < MIN_TURN_INDEX && !isAfterLastUser(lastAssistantTurn)) {
+      // A shifted index is fine when the turn follows the user prompt we just submitted; an
+      // older assistant turn precedes that prompt and must still be rejected.
       return false;
     }
 
@@ -835,11 +988,12 @@ async function isCompletionVisible(
     completionVisible?: boolean;
   },
   minTurnIndex?: number,
+  minTurnNumber?: number,
 ): Promise<boolean> {
   if (hasScopedCompletionProof(meta)) return true;
   try {
     const { result } = await Runtime.evaluate({
-      expression: buildCompletionVisibilityExpression(meta, minTurnIndex),
+      expression: buildCompletionVisibilityExpression(meta, minTurnIndex, minTurnNumber),
       returnByValue: true,
     });
     return Boolean(result?.value);
@@ -959,12 +1113,17 @@ function buildResponseObserverExpression(
   timeoutMs: number,
   minTurnIndex?: number,
   expectedConversationId?: string,
+  minTurnNumber?: number,
 ): string {
   const selectorsLiteral = JSON.stringify(ANSWER_SELECTORS);
   const assistantLiteral = JSON.stringify(ASSISTANT_ROLE_SELECTOR);
   const minTurnLiteral =
     typeof minTurnIndex === "number" && Number.isFinite(minTurnIndex) && minTurnIndex >= 0
       ? Math.floor(minTurnIndex)
+      : -1;
+  const minTurnNumberLiteral =
+    typeof minTurnNumber === "number" && Number.isFinite(minTurnNumber) && minTurnNumber >= 0
+      ? Math.floor(minTurnNumber)
       : -1;
   const expectedConversationLiteral =
     typeof expectedConversationId === "string" && expectedConversationId.trim().length > 0
@@ -976,6 +1135,7 @@ function buildResponseObserverExpression(
     const STOP_SELECTOR = ${JSON.stringify(STOP_CONTROL_SELECTOR)};
     const FINISHED_SELECTOR = '${FINISHED_ACTIONS_SELECTOR}';
     const ASSISTANT_SELECTOR = ${assistantLiteral};
+    const MIN_TURN_NUMBER = ${minTurnNumberLiteral};
     const EXPECTED_CONVERSATION_ID = ${expectedConversationLiteral};
     // Learned: settling avoids capturing mid-stream HTML; keep short.
     const settleDelayMs = 800;
@@ -1012,8 +1172,21 @@ function buildResponseObserverExpression(
     const acceptSnapshot = (snapshot) => {
       if (!snapshot) return null;
       if (!matchesExpectedConversation()) return null;
+      // Primary anchor: the turn's own ordinal is stable under culling, so it is authoritative
+      // whenever both the bound and the sampled ordinal are known.
+      if (
+        MIN_TURN_NUMBER >= 0 &&
+        typeof snapshot.turnNumber === 'number' &&
+        Number.isFinite(snapshot.turnNumber)
+      ) {
+        return snapshot.turnNumber > MIN_TURN_NUMBER ? snapshot : null;
+      }
       const index = typeof snapshot.turnIndex === 'number' ? snapshot.turnIndex : -1;
-      if (MIN_TURN_INDEX >= 0) {
+      // Fallback index is positional and drifts when ChatGPT culls off-screen turns. A turn that
+      // follows the last mounted user turn is still the new answer, so accept it even if its
+      // (shifted) index sits below the baseline; older assistant turns precede that user turn and
+      // keep being rejected.
+      if (MIN_TURN_INDEX >= 0 && snapshot.afterLastUser !== true) {
         if (index < 0 || index < MIN_TURN_INDEX) {
           return null;
         }
@@ -1219,6 +1392,24 @@ function buildAssistantExtractor(functionName: string): string {
       return Boolean(node.querySelector(ASSISTANT_SELECTOR) || node.querySelector('[data-testid*="assistant"]'));
     };
 
+    // Primary culling-proof anchor: the turn's own conversation-turn-N ordinal, which ChatGPT
+    // never renumbers when it culls or unmounts earlier turns. Document order (the answer follows
+    // the last mounted user turn) is kept only as a fallback for layouts that omit the ordinal.
+    const turnNumberFor = (node) => {
+      const match = /^conversation-turn-(\\d+)$/.exec(node.getAttribute('data-testid') || '');
+      return match ? Number(match[1]) : null;
+    };
+    const lastUserTurn = (() => {
+      const users = Array.from(
+        document.querySelectorAll('[data-message-author-role="user"], [data-turn="user"]'),
+      );
+      return users[users.length - 1] ?? null;
+    })();
+    const isAfterLastUser = (node) => {
+      if (!lastUserTurn || typeof lastUserTurn.compareDocumentPosition !== 'function') return false;
+      return Boolean(lastUserTurn.compareDocumentPosition(node) & 4);
+    };
+
     const expandCollapsibles = (root) => {
       const buttons = Array.from(root.querySelectorAll('button'));
       for (const button of buttons) {
@@ -1262,6 +1453,7 @@ function buildAssistantExtractor(functionName: string): string {
       const html = contentRoot?.innerHTML ?? '';
       const messageId = messageRoot.getAttribute('data-message-id');
       const turnId = messageRoot.getAttribute('data-testid');
+      const turnNumber = turnNumberFor(turn);
       const generatedImages = Array.from(messageRoot.querySelectorAll('img')).filter((img) =>
         String(img?.src || '').includes('/backend-api/estuary/content?id=file_')
       );
@@ -1274,10 +1466,10 @@ function buildAssistantExtractor(functionName: string): string {
         /^(?:reasoning\\s+|pro thinking\\s+)?thought for \\d+(?:\\.\\d+)?\\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)\\s+edit$/.test(normalizedText);
       if (generatedImages.length > 0 && imageOnlyChrome) {
         const label = generatedImages.length === 1 ? 'Generated image.' : \`Generated \${generatedImages.length} images.\`;
-        return { text: label, html: messageRoot?.innerHTML ?? html, messageId, turnId, turnIndex: index };
+        return { text: label, html: messageRoot?.innerHTML ?? html, messageId, turnId, turnNumber, turnIndex: index, afterLastUser: isAfterLastUser(turn) };
       }
       if (text.trim()) {
-        return { text, html, messageId, turnId, turnIndex: index };
+        return { text, html, messageId, turnId, turnNumber, turnIndex: index, afterLastUser: isAfterLastUser(turn) };
       }
     }
     return null;
@@ -1417,13 +1609,22 @@ function buildMarkdownFallbackExtractor(minTurnLiteral?: string): string {
       if (isUserEcho(text)) continue;
       const html = node.innerHTML ?? '';
       const turnIndex = resolveTurnIndex(node);
+      const containerNode =
+        (node.closest && node.closest('[data-testid^="conversation-turn"]')) ||
+        (node.parentElement && node.parentElement.closest && node.parentElement.closest('[data-testid^="conversation-turn"]')) ||
+        null;
+      const ordinalMatch = containerNode
+        ? /^conversation-turn-(\\d+)$/.exec(containerNode.getAttribute('data-testid') || '')
+        : null;
       return {
         text,
         html,
         messageId: null,
         turnId: null,
+        turnNumber: ordinalMatch ? Number(ordinalMatch[1]) : null,
         turnIndex,
         completionVisible: actionMarkdowns.includes(node),
+        afterLastUser: isAfterCurrentUser(node),
       };
     }
     return null;
@@ -1610,7 +1811,13 @@ interface AssistantSnapshot {
   messageId?: string | null;
   turnId?: string | null;
   turnIndex?: number | null;
+  // The turn's own `conversation-turn-N` ordinal, which is stable under ChatGPT's turn culling.
+  turnNumber?: number | null;
   completionVisible?: boolean;
+  // True when the turn follows the last user turn currently mounted in the DOM. ChatGPT culls
+  // off-screen turns, which shifts every positional turnIndex; this document-order anchor stays
+  // valid under culling and is what keeps a new answer from being rejected by a stale baseline.
+  afterLastUser?: boolean;
 }
 
 const LANGUAGE_TAGS = new Set(

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Browser: anchor new-turn capture on the submitted prompt's own `conversation-turn-N` ordinal (with document order as a fallback), not a positional baseline index. ChatGPT virtualizes turns, which unmounts earlier turns and shifts that index, so a completed answer could stay below the baseline and hang the run until the response timeout. The stable ordinal cannot drift, and it also rejects an older answer when the viewport has scrolled away from the new prompt. Applies to both the local and `--remote-chrome` paths, re-anchors each in-run follow-up on its own prompt, and uses a pre-submit floor so a lagging anchor read cannot fall back onto the previous prompt.
+
 ## 0.18.0 — 2026-08-14
 
 ### Changed

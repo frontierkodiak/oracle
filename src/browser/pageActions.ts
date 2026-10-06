@@ -20,6 +20,7 @@ export {
 export {
   waitForAssistantResponse,
   readAssistantSnapshot,
+  readHighestConversationTurnNumber,
   captureAssistantMarkdown,
   buildAssistantExtractorForTest,
   buildAssistantSnapshotExpressionForTest,

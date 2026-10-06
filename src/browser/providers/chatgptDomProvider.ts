@@ -2,7 +2,10 @@ import type { BrowserLogger, ChromeClient } from "../types.js";
 import type { ProviderDomAdapter, ProviderDomFlowContext } from "../providerDomFlow.js";
 import { ensurePromptReady } from "../actions/navigation.js";
 import { submitPrompt, type AttachmentReadyExpectation } from "../actions/promptComposer.js";
-import { waitForAssistantResponse } from "../actions/assistantResponse.js";
+import {
+  readSubmittedUserTurnAnchor,
+  waitForAssistantResponse,
+} from "../actions/assistantResponse.js";
 
 interface ChatgptDomProviderState {
   runtime: ChromeClient["Runtime"];
@@ -12,6 +15,8 @@ interface ChatgptDomProviderState {
   inputTimeoutMs?: number;
   attachmentTimeoutMs?: number;
   baselineTurns?: number | null;
+  baselineTurnNumber?: number | null;
+  submittedUserMessageId?: string | null;
   attachmentNames?: AttachmentReadyExpectation[];
   committedTurns?: number | null;
   onPromptSubmitted?: () => Promise<void> | void;
@@ -57,6 +62,11 @@ async function submitPromptViaAdapter(ctx: ProviderDomFlowContext): Promise<void
   ) {
     state.baselineTurns = Math.max(0, state.committedTurns - 1);
   }
+  // Pin the submitted prompt's own turn ordinal while it is still mounted; it is the
+  // culling-proof baseline the response wait uses to recognize the new answer.
+  const anchor = await readSubmittedUserTurnAnchor(state.runtime);
+  state.baselineTurnNumber = anchor.turnNumber;
+  state.submittedUserMessageId = anchor.messageId;
 }
 
 async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{
@@ -70,6 +80,8 @@ async function waitForResponse(ctx: ProviderDomFlowContext): Promise<{
     state.timeoutMs,
     state.logger,
     state.baselineTurns ?? undefined,
+    undefined,
+    state.baselineTurnNumber ?? undefined,
   );
   return {
     text: answer.text,
