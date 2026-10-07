@@ -94,13 +94,20 @@ function buildDismissBlockingUiExpression(): string {
     };
     const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
     const labelFor = (el) => normalize(el?.textContent || el?.getAttribute?.('aria-label') || el?.getAttribute?.('title'));
+    // Anchors and list items are never dismissal targets, even when they carry role="button".
+    const isDismissButton = (el) => {
+      const tag = String(el?.tagName || '').toLowerCase();
+      if (tag === 'a' || tag === 'li') return false;
+      if (tag === 'button') return true;
+      return el?.getAttribute?.('role') === 'button';
+    };
 
     const dialogs = Array.from(
       document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog,[aria-modal="true"]'),
     ).filter((el) => isVisible(el));
     for (const dialog of dialogs) {
-      const buttons = Array.from(dialog.querySelectorAll('button,[role="button"]')).filter((el) =>
-        isVisible(el),
+      const buttons = Array.from(dialog.querySelectorAll('button,[role="button"]')).filter(
+        (el) => isDismissButton(el) && isVisible(el),
       );
       const close = buttons.find((el) => labelFor(el).includes('close'));
       if (close) {

@@ -974,6 +974,26 @@ describe("dismissBlockingUi scoping (DOM logic)", () => {
     expect(link.clicked).toBe(false);
   });
 
+  test("does not click an anchor carrying role=button inside a dialog", () => {
+    const link = new FakeDismissElement({
+      tag: "a",
+      text: "Return to ChatGPT",
+      attrs: { role: "button" },
+    });
+    expect(runDismiss([dialog([link])])).toEqual({ dismissed: false });
+    expect(link.clicked).toBe(false);
+  });
+
+  test("does not click a list item carrying role=button inside a dialog", () => {
+    const item = new FakeDismissElement({
+      tag: "li",
+      text: "Return to ChatGPT",
+      attrs: { role: "button" },
+    });
+    expect(runDismiss([dialog([item])])).toEqual({ dismissed: false });
+    expect(item.clicked).toBe(false);
+  });
+
   test("clicks a Continue button inside a real dialog", () => {
     const continueButton = button("Continue");
     expect(runDismiss([dialog([continueButton])])).toEqual({
@@ -981,6 +1001,19 @@ describe("dismissBlockingUi scoping (DOM logic)", () => {
       action: "confirm",
     });
     expect(continueButton.clicked).toBe(true);
+  });
+
+  test("clicks a genuine non-native role=button control inside a dialog", () => {
+    const ariaButton = new FakeDismissElement({
+      tag: "div",
+      text: "Continue",
+      attrs: { role: "button" },
+    });
+    expect(runDismiss([dialog([ariaButton])])).toEqual({
+      dismissed: true,
+      action: "confirm",
+    });
+    expect(ariaButton.clicked).toBe(true);
   });
 
   test("clicks a Close button inside an aria-modal container", () => {
