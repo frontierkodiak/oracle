@@ -77,58 +77,76 @@ export interface PromptReadyNavigationDeps {
   ensurePromptReady?: typeof ensurePromptReady;
 }
 
+// Scoped to real dialogs and modal containers, and never to links or list items:
+// ChatGPT's project and history pages list conversations whose titles can contain
+// words like "continue" or "return", and a page-wide scan clicks the first match,
+// opening an existing conversation instead of the requested one (PL-265).
+function buildDismissBlockingUiExpression(): string {
+  return `(() => {
+    const isVisible = (el) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(el);
+      if (!style) return false;
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+      return true;
+    };
+    const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+    const labelFor = (el) => normalize(el?.textContent || el?.getAttribute?.('aria-label') || el?.getAttribute?.('title'));
+    // Anchors and list items are never dismissal targets, even when they carry role="button".
+    const isDismissButton = (el) => {
+      const tag = String(el?.tagName || '').toLowerCase();
+      if (tag === 'a' || tag === 'li') return false;
+      if (tag === 'button') return true;
+      return el?.getAttribute?.('role') === 'button';
+    };
+
+    const dialogs = Array.from(
+      document.querySelectorAll('[role="dialog"],[role="alertdialog"],dialog,[aria-modal="true"]'),
+    ).filter((el) => isVisible(el));
+    for (const dialog of dialogs) {
+      const buttons = Array.from(dialog.querySelectorAll('button,[role="button"]')).filter(
+        (el) => isDismissButton(el) && isVisible(el),
+      );
+      const close = buttons.find((el) => labelFor(el).includes('close'));
+      if (close) {
+        close.click();
+        return { dismissed: true, action: 'close' };
+      }
+      const okLike = buttons.find((el) => {
+        const label = labelFor(el);
+        return (
+          label === 'ok' ||
+          label === 'got it' ||
+          label === 'dismiss' ||
+          label === 'continue' ||
+          label === 'back' ||
+          label.includes('back to chatgpt') ||
+          label.includes('go to chatgpt') ||
+          label.includes('return') ||
+          label.includes('take me')
+        );
+      });
+      if (okLike) {
+        okLike.click();
+        return { dismissed: true, action: 'confirm' };
+      }
+    }
+    return { dismissed: false };
+  })()`;
+}
+
+export function buildDismissBlockingUiExpressionForTest(): string {
+  return buildDismissBlockingUiExpression();
+}
+
 async function dismissBlockingUi(
   Runtime: ChromeClient["Runtime"],
   logger: BrowserLogger,
 ): Promise<boolean> {
   const outcome = await Runtime.evaluate({
-    expression: `(() => {
-      const isVisible = (el) => {
-        if (!(el instanceof HTMLElement)) return false;
-        const rect = el.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return false;
-        const style = window.getComputedStyle(el);
-        if (!style) return false;
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-        return true;
-      };
-      const normalize = (value) => String(value || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-      const labelFor = (el) => normalize(el?.textContent || el?.getAttribute?.('aria-label') || el?.getAttribute?.('title'));
-      const buttonCandidates = (root) =>
-        Array.from(root.querySelectorAll('button,[role="button"],a')).filter((el) => isVisible(el));
-
-      const roots = [
-        ...Array.from(document.querySelectorAll('[role="dialog"],dialog')),
-        document.body,
-      ].filter(Boolean);
-      for (const root of roots) {
-        const buttons = buttonCandidates(root);
-        const close = buttons.find((el) => labelFor(el).includes('close'));
-        if (close) {
-          (close).click();
-          return { dismissed: true, action: 'close' };
-        }
-        const okLike = buttons.find((el) => {
-          const label = labelFor(el);
-          return (
-            label === 'ok' ||
-            label === 'got it' ||
-            label === 'dismiss' ||
-            label === 'continue' ||
-            label === 'back' ||
-            label.includes('back to chatgpt') ||
-            label.includes('go to chatgpt') ||
-            label.includes('return') ||
-            label.includes('take me')
-          );
-        });
-        if (okLike) {
-          (okLike).click();
-          return { dismissed: true, action: 'confirm' };
-        }
-      }
-      return { dismissed: false };
-    })()`,
+    expression: buildDismissBlockingUiExpression(),
     returnByValue: true,
   }).catch(() => null);
   const value = outcome?.result?.value as { dismissed?: boolean; action?: string } | undefined;

@@ -19,6 +19,7 @@ import {
   buildLoginProbeExpressionForTest,
   buildWelcomeBackAccountPickerExpressionForTest,
   buildChatModeProbeExpressionForTest,
+  buildDismissBlockingUiExpressionForTest,
 } from "../../src/browser/actions/navigation.js";
 import * as attachments from "../../src/browser/actions/attachments.js";
 import * as attachmentDataTransfer from "../../src/browser/actions/attachmentDataTransfer.js";
@@ -872,6 +873,168 @@ describe("cloudflare interstitial detection (DOM logic)", () => {
     expect(
       evalCloudflare({ title: "", appShell: false, script: true, bodyText: "just a moment" }),
     ).toBe(true);
+  });
+});
+
+describe("dismissBlockingUi scoping (DOM logic)", () => {
+  class FakeDismissElement {
+    clicked = false;
+    readonly tagName: string;
+    readonly textContent: string;
+    private readonly attrs: Record<string, string>;
+    private readonly children: FakeDismissElement[];
+    private readonly visible: boolean;
+
+    constructor(
+      options: {
+        tag?: string;
+        text?: string;
+        attrs?: Record<string, string>;
+        children?: FakeDismissElement[];
+        visible?: boolean;
+      } = {},
+    ) {
+      this.tagName = options.tag ?? "div";
+      this.textContent = options.text ?? "";
+      this.attrs = options.attrs ?? {};
+      this.children = options.children ?? [];
+      this.visible = options.visible ?? true;
+    }
+
+    getAttribute(name: string) {
+      return this.attrs[name] ?? "";
+    }
+
+    getBoundingClientRect() {
+      return { width: this.visible ? 120 : 0, height: this.visible ? 32 : 0 };
+    }
+
+    matches(selector: string) {
+      return selector.split(",").some((part) => {
+        const candidate = part.trim();
+        if (candidate.toLowerCase() === this.tagName.toLowerCase()) return true;
+        const role = candidate.match(/^\[role="([^"]+)"\]$/);
+        if (role) return this.attrs.role === role[1];
+        const ariaModal = candidate.match(/^\[aria-modal="([^"]+)"\]$/);
+        if (ariaModal) return this.attrs["aria-modal"] === ariaModal[1];
+        return false;
+      });
+    }
+
+    querySelectorAll(selector: string) {
+      const matches: FakeDismissElement[] = [];
+      const visit = (node: FakeDismissElement) => {
+        for (const child of node.children) {
+          if (child.matches(selector)) matches.push(child);
+          visit(child);
+        }
+      };
+      visit(this);
+      return matches;
+    }
+
+    click() {
+      this.clicked = true;
+    }
+  }
+
+  const button = (text: string, attrs: Record<string, string> = {}) =>
+    new FakeDismissElement({ tag: "button", text, attrs });
+  const anchor = (text: string) => new FakeDismissElement({ tag: "a", text });
+  const dialog = (
+    children: FakeDismissElement[],
+    attrs: Record<string, string> = { role: "dialog" },
+  ) => new FakeDismissElement({ tag: "div", attrs, children });
+
+  function runDismiss(bodyChildren: FakeDismissElement[]) {
+    const body = new FakeDismissElement({ tag: "body", children: bodyChildren });
+    const document = {
+      body,
+      querySelectorAll: (selector: string) => body.querySelectorAll(selector),
+    };
+    const window = {
+      getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+    };
+    const context = createContext({ document, window, HTMLElement: FakeDismissElement });
+    return new Script(buildDismissBlockingUiExpressionForTest()).runInContext(context) as {
+      dismissed?: boolean;
+      action?: string;
+    };
+  }
+
+  test("does not click a project conversation entry whose title contains Continue/Return", () => {
+    const canary = anchor("Continue this bounded transport test — Return the marker");
+    expect(runDismiss([canary])).toEqual({ dismissed: false });
+    expect(canary.clicked).toBe(false);
+  });
+
+  test("does not click a link inside a dialog", () => {
+    const link = anchor("Return to ChatGPT");
+    expect(runDismiss([dialog([link])])).toEqual({ dismissed: false });
+    expect(link.clicked).toBe(false);
+  });
+
+  test("does not click an anchor carrying role=button inside a dialog", () => {
+    const link = new FakeDismissElement({
+      tag: "a",
+      text: "Return to ChatGPT",
+      attrs: { role: "button" },
+    });
+    expect(runDismiss([dialog([link])])).toEqual({ dismissed: false });
+    expect(link.clicked).toBe(false);
+  });
+
+  test("does not click a list item carrying role=button inside a dialog", () => {
+    const item = new FakeDismissElement({
+      tag: "li",
+      text: "Return to ChatGPT",
+      attrs: { role: "button" },
+    });
+    expect(runDismiss([dialog([item])])).toEqual({ dismissed: false });
+    expect(item.clicked).toBe(false);
+  });
+
+  test("clicks a Continue button inside a real dialog", () => {
+    const continueButton = button("Continue");
+    expect(runDismiss([dialog([continueButton])])).toEqual({
+      dismissed: true,
+      action: "confirm",
+    });
+    expect(continueButton.clicked).toBe(true);
+  });
+
+  test("clicks a genuine non-native role=button control inside a dialog", () => {
+    const ariaButton = new FakeDismissElement({
+      tag: "div",
+      text: "Continue",
+      attrs: { role: "button" },
+    });
+    expect(runDismiss([dialog([ariaButton])])).toEqual({
+      dismissed: true,
+      action: "confirm",
+    });
+    expect(ariaButton.clicked).toBe(true);
+  });
+
+  test("clicks a Close button inside an aria-modal container", () => {
+    const closeButton = button("", { "aria-label": "Close" });
+    expect(runDismiss([dialog([closeButton], { role: "none", "aria-modal": "true" })])).toEqual({
+      dismissed: true,
+      action: "close",
+    });
+    expect(closeButton.clicked).toBe(true);
+  });
+
+  test("ignores a hidden dialog", () => {
+    const closeButton = button("Close");
+    const hidden = new FakeDismissElement({
+      tag: "div",
+      attrs: { role: "dialog" },
+      children: [closeButton],
+      visible: false,
+    });
+    expect(runDismiss([hidden])).toEqual({ dismissed: false });
+    expect(closeButton.clicked).toBe(false);
   });
 });
 
